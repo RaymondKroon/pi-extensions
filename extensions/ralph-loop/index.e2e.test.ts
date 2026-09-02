@@ -49,6 +49,15 @@ T 2 - "Task two"
 T 3 - "Task three"
 `;
 
+// A goal-only backlog: the planning state of the goal loop (goal open, no tasks).
+const RALPH_GOAL_ONLY = `# ralph v2
+
+G "Ship the thing" open
+GB
+  - Criterion one holds.
+  - Criterion two holds.
+`;
+
 const BLOB_MARKER = 'RALPH-E2E-BLOB';
 
 // ---------------------------------------------------------------------------
@@ -132,6 +141,48 @@ function writeToolCallResponder(todoPath: string, content: string, usage?: { pro
 				completion_tokens: completionTokens,
 				total_tokens: promptTokens + completionTokens
 			}
+		}),
+		'data: [DONE]\n\n'
+	];
+}
+
+/**
+ * A scripted response that calls an arbitrary tool (e.g. ralph_todo or
+ * ralph_goal) with the given JSON arguments, streamed in chunks like a real
+ * tool call. The real tool executes, so its side effects (backlog file
+ * writes, loop state changes) happen for real.
+ */
+function toolCallResponder(toolName: string, args: Record<string, unknown>, callId = 'call_mock_1'): ScriptedResponder {
+	const argsJson = JSON.stringify(args);
+	const chunks: string[] = [];
+	for (let offset = 0; offset < argsJson.length; offset += 32) chunks.push(argsJson.slice(offset, offset + 32));
+	return () => [
+		dataLine({
+			id: 'chatcmpl-mock',
+			object: 'chat.completion.chunk',
+			choices: [
+				{
+					index: 0,
+					delta: {
+						role: 'assistant',
+						content: null,
+						tool_calls: [{ index: 0, id: callId, type: 'function', function: { name: toolName, arguments: '' } }]
+					}
+				}
+			]
+		}),
+		...chunks.map((chunk) =>
+			dataLine({
+				id: 'chatcmpl-mock',
+				object: 'chat.completion.chunk',
+				choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: chunk } }] } }]
+			})
+		),
+		dataLine({
+			id: 'chatcmpl-mock',
+			object: 'chat.completion.chunk',
+			choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+			usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 }
 		}),
 		'data: [DONE]\n\n'
 	];
@@ -475,6 +526,134 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				'post-resume request',
 				30000
 			);
+		}
+	);
+
+	test(
+		'goal loop: planning -> execution -> re-evaluation -> approved completion stops the loop',
+		{ timeout: 90000 },
+		async () => {
+			const todoPath = join(projectDir, 'TODO.ralph');
+			await writeFile(todoPath, RALPH_GOAL_ONLY);
+			endpoint = startMockEndpoint([
+				// Iteration 1 (planning): the model decomposes the goal into the plan.
+				toolCallResponder('ralph_todo', { action: 'add-many', tasks: [{ title: 'Task one.' }, { title: 'Task two.' }] }, 'call_plan'),
+				textResponder('Plan recorded: two tasks added.'),
+				// Plan-updated recording turn (commit-only).
+				textResponder('Plan committed.'),
+				// Iteration 2 (execution): complete task 1 via the real tool.
+				toolCallResponder('ralph_todo', { action: 'complete', task: '1' }, 'call_task1'),
+				textResponder('Task one complete.'),
+				// Completed-task recording turn.
+				textResponder('Progress recorded.'),
+				// Iteration 3 (execution): complete task 2.
+				toolCallResponder('ralph_todo', { action: 'complete', task: '2' }, 'call_task2'),
+				textResponder('Task two complete.'),
+				// Completed-task recording turn.
+				textResponder('Progress recorded.'),
+				// Iteration 4 (re-evaluation): every criterion verified -> claim the goal.
+				// ralph_goal complete terminates the turn (the approval gate).
+				toolCallResponder(
+					'ralph_goal',
+					{ action: 'complete', note: 'All acceptance criteria verified: bun test passes (5 suites).' },
+					'call_complete'
+				),
+				// The user approves in chat; the input is transformed into the decision context.
+				toolCallResponder(
+					'ralph_resolve_decision',
+					{ recordPath: 'docs/decisions/goal-approval.md', resolution: 'User approved completion of the goal.' },
+					'call_resolve'
+				),
+				// Approved: confirm the claim -> goal done.
+				toolCallResponder('ralph_goal', { action: 'confirm' }, 'call_confirm'),
+				textResponder('Goal confirmed; the loop should stop.')
+			]);
+			const sess = await createRalphSession(endpoint.port, {
+				contextThresholds: { __default__: 0.9 },
+				autoApproveDecisions: false,
+				maxIterations: 10
+			});
+
+			await sess.prompt('/ralph start --goal');
+
+			// The scripted endpoint answers instantly, so the whole loop can run
+				// ahead of the assertions: the request log is the source of truth,
+				// and the file is only asserted once the loop has provably stopped.
+
+			// Iteration 1 is a planning iteration: goal open, no tasks yet.
+			await waitFor(() => endpoint!.requests.length >= 1, 30000);
+			expect(requestText(endpoint!.requests[0]!)).toContain('This is a planning iteration');
+
+			// The planning turn adds the plan through the REAL ralph_todo tool
+			// (the tool call and its result are in the request log).
+			await waitFor(() => endpoint!.requests.length >= 2, 30000);
+			expect(requestText(endpoint!.requests[1]!)).toContain('"name":"ralph_todo"');
+			expect(requestText(endpoint!.requests[1]!)).toContain('add-many');
+
+			// The grown plan triggers a plan-updated rotation with a commit-only
+			// recording turn (no completion log: no task was completed).
+			await waitFor(() => endpoint!.requests.length >= 3, 30000);
+			expect(requestText(endpoint!.requests[2]!)).toContain('The Ralph plan was just updated');
+
+			// Fresh execution iteration with a clean context: the old planning and
+			// recording turns are filtered out by the context boundary.
+			await waitFor(() => endpoint!.requests.length >= 4, 30000);
+			let fresh = requestText(endpoint!.requests[3]!);
+			expect(fresh).toContain('You are executing the goal');
+			expect(fresh).toContain('The plan was just updated with new tasks.');
+			expect(fresh).not.toContain('Plan committed.');
+
+			// Iteration 2 completes task 1 via the real tool.
+			await waitFor(() => endpoint!.requests.length >= 5, 30000);
+			expect(requestText(endpoint!.requests[4]!)).toContain('"name":"ralph_todo"');
+
+			// The completed-task recording turn names the completed task.
+			await waitFor(() => endpoint!.requests.length >= 6, 30000);
+			expect(requestText(endpoint!.requests[5]!)).toContain('A Ralph TODO task was just completed: task 1');
+
+			// Fresh execution iteration for task 2, again from a clean context.
+			await waitFor(() => endpoint!.requests.length >= 7, 30000);
+			fresh = requestText(endpoint!.requests[6]!);
+			expect(fresh).toContain('You are executing the goal');
+			expect(fresh).toContain('A previous TODO item was completed.');
+			expect(fresh).not.toContain('Task one complete.');
+
+			// Iteration 3 completes task 2; its recording turn follows.
+			await waitFor(() => endpoint!.requests.length >= 9, 30000);
+			expect(requestText(endpoint!.requests[8]!)).toContain('A Ralph TODO task was just completed: task 2');
+
+			// Plan exhausted: the fresh iteration is a re-evaluation, and the model
+			// claims the goal (ralph_goal complete terminates the turn at the gate).
+			await waitFor(() => endpoint!.requests.length >= 10, 30000);
+			expect(requestText(endpoint!.requests[9]!)).toContain('This is a re-evaluation iteration');
+
+			// The loop is paused at the approval gate: the user's chat reply is
+			// transformed into the pending-decision context for the model. Wait for
+			// the claim turn to fully settle first — prompting a still-streaming
+			// session throws.
+			await sess.waitForIdle();
+			await sess.prompt('Approved. The evidence is solid.');
+			const approvalRequest = await waitForRequestContaining('Ralph is paused in this session pending this decision');
+			expect(approvalRequest).toContain('Approve completion of the goal');
+			expect(approvalRequest).toContain('The user replied:');
+
+			// After the decision is resolved and the goal confirmed, the goal is
+			// done in the file and the loop stops: no further model request is
+			// triggered (no fresh iteration, no recording turn).
+			await waitFor(() => endpoint!.requests.length >= 13, 30000);
+			const countAtEnd = endpoint!.requests.length;
+			await new Promise((r) => setTimeout(r, 2000));
+			expect(endpoint!.requests.length).toBe(countAtEnd);
+
+			// The final file state proves the real tools did the work: both tasks
+			// completed, the goal claimed with evidence and then confirmed to done.
+			const todoOnDisk = await readFile(todoPath, 'utf8');
+			expect(todoOnDisk).toContain('T 1 - "Task one."');
+			expect(todoOnDisk).toContain('D 1');
+			expect(todoOnDisk).toContain('T 2 - "Task two."');
+			expect(todoOnDisk).toContain('D 2');
+			expect(todoOnDisk).toContain('G "Ship the thing" done');
+			expect(todoOnDisk).toContain('GE "All acceptance criteria verified: bun test passes (5 suites)."');
 		}
 	);
 });
