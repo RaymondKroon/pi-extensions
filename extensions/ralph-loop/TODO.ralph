@@ -59,6 +59,7 @@ B 8
   - New actions: confirm (claimed -> done) and withdraw (claimed -> open, note becomes the checkpoint).
   - Tool result text instructs the model on the after-answer procedure: approved -> record decision, ralph_resolve_decision, ralph_goal confirm; rejected -> ralph_goal withdraw with what is missing, then continue working.
   - Acceptance: tests: blocked state set and turn terminated; confirm/withdraw transitions; auto-approve path.
+D 8
 
 T 9 - "Extract the shared view kit from todos-view.ts"
 B 9
@@ -113,3 +114,6 @@ L 6 6 2026-09-02
 
 L 7 7 2026-09-02
   Added the 'plan-updated' rotation reason to the goal loop. index.ts: RotationReason gains 'plan-updated' (state validation accepts it); agent_settled now queues a plan-updated rotation in goal mode when the baseline diff shows new open task ids with no completions (after the completed-task check, before the context-threshold check, with the same max-iterations guard; also honored in the stopRequested path so a grown plan gets its commit before the loop ends); new commit-only planRecordingPrompt (git commit, explicitly no completion log entry, no new-task work); sendRecordingPrompt and the status line ('recording') branch on it; iterationPrompt gains a plan-updated context note. index.test.ts: new test 'agent_settled rotates a planning iteration that adds tasks into an execution iteration' (recording prompt asserts, then fresh execution iteration with the execution prompt) and 'agent_settled does not rotate when tasks are edited without changing the open set' (no recording turn, no fresh iteration, counters unchanged); the old 'does not stop when the plan grows' test was replaced by the rotation test. Evidence: bun test — 226 pass, 0 fail across 4 files; both new tests pass. Committed locally as cdbd89d (not pushed).
+
+L 8 8 2026-09-02
+  Goal completion is now gated on user approval. ralph_goal complete claims the goal (open -> claimed with evidence); with autoApproveDecisions it confirms straight to done (approver 'auto-approved'), otherwise it blockLoops with the approval question + evidence and returns terminate: true (ralph_request_decision pattern), with result text instructing the after-answer procedure (approved -> record decision, ralph_resolve_decision, ralph_goal confirm; rejected -> ralph_goal withdraw with what is missing, then keep working). New actions confirm (claimed -> done) and withdraw (claimed -> open, note becomes the goal checkpoint), both requiring an active goal loop; tool description and prompt guidelines updated. Changed: extensions/ralph-loop/index.ts, extensions/ralph-loop/index.test.ts. Evidence: new tests cover blocked state + terminated turn (status 'waiting', ralph-decision widget, notify), confirm/withdraw transitions and preconditions, and the auto-approve path; updated the two goal-loop-stop tests to the claim -> resolve -> confirm flow. Verification: bun test . -> 231 pass, 0 fail (backlog, index, todos-view, e2e suites).
