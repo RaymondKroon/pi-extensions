@@ -44,6 +44,7 @@ B 6
   - agent_settled: goal done in the file -> stopLoop; goal open + no open tasks + no plan growth + no completion -> stop with a clear stalled notification.
   - startFreshIteration: check goal done before starting a fresh iteration.
   - Acceptance: settle-handler tests for the goal-done stop and the stall stop.
+D 6
 
 T 7 - "Add plan-grew rotation to the goal loop"
 B 7
@@ -105,3 +106,6 @@ L 4 4 -
 
 L 5 5 -
   Registered the ralph_goal tool (first cut): show (works anywhere; target = active loop's backlog else TODO.ralph; prints title/status/body/evidence/checkpoint via new backlog.ts formatGoal), checkpoint (active goal loop only; note required; replaces the single goal checkpoint via setGoalCheckpoint), complete (active goal loop only; requires goal open + no open tasks + evidence note; claimGoal + confirmGoal → done with evidence in file). Description/guidelines state the completion bar (full verification run, evidence required) and that the goal text is the user's contract (model read-only). Extracted the shared loadTargetBacklog parse discipline from ralph_todo so both tools share parse → mutate → render → write. Changed: index.ts, backlog.ts, index.test.ts (7 new tests covering each action and each gate rejection). Verified: bun test — 220 pass / 0 fail across 4 files.
+
+L 6 6 2026-09-02
+  Goal loop now stops on goal completion and stall. agent_settled: goal done in the file -> stopLoop; goal open + no open tasks + no plan growth + no completion (and under budget, so no context-limit rotation) -> stop with a clear stalled notification. startFreshIteration: goal done -> stopLoop before starting a fresh iteration. Added goalStatus() and planGrew() helpers (index.ts). planGrew is also the shared basis for the task-7 plan-updated rotation. Changed paths: index.ts (helpers + agent_settled + startFreshIteration), index.test.ts (new 'goal loop stop' describe: 5 tests). Evidence: bun test 225 pass / 0 fail across 4 files (backlog, index, todos-view, index.e2e). Committed locally as 1b8fe41 (not pushed).
