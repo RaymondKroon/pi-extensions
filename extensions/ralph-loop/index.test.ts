@@ -1990,16 +1990,61 @@ T 2 - "Port the state."
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
 	});
 
-	test('agent_settled does not stop the goal loop when the plan grows', async () => {
+	test('agent_settled rotates a planning iteration that adds tasks into an execution iteration', async () => {
 		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
 
 		// The planning iteration decomposes the goal into tasks (the plan grew) and settles.
 		await writeFile(join(dir, 'GOAL.ralph'), GOAL_EXECUTION);
+		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// The loop is still active (execution phase), not stalled.
+		// A commit-only recording turn runs before the fresh iteration: the plan
+		// update is committed, but no completion log entry is written.
+		let status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: recording');
+		const recordingPrompt = fake.userMessages.at(-1)?.text ?? '';
+		expect(recordingPrompt).toContain('plan was just updated');
+		expect(recordingPrompt).toContain('Check git status');
+		expect(recordingPrompt).toContain('Do not push');
+		expect(recordingPrompt).toContain('Do not add a completion log entry');
+		expect(recordingPrompt).toContain('Do not start work on the new tasks');
+		expect(recordingPrompt).not.toContain('action "log"');
+
+		// The recording turn settles: the fresh iteration starts in the execution phase.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: starting');
+		expect(status).toContain('iteration 2/10');
+		expect(status).toContain('task: 1/2 (iteration 2)');
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: on');
+		const iterationPrompt = fake.userMessages.at(-1)?.text ?? '';
+		expect(iterationPrompt).toContain('The plan was just updated with new tasks');
+		expect(iterationPrompt).toContain('You are executing the goal');
+		expect(iterationPrompt).toContain('action "next"');
+		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
+	});
+
+	test('agent_settled does not rotate when tasks are edited without changing the open set', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_EXECUTION);
+
+		// The execution iteration rewords a task (same ids, same open set) and settles.
+		const edited = GOAL_EXECUTION.replace('T 1 - "Port the routes."', 'T 1 - "Port the HTTP routes."');
+		await writeFile(join(dir, 'GOAL.ralph'), edited);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// No rotation: the open set is unchanged, so no recording turn and no fresh iteration.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		expect(fake.userMessages.length).toBe(1);
 		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
 	});
 

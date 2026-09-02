@@ -49,7 +49,7 @@ const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 
-type RotationReason = 'completed-task' | 'context-limit';
+type RotationReason = 'completed-task' | 'plan-updated' | 'context-limit';
 
 interface RalphConfig {
 	/**
@@ -119,7 +119,10 @@ function isRalphState(value: unknown): value is RalphState {
 		typeof state.contextThreshold === 'number' &&
 		(state.autoApproveDecisions === undefined || typeof state.autoApproveDecisions === 'boolean') &&
 		typeof state.rotationQueued === 'boolean' &&
-		(state.rotationReason === undefined || state.rotationReason === 'completed-task' || state.rotationReason === 'context-limit') &&
+		(state.rotationReason === undefined ||
+			state.rotationReason === 'completed-task' ||
+			state.rotationReason === 'plan-updated' ||
+			state.rotationReason === 'context-limit') &&
 		(state.rotationCheckpointing === undefined || typeof state.rotationCheckpointing === 'boolean') &&
 		(state.stopRequested === undefined || typeof state.stopRequested === 'boolean') &&
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
@@ -465,7 +468,9 @@ function iterationPrompt(state: RalphState, reason?: RotationReason): string {
 			? 'The previous iteration reached its context budget and recorded a durable TODO checkpoint. Re-establish facts from the repository and TODO before continuing; do not rely on the old conversation.'
 			: reason === 'completed-task'
 				? 'A previous TODO item was completed. Start the next independent iteration with a clean review of the repository.'
-				: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
+				: reason === 'plan-updated'
+					? 'The plan was just updated with new tasks. Start the next independent iteration with a clean review of the repository and the updated plan.'
+					: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
 
 	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
 
@@ -630,6 +635,22 @@ Report the completion log entry (existing or newly recorded) and the commit (if 
 4. Do not start work on the next TODO item and do not modify product code beyond the completion record.
 
 Report the recorded entry and the commit (if any) succinctly.`;
+}
+
+/**
+ * Sent as the dedicated recording turn before a fresh iteration after the goal
+ * plan grew: the plan update must be committed locally before the next
+ * iteration starts, but no completion log entry is written because no task
+ * was completed in the turn.
+ */
+function planRecordingPrompt(state: RalphState): string {
+	return `The Ralph plan was just updated: new tasks were added to the backlog. Commit the updated plan now, then stop working; a fresh Ralph iteration will start after this turn.
+
+1. Check git status. If the updated plan (or any other uncommitted work from this iteration) is not committed locally, commit it with a concise message. Do not push.
+2. Do not add a completion log entry: no task was completed in this iteration.
+3. Do not start work on the new tasks and do not modify product code beyond the commit.
+
+Report the commit (if any) succinctly.`;
 }
 
 /** Extract the readable text from a tool result payload (for abort detection). */
@@ -1031,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
 			: state?.paused
 				? 'paused'
 				: state?.rotationCheckpointing
-					? state?.rotationReason === 'completed-task'
+					? state?.rotationReason === 'completed-task' || state?.rotationReason === 'plan-updated'
 						? 'recording'
 						: 'checkpointing'
 					: state?.stopRequested
@@ -1748,7 +1769,11 @@ export default function (pi: ExtensionAPI) {
 	const sendRecordingPrompt = (ctx: ExtensionContext, options?: { midTurn?: boolean }) => {
 		if (!state) return;
 		const prompt =
-			state.rotationReason === 'completed-task' ? completionRecordingPrompt(state) : contextCheckpointPrompt(state);
+			state.rotationReason === 'completed-task'
+				? completionRecordingPrompt(state)
+				: state.rotationReason === 'plan-updated'
+					? planRecordingPrompt(state)
+					: contextCheckpointPrompt(state);
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
 	};
 
@@ -2044,6 +2069,12 @@ export default function (pi: ExtensionAPI) {
 					queueRotation(ctx, 'completed-task', { currentTodo });
 					return;
 				}
+				// Goal mode: a grown plan is a progress boundary too — the plan
+				// update gets its commit before the loop ends.
+				if (state.mode === 'goal' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+					queueRotation(ctx, 'plan-updated');
+					return;
+				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Ralph loop could not read ${state.todoPath}: ${message}`, 'error');
@@ -2083,6 +2114,18 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				queueRotation(ctx, 'completed-task', { currentTodo });
+				return;
+			}
+
+			// Goal mode: the plan grew (new open tasks, no completions) — a
+			// progress boundary that rotates with a commit-only recording turn,
+			// winning over the proactive threshold check below like completions do.
+			if (state.mode === 'goal' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+				if (state.iteration >= state.maxIterations) {
+					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
+					return;
+				}
+				queueRotation(ctx, 'plan-updated');
 				return;
 			}
 
