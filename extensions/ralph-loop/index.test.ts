@@ -1721,6 +1721,14 @@ G "Rewrite the app" claimed
 GE "All routes render."
 `;
 
+	const GOAL_CLAIMED_WITH_TASK = `# ralph v2
+
+G "Rewrite the app" claimed
+GE "All routes render."
+
+T 1 - "Port the routes."
+`;
+
 	const GOAL_DONE = `# ralph v2
 
 G "Rewrite the app" done
@@ -1734,7 +1742,7 @@ GE "All routes render."
 			signal: unknown,
 			onUpdate: unknown,
 			ctx: unknown
-		) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
 	};
 
 	const goalTool = (fake: ReturnType<typeof createFakePi>): GoalTool => {
@@ -1874,25 +1882,141 @@ GE "All routes render."
 		const claimed = await startLoopWith(GOAL_CLAIMED);
 		await expect(claimed.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/complete requires open/);
 
-		// A done goal cannot be completed again (a done goal cannot start a
-		// loop, so finish one first and retry).
+		// A claimed goal (from a pending approval) cannot be completed again
+		// either: complete only claims; the approval flow confirms.
 		const finished = await startLoopWith(GOAL_OPEN_TASKS_DONE);
 		await finished.run({ action: 'complete', note: 'verified' });
 		await expect(finished.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/complete requires open/);
 	});
 
-	test('complete marks the goal done with the evidence in the file', async () => {
-		const { run } = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+	test('complete claims the goal, blocks the loop, and terminates the turn', async () => {
+		const { fake, fakeCtx, run } = await startLoopWith(GOAL_OPEN_TASKS_DONE);
 
 		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
-		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done');
+		// The turn terminates so the model cannot act before the user answers.
+		expect(result.terminate).toBe(true);
+		// The result instructs the after-answer procedure for both outcomes.
+		expect(result.content[0]!.text).toContain('claimed');
+		expect(result.content[0]!.text).toContain('ralph_resolve_decision');
+		expect(result.content[0]!.text).toContain('ralph_goal with action "confirm"');
+		expect(result.content[0]!.text).toContain('ralph_goal with action "withdraw"');
+
+		// The goal is claimed (not done) with the evidence in the file.
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" claimed');
+		expect(text).toContain('GE "All criteria verified: bun test green."');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.status).toBe('claimed');
+		expect(goal.evidence).toBe('All criteria verified: bun test green.');
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+
+		// The loop is blocked: the status shows waiting, the decision widget is
+		// set, and the user is notified.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('paused');
+	});
+
+	test('complete goes straight to done when auto-approve decisions is enabled', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: true, maxIterations: 10 }, null, '\t')}\n`
+		);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN_TASKS_DONE);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Delegated approval: the claim is confirmed immediately, no block, no
+		// terminated turn.
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approver: auto-approved)');
 
 		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
 		expect(text).toContain('G "Rewrite the app" done');
 		expect(text).toContain('GE "All criteria verified: bun test green."');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('waiting');
+	});
+
+	test('confirm requires an active goal loop and a claimed goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_CLAIMED);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'confirm' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_CLAIMED_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'confirm' })).rejects.toThrow(/active goal loop/);
+
+		// An open goal cannot be confirmed.
+		const open = await startLoopWith(GOAL_OPEN);
+		await expect(open.run({ action: 'confirm' })).rejects.toThrow(/confirm requires claimed/);
+	});
+
+	test('confirm marks a claimed goal done, keeping its evidence', async () => {
+		const { run } = await startLoopWith(GOAL_CLAIMED);
+
+		const result = await run({ action: 'confirm' });
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approved)');
+
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" done');
+		expect(text).toContain('GE "All routes render."');
 		const goal = Backlog.parse(text).goal()!;
 		expect(goal.status).toBe('done');
-		expect(goal.evidence).toBe('All criteria verified: bun test green.');
+		expect(goal.evidence).toBe('All routes render.');
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+	});
+
+	test('withdraw requires an active goal loop, a claimed goal, and a note', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_CLAIMED);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'withdraw', note: 'missing' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_CLAIMED_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'withdraw', note: 'missing' })).rejects.toThrow(/active goal loop/);
+
+		// An open goal cannot be withdrawn.
+		const open = await startLoopWith(GOAL_OPEN);
+		await expect(open.run({ action: 'withdraw', note: 'missing' })).rejects.toThrow(/withdraw requires claimed/);
+
+		// A claimed goal still needs the note.
+		const claimed = await startLoopWith(GOAL_CLAIMED);
+		await expect(claimed.run({ action: 'withdraw' })).rejects.toThrow(/requires a note/);
+	});
+
+	test('withdraw returns a claimed goal to open with the note as checkpoint', async () => {
+		const { run } = await startLoopWith(GOAL_CLAIMED);
+
+		const result = await run({ action: 'withdraw', note: 'Criterion 2 not met: the state was not ported.' });
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('open again');
+
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" open');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.status).toBe('open');
+		expect(goal.evidence).toBeNull();
+		expect(goal.checkpoint).toBe('Criterion 2 not met: the state was not ported.');
 		// The file stays valid ralph format.
 		expect(text.startsWith('# ralph v2')).toBe(true);
 	});
@@ -1936,7 +2060,7 @@ T 2 - "Port the state."
 			signal: unknown,
 			onUpdate: unknown,
 			ctx: unknown
-		) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
 	};
 
 	async function startGoalLoopWith(content: string) {
@@ -1956,11 +2080,32 @@ T 2 - "Port the state."
 		};
 	}
 
-	test('agent_settled stops the goal loop when the goal is done in the file', async () => {
+	test('agent_settled stops the goal loop after the approved completion', async () => {
 		const { fake, fakeCtx, run } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
 
-		// The re-evaluation iteration verifies the goal and completes it, then settles.
-		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		// The re-evaluation iteration verifies the goal and claims it: the loop
+		// blocks pending the user's approval and the turn terminates.
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBe(true);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+
+		// The blocked turn settles: nothing rotates, nothing stops.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+
+		// The user approves; the model records the decision and resolves it.
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute(
+			't',
+			{ recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+
+		// The model confirms the goal; the settle stops the loop on the done goal.
+		await run({ action: 'confirm' });
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
@@ -2058,11 +2203,30 @@ T 2 - "Port the state."
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
 
-		// The recording turn completes the remaining tasks and the goal, then settles.
+		// The recording turn completes the remaining tasks and claims the goal:
+		// the loop blocks pending the user's approval.
 		await todo({ action: 'complete', task: '1', note: 'done' });
 		await todo({ action: 'complete', task: '2', note: 'done' });
-		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBe(true);
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The blocked turn settles: the loop waits — it does not rotate or start
+		// a fresh iteration.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+
+		// The user approves; the model resolves the decision and confirms the goal.
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute(
+			't',
+			{ recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		await run({ action: 'confirm' });
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 

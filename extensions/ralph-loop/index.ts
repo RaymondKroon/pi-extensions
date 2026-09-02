@@ -1525,20 +1525,26 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_goal',
 		label: 'Ralph goal',
 		description:
-			'Read or update the single goal of the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. The goal is the user\'s contract: you are read-only on its title and body — only the user edits them, and you may only change the goal\'s state through this tool. Actions: show (works anywhere; prints the goal\'s title, status, body, evidence, and checkpoint), checkpoint (active goal loop only; replaces the single goal checkpoint — the durable state of task-less planning/re-evaluation iterations), complete (active goal loop only; requires the goal open and no open tasks; the completion bar is a full verification run — run every verification command required by SPEC.md first and pass the evidence; the goal then becomes done).',
+			'Read or update the single goal of the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. The goal is the user\'s contract: you are read-only on its title and body — only the user edits them, and you may only change the goal\'s state through this tool. Actions: show (works anywhere; prints the goal\'s title, status, body, evidence, and checkpoint), checkpoint (active goal loop only; replaces the single goal checkpoint — the durable state of task-less planning/re-evaluation iterations), complete (active goal loop only; requires the goal open and no open tasks; the completion bar is a full verification run — run every verification command required by SPEC.md first and pass the evidence; the goal becomes claimed and the loop pauses for the user\'s approval, or goes straight to done when auto-approve decisions is enabled), confirm (active goal loop only; claimed → done — call it only after the user approved the completion), withdraw (active goal loop only; claimed → open — call it when the user rejected the completion, with a note describing what is missing; the note becomes the goal checkpoint).',
 		promptSnippet: 'Read/update the Ralph goal',
 		promptGuidelines: [
 			'Use ralph_goal for the goal of the active goal loop; the goal text is the user\'s contract — you are read-only on it and may only change its state through this tool.',
-			'ralph_goal complete is the completion bar: run every verification command required by SPEC.md first and pass the evidence; never claim an unverified completion.'
+			'ralph_goal complete is the completion bar: run every verification command required by SPEC.md first and pass the evidence; never claim an unverified completion.',
+			'ralph_goal complete pauses the loop for the user\'s approval: after the answer, approved → record the decision, call ralph_resolve_decision, then ralph_goal confirm; rejected → ralph_goal withdraw with what is missing, then keep working.'
 		],
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('show'),
 				Type.Literal('checkpoint'),
-				Type.Literal('complete')
+				Type.Literal('complete'),
+				Type.Literal('confirm'),
+				Type.Literal('withdraw')
 			]),
 			note: Type.Optional(
-				Type.String({ description: 'Checkpoint note (checkpoint) or completion evidence (complete).' })
+				Type.String({
+					description:
+						'Checkpoint note (checkpoint), completion evidence (complete), or withdrawal note describing what is missing (withdraw).'
+				})
 			)
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1548,6 +1554,7 @@ export default function (pi: ExtensionAPI) {
 			const goal = backlog.goal();
 
 			let mutated = false;
+			let terminated = false;
 			let output: string;
 			switch (params.action) {
 				case 'show': {
@@ -1583,10 +1590,45 @@ export default function (pi: ExtensionAPI) {
 					if (open > 0) {
 						throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
 					}
-					backlog.claimGoal(params.note.trim());
+					const evidence = params.note.trim();
+					const claimed = backlog.claimGoal(evidence);
+					mutated = true;
+					if (state.autoApproveDecisions) {
+						// Delegated approval, consistent with the decision semantics:
+						// the claim is confirmed immediately.
+						const done = backlog.confirmGoal();
+						output = `Goal "${done.title}" is done (approver: auto-approved). Stop working now; the loop records the completion.`;
+						break;
+					}
+					// User approval gate: the goal stays claimed and the loop pauses
+					// until the user answers (the ralph_request_decision pattern).
+					const question = `Approve completion of the goal "${claimed.title}"?`;
+					blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
+					terminated = true;
+					output = `Goal "${claimed.title}" is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
+					break;
+				}
+				case 'confirm': {
+					if (!state?.enabled) throw new Error('confirm requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('confirm requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!goal) throw new Error(`no goal in ${todoPath}`);
 					const done = backlog.confirmGoal();
 					mutated = true;
-					output = `Goal "${done.title}" is done (evidence recorded). Stop working now; the loop records the completion.`;
+					output = `Goal "${done.title}" is done (approved). Stop working now; the loop records the completion.`;
+					break;
+				}
+				case 'withdraw': {
+					if (!state?.enabled) throw new Error('withdraw requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('withdraw requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!params.note) throw new Error('withdraw requires a note describing what is missing.');
+					if (!goal) throw new Error(`no goal in ${todoPath}`);
+					const withdrawn = backlog.withdrawGoal(params.note.trim());
+					mutated = true;
+					output = `Goal "${withdrawn.title}" is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
 					break;
 				}
 			}
@@ -1600,7 +1642,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			return {
 				content: [{ type: 'text', text: output }],
-				details: { action: params.action }
+				details: { action: params.action },
+				...(terminated ? { terminate: true } : {})
 			};
 		},
 		renderResult(result, options) {
