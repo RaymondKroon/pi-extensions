@@ -387,8 +387,8 @@ The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and
 2. Do not work on a later task${state.category ? ' or on a task in another category' : ''}.
 3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
 4. Add focused tests and run every quality command required by SPEC.md and the backlog.
-5. Only after all acceptance criteria pass, call ralph_todo with action "complete" and the task's number. Do not edit ${state.todoPath} directly.
-6. Commit the completed iteration locally. Do not push.
+5. Only after all acceptance criteria pass, commit the completed iteration locally. Do not push.
+6. Finally, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly. This is the last step of the iteration: stop working when the tool confirms the completion.
 
 ${decisionNote}`;
 	}
@@ -399,8 +399,8 @@ ${decisionNote}`;
 2. Select the highest-priority unblocked unchecked TODO item. Do not work on a later item.
 3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
 4. Add focused tests and run every quality command required by SPEC.md and TODO.md.
-5. Only after all acceptance criteria pass, update ${state.todoPath}: check the completed item and add exactly one dated, concise entry for it to the completion log (outcome, changed paths, evidence, verification commands). The completion log is the single completion record: do not also add a completion note under the checked item itself.
-6. Commit the completed iteration locally. Do not push.
+5. Only after all acceptance criteria pass, commit the completed iteration locally. Do not push.
+6. Finally, update ${state.todoPath}: check the completed item and add exactly one dated, concise entry for it to the completion log (outcome, changed paths, evidence, verification commands). The completion log is the single completion record: do not also add a completion note under the checked item itself. This is the last step of the iteration: stop working when the TODO is updated.
 
 ${decisionNote}`;
 }
@@ -445,22 +445,21 @@ function completionRecordingPrompt(state: RalphState): string {
 		if (numbers.length > 0) {
 			const singular = numbers.length === 1;
 			const target = singular ? `task ${numbers[0]}` : `tasks ${numbers.join(', ')}`;
-			return `A Ralph TODO task was just completed: ${target}. Record its progress now, then stop working; a fresh Ralph iteration will start after this turn.
+			return `A Ralph TODO task was just completed: ${target}. Verify its progress record now, then stop working; a fresh Ralph iteration will start after this turn.
 
-1. Call ralph_todo with action "log" for ${target}, today's date, and exactly one concise ${singular ? 'entry' : 'entry per task'}: outcome, changed paths, evidence, and the verification commands that were run. The completion log is the single completion record: do not add more than one entry for ${singular ? 'this task' : 'any of these tasks'} and do not modify any other task.
+1. Call ralph_todo with action "list" and ${singular ? 'the task\'s number' : 'each task\'s number'} to check the completion log. If ${singular ? 'the task' : 'a task'} already has a completion log entry (for example, recorded by the "complete" call), do not add another. Only if the entry is missing, call ralph_todo with action "log" for ${target}, today's date, and exactly one concise ${singular ? 'entry' : 'entry per task'}: outcome, changed paths, evidence, and the verification commands that were run. Do not modify any other task.
 2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
 3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
 
-Report the recorded ${singular ? 'entry' : 'entries'} and the commit (if any) succinctly.`;
+Report the completion log ${singular ? 'entry' : 'entries'} (existing or newly recorded) and the commit (if any) succinctly.`;
 		}
-		return `A Ralph TODO task was just completed. Record its progress now, then stop working; a fresh Ralph iteration will start after this turn.
+		return `A Ralph TODO task was just completed. Verify its progress record now, then stop working; a fresh Ralph iteration will start after this turn.
 
-1. Call ralph_todo with action "list" and identify the task that was just completed: the checked task without a completion log entry.
-2. Call ralph_todo with action "log", the task's number, today's date, and exactly one concise entry: outcome, changed paths, evidence, and the verification commands that were run. The completion log is the single completion record: do not add more than one entry for this task and do not modify any other task.
-3. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
-4. Do not start work on the next TODO task and do not modify product code beyond the completion record.
+1. Call ralph_todo with action "list" and identify the task that was just completed (the one you marked complete in the previous turn). Check its completion log: if it already has a completion log entry (for example, recorded by the "complete" call), do not add another. Only if the entry is missing, call ralph_todo with action "log", the task's number, today's date, and exactly one concise entry: outcome, changed paths, evidence, and the verification commands that were run. Do not modify any other task.
+2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
+3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
 
-Report the recorded entry and the commit (if any) succinctly.`;
+Report the completion log entry (existing or newly recorded) and the commit (if any) succinctly.`;
 	}
 	return `A Ralph TODO item was just completed. Record its progress now, then stop working; a fresh Ralph iteration will start after this turn.
 
@@ -1032,7 +1031,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph, which must exist first (create it with action "init" or "import"). Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, add-many, new-list, log, move, import, init. "add" adds to the current scope, or to an existing list via "category" (it never creates a list); use "new-list" with a name to create a new list explicitly. "add-many" adds several tasks at once via the "tasks" array (all-or-nothing; each entry may set its own category). "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email). "init" explicitly bootstraps an empty backlog at the target path when it does not exist yet (idempotent; refuses to overwrite a non-ralph file).',
+			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph, which must exist first (create it with action "init" or "import"). Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, add-many, new-list, log, move, import, init. "add" adds to the current scope, or to an existing list via "category" (it never creates a list); use "new-list" with a name to create a new list explicitly. "add-many" adds several tasks at once via the "tasks" array (all-or-nothing; each entry may set its own category). "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "complete" marks the task done; with a note it also records the completion log entry in the same call. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email). "init" explicitly bootstraps an empty backlog at the target path when it does not exist yet (idempotent; refuses to overwrite a non-ralph file).',
 		promptSnippet: 'Read/update the Ralph backlog',
 		promptGuidelines: [
 			'Use ralph_todo to read or update the ralph-format backlog; never read or modify the backlog file by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use action "search" to find tasks by keyword.'
@@ -1055,7 +1054,7 @@ export default function (pi: ExtensionAPI) {
 			task: Type.Optional(
 				Type.String({ description: 'Task number (as shown by list/next, e.g. "3"): the target of complete/checkpoint/log/move; with list: show that single task\'s detail view (body, checkpoint, completion log) instead of the whole backlog.' })
 			),
-			note: Type.Optional(Type.String({ description: 'Checkpoint note (checkpoint) or completion-log entry (log).' })),
+			note: Type.Optional(Type.String({ description: 'Checkpoint note (checkpoint), completion-log entry (log), or completion summary recorded with the task (complete).' })),
 			title: Type.Optional(Type.String({ description: 'New task title (add).' })),
 			body: Type.Optional(Type.String({ description: 'New task body, markdown bullets (add).' })),
 			tasks: Type.Optional(
@@ -1203,9 +1202,16 @@ export default function (pi: ExtensionAPI) {
 					const task = backlog.complete(params.task, scope);
 					mutated = true;
 					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+					let recorded = false;
+					if (params.note) {
+						const now = new Date();
+						const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+						backlog.addLogEntry({ task: String(number), date, note: params.note.trim() }, scope);
+						recorded = true;
+					}
 					output = state?.enabled
-						? `Marked task ${number} "${task.title}" done. Stop working now; the loop records the completion and starts a fresh iteration.`
-						: `Marked task ${number} "${task.title}" done in ${todoPath}.`;
+						? `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}. Stop working now — the iteration is finished; the loop records the completion and starts a fresh iteration.`
+						: `Marked task ${number} "${task.title}" done in ${todoPath}${recorded ? ' and recorded the completion log entry' : ''}.`;
 					break;
 				}
 				case 'checkpoint': {

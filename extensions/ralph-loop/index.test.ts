@@ -349,11 +349,11 @@ describe('ralph-loop extension', () => {
 		let status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph: recording');
 		expect(fake.userMessages.at(-1)?.text).toContain('completion log');
-		// The completion log is the single completion record.
-		expect(fake.userMessages.at(-1)?.text).toContain('single completion record');
-		// The ralph backlog is diffed by task id, so the prompt names the task.
+		// The ralph backlog is diffed by task id, so the prompt names the task, and it
+		// is idempotent: check for an existing entry before logging.
 		expect(fake.userMessages.at(-1)?.text).toContain('was just completed: task 1');
 		expect(fake.userMessages.at(-1)?.text).toContain('action "log" for task 1');
+		expect(fake.userMessages.at(-1)?.text).toContain('do not add another');
 
 		// The recording turn settles: only now does the fresh iteration start.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -397,11 +397,13 @@ describe('ralph-loop extension', () => {
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
-		// The recording prompt names the completed task directly: no backlog re-read needed.
+		// The recording prompt names the completed task directly and is idempotent:
+		// the model checks the task's completion log before adding an entry.
 		const prompt = fake.userMessages.at(-1)?.text ?? '';
 		expect(prompt).toContain('was just completed: task 1');
 		expect(prompt).toContain('action "log" for task 1');
-		expect(prompt).not.toContain('action "list"');
+		expect(prompt).toContain('action "list"');
+		expect(prompt).toContain('do not add another');
 	});
 
 	test('mid-turn: crossing the threshold during streaming steers the checkpoint into the running turn', async () => {
@@ -1050,6 +1052,45 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// The file stays valid ralph format after every mutation.
 		const final = await file();
 		expect(final.startsWith('# ralph v2')).toBe(true);
+	});
+
+	test('ralph_todo complete with a note records the completion log entry in the same call', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await importTodo(fake, fakeCtx, 'import TODO.md');
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo TODO.ralph', fakeCtx.ctx);
+
+		const tool = fake.tools.get('ralph_todo') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		};
+		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
+		const file = () => readFile(join(dir, 'TODO.ralph'), 'utf8');
+
+		// complete with a note: the note becomes the completion log entry, and the
+		// result says so — the model never has to guess whether it was recorded.
+		const done = await run({ action: 'complete', task: '1', note: 'Replaced the README. Verified: bun test.' });
+		expect(done.content[0]!.text).toContain('Marked task 1 "Establish a clean local developer contract." done');
+		expect(done.content[0]!.text).toContain('recorded the completion log entry');
+		expect(await file()).toContain('D 1');
+		expect(await file()).toContain('Replaced the README. Verified: bun test.');
+
+		// The entry shows in the task detail view.
+		const detail = await run({ action: 'list', task: '1' });
+		expect(detail.content[0]!.text).toContain('Replaced the README. Verified: bun test.');
+
+		// complete without a note: no entry is recorded, and the result says nothing about one.
+		const plain = await run({ action: 'complete', task: '2' });
+		expect(plain.content[0]!.text).toContain('Marked task 2 "Remove starter/demo surfaces." done');
+		expect(plain.content[0]!.text).not.toContain('recorded the completion log entry');
 	});
 
 	test('ralph_todo manages the main backlog from chat without an active loop', async () => {
