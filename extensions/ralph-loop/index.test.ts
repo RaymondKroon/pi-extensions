@@ -1562,6 +1562,131 @@ D 2
 	});
 });
 
+describe('ralph-loop extension (goal loop prompts)', () => {
+	const GOAL_PLANNING = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+`;
+
+	const GOAL_EXECUTION = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+
+T 1 - "Port the routes."
+
+T 2 - "Port the state."
+`;
+
+	const GOAL_REEVALUATION = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+
+T 1 - "Port the routes."
+D 1
+
+T 2 - "Port the state."
+D 2
+`;
+
+	async function startGoalLoop(content: string, goal = true) {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), content);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(`start --todo GOAL.ralph${goal ? ' --goal' : ''}`, fakeCtx.ctx);
+		return { fake, fakeCtx };
+	}
+
+	test('planning prompt: goal open, zero tasks', async () => {
+		const { fake } = await startGoalLoop(GOAL_PLANNING);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph goal loop');
+		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
+		expect(prompt).toContain('Port the routes.');
+		expect(prompt).toContain('Port the state.');
+		expect(prompt).toContain('This is a planning iteration: the goal is open and the backlog has no tasks yet.');
+		expect(prompt).toContain('Decompose the goal into small, ordered tasks');
+		expect(prompt).toContain('action "add-many"');
+		expect(prompt).toContain('Do not implement the goal in this iteration');
+		// Planning does not select a task.
+		expect(prompt).not.toContain('action "next"');
+	});
+
+	test('execution prompt: goal open, open tasks', async () => {
+		const { fake } = await startGoalLoop(GOAL_EXECUTION);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph goal loop');
+		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
+		expect(prompt).toContain('You are executing the goal');
+		expect(prompt).toContain('keep the plan honest');
+		expect(prompt).toContain('add or adjust tasks with ralph_todo');
+		// The task workflow is the task prompt plus the goal context.
+		expect(prompt).toContain('action "next"');
+		expect(prompt).toContain('action "complete"');
+		expect(prompt).not.toContain('planning iteration');
+		expect(prompt).not.toContain('re-evaluation iteration');
+	});
+
+	test('re-evaluation prompt: goal open, tasks exist, none open', async () => {
+		const { fake } = await startGoalLoop(GOAL_REEVALUATION);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph goal loop');
+		expect(prompt).toContain('This is a re-evaluation iteration: the goal is open and every planned task is complete.');
+		expect(prompt).toContain('Re-check every acceptance criterion of the goal against the repository');
+		expect(prompt).toContain('add tasks for the missing work with ralph_todo');
+		expect(prompt).toContain('ralph_goal with action "complete"');
+		expect(prompt).not.toContain('action "next"');
+	});
+
+	test('task-less goal iterations checkpoint via ralph_goal', async () => {
+		const { fake, fakeCtx } = await startGoalLoop(GOAL_PLANNING);
+
+		// The planning iteration settles at/above the context threshold.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		const prompt = fake.userMessages.at(-1)!.text;
+		expect(prompt).toContain('durable checkpoint');
+		expect(prompt).toContain('iteration 1 of 10');
+		expect(prompt).toContain('ralph_goal with action "checkpoint"');
+		expect(prompt).toContain('keep only the single most recent one');
+		// The task checkpoint tool is not offered for a task-less iteration.
+		expect(prompt).not.toContain('ralph_todo');
+	});
+
+	test('goal execution iterations still checkpoint the task via ralph_todo', async () => {
+		const { fake, fakeCtx } = await startGoalLoop(GOAL_EXECUTION);
+
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		const prompt = fake.userMessages.at(-1)!.text;
+		expect(prompt).toContain('durable checkpoint');
+		expect(prompt).toContain('ralph_todo with action "checkpoint"');
+		expect(prompt).not.toContain('ralph_goal');
+	});
+
+	test('task-mode prompt is unchanged when the backlog has a goal', async () => {
+		const { fake } = await startGoalLoop(GOAL_EXECUTION, false);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph loop for this repository');
+		expect(prompt).not.toContain('goal loop');
+		expect(prompt).not.toContain('planning iteration');
+		expect(prompt).not.toContain('re-evaluation iteration');
+		expect(prompt).not.toContain('executing the goal');
+	});
+});
+
 describe('ralph-loop extension (/ralph todos view)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);

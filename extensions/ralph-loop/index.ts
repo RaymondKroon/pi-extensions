@@ -21,7 +21,15 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
-import { Backlog, formatBacklog, formatNextTask, formatSearchResults, formatTaskDetail, isRalphBacklog } from './backlog.ts';
+import {
+	Backlog,
+	formatBacklog,
+	formatNextTask,
+	formatSearchResults,
+	formatTaskDetail,
+	isRalphBacklog,
+	type Goal
+} from './backlog.ts';
 import { createTodosView, type TodosView } from './todos-view.ts';
 import { createListPicker, type ListPicker } from './list-picker.ts';
 
@@ -332,6 +340,39 @@ function isBacklogFinished(todo: string, category?: string): boolean {
 	return todoCounts(todo, category).open === 0;
 }
 
+type GoalPhase = 'planning' | 'execution' | 're-evaluation';
+
+/**
+ * The goal-loop phase for the state's baseline backlog: planning (goal open,
+ * zero tasks), execution (open tasks), or re-evaluation (goal open, tasks
+ * exist, none open). Undefined outside a goal loop on a ralph backlog with a
+ * goal, so callers fall back to the task-loop prompts.
+ */
+function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefined {
+	if (state.mode !== 'goal' || !isRalphBacklog(state.baselineTodo)) return undefined;
+	try {
+		const backlog = Backlog.parse(state.baselineTodo);
+		const goal = backlog.goal();
+		if (!goal) return undefined;
+		const counts = backlog.counts(state.category);
+		if (counts.total === 0) return { phase: 'planning', goal };
+		if (counts.open === 0) return { phase: 're-evaluation', goal };
+		return { phase: 'execution', goal };
+	} catch {
+		return undefined;
+	}
+}
+
+/** The goal contract shown to the model in every goal-loop prompt. */
+function goalBlock(goal: Goal): string {
+	const lines = [`The goal is "${goal.title}" (status: ${goal.status}).`];
+	if (goal.body) lines.push(goal.body.trim());
+	if (goal.checkpoint) {
+		lines.push(`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${goal.checkpoint}`);
+	}
+	return lines.join('\n');
+}
+
 /**
  * Backlog statistics for either supported TODO format (Markdown or the
  * ralph text format backed by SQLite), optionally scoped to one category.
@@ -390,6 +431,63 @@ function iterationPrompt(state: RalphState, reason?: RotationReason): string {
 	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
 
 	if (isRalphBacklog(state.baselineTodo)) {
+		const goalInfo = goalPhase(state);
+		if (goalInfo) {
+			const { phase, goal } = goalInfo;
+			const backlogNote = `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`;
+			const categoryScope = state.category ? ` in category "${state.category}"` : '';
+			const categoryGuard = state.category ? ' or on a task in another category' : '';
+
+			if (phase === 'planning') {
+				return `Run the Ralph goal loop for this repository. ${contextNote}
+
+${backlogNote}
+
+${goalBlock(goal)}
+
+This is a planning iteration: the goal is open and the backlog has no tasks yet.
+
+1. Read ${state.specPath} in full.
+2. Decompose the goal into small, ordered tasks that together cover every acceptance criterion.
+3. Add the whole plan to the backlog with ralph_todo (action "add-many" for the plan, or "add" per task).
+4. Do not implement the goal in this iteration: the plan is the deliverable. Do not edit ${state.todoPath} directly.
+
+${decisionNote}`;
+			}
+			if (phase === 're-evaluation') {
+				return `Run the Ralph goal loop for this repository. ${contextNote}
+
+${backlogNote}
+
+${goalBlock(goal)}
+
+This is a re-evaluation iteration: the goal is open and every planned task is complete.
+
+1. Read ${state.specPath} in full.
+2. Re-check every acceptance criterion of the goal against the repository and run every verification command required by SPEC.md.
+3. If any criterion is not met, add tasks for the missing work with ralph_todo and stop after recording them.
+4. If every criterion is met and verified, call ralph_goal with action "complete" and the evidence. Do not edit ${state.todoPath} directly.
+
+${decisionNote}`;
+			}
+			return `Run the Ralph goal loop for this repository. ${contextNote}
+
+${backlogNote}
+
+${goalBlock(goal)}
+
+You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks with ralph_todo so the backlog always reflects the remaining work.
+
+1. Read ${state.specPath} in full, then call ralph_todo with action "next" to get the next open task${categoryScope}: its number, body, and checkpoint. Use action "list" only when that task is blocked and you need the wider backlog to find an unblocked one.
+2. Do not work on a later task${categoryGuard}.
+3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
+4. Add focused tests and run every quality command required by SPEC.md and the backlog.
+5. Only after all acceptance criteria pass, call ralph_todo with action "complete" and the task's number. Do not edit ${state.todoPath} directly.
+6. Commit the completed iteration locally. Do not push.
+
+${decisionNote}`;
+		}
+
 		const categoryScope = state.category ? ` in category "${state.category}"` : '';
 		return `Run the Ralph loop for this repository. ${contextNote}
 
@@ -427,6 +525,18 @@ function resumePrompt(state: RalphState): string {
 
 function contextCheckpointPrompt(state: RalphState): string {
 	if (isRalphBacklog(state.baselineTodo)) {
+		// Task-less goal iterations (planning/re-evaluation) have no task to
+		// checkpoint: the goal carries the durable state instead.
+		const goalInfo = goalPhase(state);
+		if (goalInfo && goalInfo.phase !== 'execution') {
+			return `The current Ralph goal iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations}.
+
+1. Call ralph_goal with action "checkpoint" and a concise note: planning or re-evaluation evidence so far, relevant changed paths, known failures or risks, and the exact next step. The tool replaces any older checkpoint: keep only the single most recent one, because an older checkpoint's state and next step are stale.
+2. Keep a single exact next step in the checkpoint note.
+3. Do not change the goal's state, do not claim unverified work, do not modify product code, and do not commit. Do not continue work after recording the checkpoint.
+
+Report the checkpoint and the next step succinctly.`;
+		}
 		return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
 
 1. Call ralph_todo with action "list" and identify the currently selected open task.
@@ -1780,7 +1890,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
 				taskCount = countTodoTasks(currentTodo, state?.category);
-				if (isBacklogFinished(currentTodo, state?.category)) {
+				// Goal mode is done when the goal is done, not when the plan is
+				// exhausted: an empty plan is the planning state.
+				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
@@ -1805,7 +1917,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const currentTodo = await readRequiredFile(state.todoPath);
 			taskCount = countTodoTasks(currentTodo, state?.category);
-			if (isBacklogFinished(currentTodo, state?.category)) {
+			// Goal mode is done when the goal is done, not when the plan is
+			// exhausted: an empty plan is the planning state.
+			if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}
