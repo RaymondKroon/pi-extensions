@@ -69,7 +69,7 @@ export interface TodosViewOptions {
 	/**
 	 * Total view height in lines (header + body + footer). When provided the
 	 * body is a scroll window padded with blank lines up to the full height (so
-	 * the overlay blacks out the chat behind it, like the list picker); when
+	 * the overlay blacks out the chat behind it, like the home view); when
 	 * omitted every row is rendered (tests).
 	 * A function so the host can track terminal resizes.
 	 */
@@ -444,7 +444,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 				body.push(...lines.slice(0, fit));
 			}
 			// Pad the remainder with blank lines so the overlay blacks out the
-			// chat behind it even for short lists (the list picker does the same).
+			// chat behind it even for short lists (the home view does the same).
 			const total = options.height?.();
 			if (total !== undefined) {
 				const target = total - 1 - footer.length;

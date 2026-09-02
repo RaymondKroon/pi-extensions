@@ -2236,12 +2236,12 @@ T 2 - "Port the state."
 	});
 });
 
-describe('ralph-loop extension (/ralph todos view)', () => {
+describe('ralph-loop extension (/ralph home view)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);
 	});
 
-	test('opens the backlog view for the active loop and closes on q', async () => {
+	test('bare /ralph opens the home view for the active loop; enter opens the task view, q closes it', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2252,7 +2252,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 
 		// One overlay hosts both stages, so the chat scroll position is
 		// untouched and the stages swap without the chat flashing through.
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(1);
 		expect(fakeCtx.customOptions[0]).toEqual({
 			overlay: true,
@@ -2262,8 +2262,13 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, (r?: string) => {
 			closed = r;
 		}) as { render: (width: number) => string[]; handleInput: (data: string) => void };
-		// The import stamped the "General" list, so the picker opens first;
-		// selecting it swaps to the view scoped to the list.
+		// The home view shows the list rows (the import stamped "General");
+		// with no goal the (all) row is highlighted first.
+		const home = component.render(100).join('\n');
+		expect(home).toContain('Ralph home — TODO.ralph');
+		expect(home).toContain('> (all) — 2 open / 3 total');
+		expect(home).toContain('General — 2 open / 3 total');
+		// Enter on (all) opens the unchanged task view.
 		component.handleInput('\r');
 		const rendered = component.render(100).join('\n');
 		expect(rendered).toContain('Ralph backlog — TODO.ralph');
@@ -2274,7 +2279,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		expect(closed).toBe('quit');
 	});
 
-	test('scopes the view to the loop category', async () => {
+	test('opens the task view scoped to the list chosen in the home view', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2290,17 +2295,22 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		);
 		await ralph.handler('start --todo TODO.ralph --category dossier', fakeCtx.ctx);
 
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
+			handleInput: (data: string) => void;
 		};
+		// Rows: (all), dossier, auth (first-appearance order). Highlight
+		// dossier and open it.
+		component.handleInput('j');
+		component.handleInput('\r');
 		const rendered = component.render(100).join('\n');
 		expect(rendered).toContain('category "dossier"');
 		expect(rendered).toContain('Establish a clean local developer contract.');
 		expect(rendered).not.toContain('Add sign-in.');
 	});
 
-	test('asks to choose a list when the backlog has categories', async () => {
+	test('shows the lists with counts; enter opens the task view for each list', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2314,62 +2324,53 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		);
 		await importTodo(fake, fakeCtx, 'import EMAIL.md --category Email');
 
-		// Without an active loop the picker opens first; selecting a list
-		// swaps to the view scoped to it (the same overlay).
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		// The home view opens on the lists; selecting one swaps to the view
+		// scoped to it (the same overlay).
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(1);
 		expect(fakeCtx.customOptions[0]).toEqual({ overlay: true, overlayOptions: { width: '100%', maxHeight: '90%' } });
 		const host = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
 		};
-		// The picker opens first.
-		const pickerText = host.render(100).join('\n');
-		expect(pickerText).toContain('> General — 2 open / 3 total');
-		expect(pickerText).toContain('Email — 1 open / 1 total');
-		expect(pickerText).toContain('R: rename');
-		// Like the todos view: pinned to the top, padded to 90% of the
+		// The home view shows one row per list with open/total counts.
+		const homeText = host.render(100).join('\n');
+		expect(homeText).toContain('Ralph home — TODO.ralph');
+		expect(homeText).toContain('> (all) — 3 open / 4 total');
+		expect(homeText).toContain('General — 2 open / 3 total');
+		expect(homeText).toContain('Email — 1 open / 1 total');
+		expect(homeText).toContain('R: rename list');
+		// Like the task view: pinned to the top, padded to 90% of the
 		// terminal height, key hints on the bottom line.
-		const pickerLines = host.render(100);
-		expect(pickerLines.length).toBe(Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9)));
-		expect(pickerLines[0]).toContain('Ralph lists');
-		expect(pickerLines[pickerLines.length - 1]).toContain('q: quit');
-		expect(pickerLines[pickerLines.length - 2]).toBe('');
+		const homeLines = host.render(100);
+		expect(homeLines.length).toBe(Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9)));
+		expect(homeLines[0]).toContain('Ralph home');
+		expect(homeLines[homeLines.length - 1]).toContain('q: quit');
 		// Selecting a list swaps to the view scoped to it (same overlay).
+		host.handleInput('j'); // General
 		host.handleInput('\r');
 		expect(host.render(100).join('\n')).toContain('category "General"');
 		expect(host.render(100).join('\n')).not.toContain('Fetch mail.');
 
-
 		// Picking the second list scopes the view to it.
 		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		const second = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
 		};
-		second.handleInput('j');
+		second.handleInput('j'); // General
+		second.handleInput('j'); // Email
 		second.handleInput('\r');
 		const rendered = second.render(100).join('\n');
 		expect(rendered).toContain('category "Email"');
 		expect(rendered).toContain('Fetch mail.');
 		expect(rendered).not.toContain('Establish a clean local developer contract.');
 
-
-		// Cancelling the picker opens no view.
+		// Escape in the view goes back to the home view inside the same
+		// overlay; q in the home view closes it.
 		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
-		expect(fakeCtx.customFactories.length).toBe(1); // single overlay, picker stage
-		const cancelled = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
-			render: (width: number) => string[];
-		};
-		expect(cancelled.render(100).join('\n')).toContain('Ralph lists');
-
-
-		// Escape in the view goes back to the list overview inside the same
-		// overlay; q in the overview closes it.
-		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		let closed = false;
 		let result: string | undefined;
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, (r?: string) => {
@@ -2377,21 +2378,20 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 			result = r;
 		}) as { render: (width: number) => string[]; handleInput: (data: string) => void };
 		component.handleInput('j');
-		component.handleInput('\r'); // open the Email view
-		component.handleInput('\x1b'); // back to the list overview
-		expect(component.render(100).join('\n')).toContain('Ralph lists');
+		component.handleInput('\r'); // open the General view
+		component.handleInput('\x1b'); // back to the home view
+		expect(component.render(100).join('\n')).toContain('Ralph home');
 		expect(closed).toBe(false);
 		component.handleInput('q');
 		expect(closed).toBe(true);
 		expect(result).toBeUndefined();
 
-
-		// Re-opening a list from the overview swaps back to the view.
-		component.handleInput('\r');
-		expect(component.render(100).join('\n')).toContain('category "General"');
+		// Re-opening a list from the home view swaps back to the view.
+		component.handleInput('\r'); // (all) row
+		expect(component.render(100).join('\n')).toContain('Ralph backlog — TODO.ralph');
 	});
 
-	test('the list picker renames a list inline', async () => {
+	test('R renames the highlighted list from the home view', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2405,42 +2405,43 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		);
 		await importTodo(fake, fakeCtx, 'import EMAIL.md --category Email');
 
-		// The picker opens; close it after the rename round.
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
-		const picker = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
+		// The home view opens; close it after the rename round.
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		const home = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
 		};
 
-		// R starts the inline rename of the highlighted list, prefilled with
-		// its name; appending and pressing enter saves it to disk.
-		picker.handleInput('R');
-		picker.handleInput('2');
-		picker.handleInput('\r');
+		// Highlight General; R starts the inline rename prefilled with its
+		// name. Appending and pressing enter saves it to disk.
+		home.handleInput('j');
+		home.handleInput('R');
+		home.handleInput('2');
+		home.handleInput('\r');
 		await flush();
 		const onDisk = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
 		expect(onDisk.categories()).toEqual(['General2', 'Email']);
 		expect(onDisk.listTasks().find((t) => t.title === 'Establish a clean local developer contract.')?.category).toBe('General2');
-		// The picker shows the renamed list in place with a saved notice.
-		const renamed = picker.render(100).join('\n');
+		// The home view shows the renamed list in place with a saved notice.
+		const renamed = home.render(100).join('\n');
 		expect(renamed).toContain('> General2 — 2 open / 3 total');
 		expect(renamed).toContain('saved');
 
 		// Colliding names are refused: the row keeps its name, nothing is written.
-		picker.handleInput('R');
-		for (let i = 0; i < 'General2'.length; i += 1) picker.handleInput('\x7f');
-		for (const ch of 'Email') picker.handleInput(ch);
-		picker.handleInput('\r');
+		home.handleInput('R');
+		for (let i = 0; i < 'General2'.length; i += 1) home.handleInput('\x7f');
+		for (const ch of 'Email') home.handleInput(ch);
+		home.handleInput('\r');
 		await flush();
 		const after = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
 		expect(after.categories()).toEqual(['General2', 'Email']);
-		expect(picker.render(100).join('\n')).toContain('not saved');
+		expect(home.render(100).join('\n')).toContain('not saved');
 
 		// Escape cancels the inline rename.
-		picker.handleInput('R');
-		picker.handleInput('x');
-		picker.handleInput('\x1b');
-		expect(picker.render(100).join('\n')).toContain('> General2 — 2 open / 3 total');
+		home.handleInput('R');
+		home.handleInput('x');
+		home.handleInput('\x1b');
+		expect(home.render(100).join('\n')).toContain('> General2 — 2 open / 3 total');
 	});
 
 	test('falls back to a file argument, then conventional names; errors without TUI', async () => {
@@ -2452,7 +2453,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 
 		// No loop, no TODO.ralph: a Markdown TODO.md has no todo entries; the
 		// view suggests importing it instead.
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Todo entries empty. Import data with /ralph import');
 
@@ -2460,7 +2461,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		await ralph.handler('import TODO.md', fakeCtx.ctx);
 		fakeCtx.customFactories.length = 0;
 		// The import stamped the "General" list; opening it shows the view.
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		const host = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
@@ -2471,19 +2472,22 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		// Missing file: error notification, no view.
 		fakeCtx.notifications.length = 0;
 		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos missing.md', fakeCtx.ctx);
+		await ralph.handler('missing.md', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Could not read missing.md');
 
-		// Non-TUI mode: refused.
+		// Non-TUI mode: bare /ralph shows the usage, a file argument errors.
 		fakeCtx.notifications.length = 0;
 		(fakeCtx.ctx as { mode: string }).mode = 'rpc';
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('requires TUI mode');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph');
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Unknown subcommand');
 	});
 
-	test('edits from the view are written back to the backlog file', async () => {
+	test('edits from the task view are written back to the backlog file', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2491,8 +2495,8 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		const ralph = fake.commands.get('ralph')!;
 		await importTodo(fake, fakeCtx, 'import TODO.md --category General');
 
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
-		// The picker opens first; opening the list swaps to the view.
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		// The home view opens first; opening the (all) row swaps to the view.
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			handleInput: (data: string) => void;
 		};
@@ -2517,12 +2521,13 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		await writeFile(join(dir, 'EMAIL.md'), `# Email backlog\n\n## Priority 1 — email\n\n- [ ] **E1.1 Fetch mail.**\n`);
 		await importTodo(fake, fakeCtx, 'import EMAIL.md --category Email');
 
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		let closed: string | undefined;
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, (r?: string) => {
 			closed = r;
 		}) as { handleInput: (data: string) => void };
-		component.handleInput('j'); // highlight the Email list
+		component.handleInput('j'); // General
+		component.handleInput('j'); // Email
 		component.handleInput('\r'); // open it
 		component.handleInput('s');
 		component.handleInput('y');
@@ -2536,7 +2541,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('category: Email');
 	});
 
-	test('the list picker refreshes after a view round renames a list', async () => {
+	test('the home view refreshes after a task-view round renames a list', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2546,21 +2551,73 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 
 		const created: unknown[] = [];
 		fakeCtx.customControl.factoryHook = (component) => created.push(component);
-		const handler = ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		const handler = ralph.handler('TODO.ralph', fakeCtx.ctx);
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		const host = created[0] as { render: (width: number) => string[]; handleInput: (data: string) => void };
-		// Open the list, rename it from the view, and go back to the overview.
+		// Open the General view, rename the list from the view, and go back
+		// to the home view.
+		host.handleInput('j');
 		host.handleInput('\r');
 		host.handleInput('R');
 		host.handleInput('x');
 		host.handleInput('\r');
 		await flush();
 		host.handleInput('\x1b');
-		// The overview re-read the file: the list is renamed.
+		// The home view re-read the file: the list is renamed.
 		expect(host.render(100).join('\n')).toContain('Generalx — 2 open / 3 total');
 		host.handleInput('q');
 		await handler;
 		fakeCtx.customControl.factoryHook = undefined;
+	});
+
+	test('dispatch: subcommands stay, a bare /ralph and a file argument open the home view', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await importTodo(fake, fakeCtx, 'import TODO.md --category General');
+
+		// Bare /ralph opens the home view on the conventional backlog.
+		await ralph.handler('', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(1);
+		expect(
+			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
+		).toContain('Ralph home — TODO.ralph');
+
+		// A first argument that is not a subcommand is a backlog file.
+		fakeCtx.customFactories.length = 0;
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(1);
+		expect(
+			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
+		).toContain('Ralph home — TODO.ralph');
+
+		// Known subcommands are untouched: start still starts the task loop.
+		fakeCtx.customFactories.length = 0;
+		await ralph.handler('start --todo TODO.ralph', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(0);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+
+		// The command description and argument completions no longer offer
+		// the removed todos subcommand.
+		const command = fake.commands.get('ralph') as unknown as {
+			description: string;
+			getArgumentCompletions: (prefix: string) => Array<{ value: string }> | null;
+		};
+		expect(command.description).not.toContain('todos');
+		for (const prefix of ['', 't', 's', 'i', 'st', 're', 'co']) {
+			const values = (command.getArgumentCompletions(prefix) ?? []).map((o) => o.value);
+			expect(values).not.toContain('todos');
+		}
+		expect((command.getArgumentCompletions('') ?? []).map((o) => o.value)).toEqual([
+			'start',
+			'import',
+			'stop',
+			'resume',
+			'status',
+			'config'
+		]);
 	});
 });
 

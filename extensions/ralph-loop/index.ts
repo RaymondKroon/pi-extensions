@@ -33,7 +33,7 @@ import {
 	type GoalStatus
 } from './backlog.ts';
 import { createTodosView, type TodosView } from './todos-view.ts';
-import { createListPicker, type ListPicker } from './list-picker.ts';
+import { createRalphHome, type RalphHome } from './ralph-home.ts';
 
 const STATE_TYPE = 'ralph-loop-state';
 const CONFIG_TYPE = 'ralph-loop-config';
@@ -916,7 +916,7 @@ async function importMarkdownBacklog(
 		return { ok: false, level: 'warning', message: `Ralph import only accepts Markdown TODO files (.md); ${input} is not one.` };
 	}
 	// Imports always stamp a category: uncategorized tasks are invisible in the
-	// todos view's list picker. An omitted or empty category falls back to a
+	// home view's list rows. An omitted or empty category falls back to a
 	// name derived from the file name (TODO_EMAIL.md → Email).
 	const category = options.category?.trim() || suggestCategory(input);
 	let markdown: string;
@@ -2413,8 +2413,156 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	/**
+	 * Open the Ralph home view (bare /ralph or /ralph <file>): a pinned goal
+	 * row above the list rows; enter on a list opens the task view for it.
+	 * Source: an explicit file, else the active loop's backlog, else the
+	 * conventional names in the project root.
+	 */
+	const openHome = async (ctx: ExtensionCommandContext, fileArg?: string): Promise<void> => {
+		const candidates = fileArg
+			? [resolveProjectFile(ctx.cwd, fileArg)].filter((p): p is string => p !== undefined)
+			: state?.enabled
+				? [state.todoPath]
+				: [resolve(ctx.cwd, DEFAULT_TODO), resolve(ctx.cwd, 'TODO.md')];
+		let todoPath: string | undefined;
+		for (const candidate of candidates) {
+			if (candidate && (await pathExists(candidate))) {
+				todoPath = candidate;
+				break;
+			}
+		}
+		if (!todoPath) {
+			ctx.ui.notify(
+				fileArg
+					? `Could not read ${fileArg}`
+					: 'No backlog found: start a loop or pass a file (e.g. /ralph TODO.ralph)',
+				'error'
+			);
+			return;
+		}
+		const title = relative(ctx.cwd, todoPath) || todoPath;
+		const loadBacklog = (): Backlog | undefined => {
+			try {
+				const text = readFileSync(todoPath!, 'utf8');
+				// The view only renders ralph-format backlogs; Markdown
+				// backlogs must be imported first (see below).
+				return isRalphBacklog(text) ? Backlog.parse(text) : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+		let initial: Backlog | undefined;
+		try {
+			const text = readFileSync(todoPath, 'utf8');
+			if (!isRalphBacklog(text)) {
+				ctx.ui.notify('Todo entries empty. Import data with /ralph import', 'info');
+				return;
+			}
+			initial = Backlog.parse(text);
+		} catch {
+			initial = undefined;
+		}
+		if (!initial) {
+			ctx.ui.notify(`Could not parse ${todoPath} as a Ralph backlog`, 'error');
+			return;
+		}
+		// Persist a backlog mutation: run fn on the given backlog instance and
+		// write the result to disk. Return false when the change was not saved
+		// (the view keeps showing the previous data).
+		const persist = async (backlog: Backlog, fn: (b: Backlog) => void): Promise<boolean> => {
+			try {
+				fn(backlog);
+			} catch (error) {
+				ctx.ui.notify(`Could not update ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+				return false;
+			}
+			try {
+				await writeFile(todoPath, backlog.render());
+				return true;
+			} catch (error) {
+				ctx.ui.notify(`Could not save ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+				return false;
+			}
+		};
+		// The views render as overlays on top of the chat, so the chat layout
+		// and its scroll position are untouched while they are open (closing a
+		// view no longer disturbs where the chat was scrolled). One overlay
+		// hosts both stages (home view, task view) and swaps between them
+		// without closing: closing between stages would let the chat behind
+		// flash for a frame. Both stages use the todos view's layout: the
+		// list is pinned to the top, the key hints sit on the bottom line,
+		// and the lines in between are blank so the chat behind is blacked
+		// out; both size to 90% of terminal height so the status footer
+		// stays visible.
+		const OVERLAY_MAX_HEIGHT = '90%';
+		const viewHeight = () => Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9));
+		// The backlog instance the view currently renders; refreshed from
+		// disk on every home round (a task-view round may have renamed or
+		// added lists).
+		let source: Backlog = initial;
+		await ctx.ui.custom((tui, theme, _keybindings, done) => {
+			// The stage currently rendered. Swapping stages does not close
+			// the overlay, so the chat behind never flashes through.
+			let stage: RalphHome | TodosView | undefined;
+			const showStage = (next: RalphHome | TodosView) => {
+				stage?.dispose();
+				stage = next;
+				tui.requestRender();
+			};
+			const showView = (category?: string) => {
+				showStage(
+					createTodosView({
+						backlog: source,
+						tui,
+						title,
+						category,
+						theme,
+						height: viewHeight,
+						requestRender: () => tui.requestRender(),
+						onClose: () => done('quit'),
+						onBack: () => showHome(),
+						reload: loadBacklog,
+						mutate: persist,
+						onStartLoop: (loopCategory) => {
+							void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory, goal: false });
+						}
+					})
+				);
+			};
+			const showHome = () => {
+				const fresh = loadBacklog();
+				if (fresh) source = fresh;
+				showStage(
+					createRalphHome({
+						backlog: source,
+						tui,
+						title,
+						theme,
+						height: viewHeight,
+						requestRender: () => tui.requestRender(),
+						onClose: () => done(undefined),
+						reload: loadBacklog,
+						mutate: persist,
+						onOpenList: (category) => showView(category),
+						onStartGoalLoop: () => {
+							void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, goal: true });
+						}
+					})
+				);
+			};
+			showHome();
+			return {
+				render: (width: number) => stage?.render(width) ?? [],
+				handleInput: (data: string) => stage?.handleInput(data),
+				invalidate: () => stage?.invalidate(),
+				dispose: () => stage?.dispose()
+			};
+		}, { overlay: true, overlayOptions: { width: '100%', maxHeight: OVERLAY_MAX_HEIGHT } });
+	};
+
 	pi.registerCommand('ralph', {
-		description: 'Start or manage the Ralph loop: [start|import|todos|stop|resume|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|stop|resume|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
@@ -2423,7 +2571,6 @@ export default function (pi: ExtensionAPI) {
 					description: 'Defaults: SPEC.md and TODO.ralph. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into TODO.ralph, merging into an existing backlog. Each source file is only imported once.' },
-				{ value: 'todos', label: 'todos', description: 'Show the backlog in an interactive list: /ralph todos [file] (defaults to the active loop’s backlog). In the list picker: enter: open, R: rename, q: quit. In the view: a/A add and e edit open a popup form (jk/↑↓ or tab: field, enter: edit/confirm field, ctrl+s: save, esc: cancel), x delete, R rename list, s start a loop on the list, q quit.' },
 				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration.' },
 				{ value: 'resume', label: 'resume', description: 'Resume a paused loop (Escape pauses it).' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
@@ -2499,170 +2646,25 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			if (command && command !== 'start' && command !== 'import' && command !== 'todos') {
-				ctx.ui.notify('Usage: /ralph [start|import|todos|stop|resume|status|config]', 'warning');
-				return;
-			}
-			if (command === 'todos') {
-				const fileArg = commandArgs.slice(1)[0];
+			const knownCommands = ['start', 'import', 'stop', 'resume', 'status', 'config'];
+			if (command !== '' && !knownCommands.includes(command)) {
+				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('/ralph todos requires TUI mode', 'error');
-					return;
-				}
-				// Source: the active loop's backlog, else an explicit file, else the
-				// conventional names in the project root.
-				const candidates = state?.enabled
-					? [state.todoPath]
-					: fileArg
-						? [resolveProjectFile(ctx.cwd, fileArg)].filter((p): p is string => p !== undefined)
-						: [resolve(ctx.cwd, DEFAULT_TODO), resolve(ctx.cwd, 'TODO.md')];
-				let todoPath: string | undefined;
-				for (const candidate of candidates) {
-					if (candidate && (await pathExists(candidate))) {
-						todoPath = candidate;
-						break;
-					}
-				}
-				if (!todoPath) {
 					ctx.ui.notify(
-						fileArg
-							? `Could not read ${fileArg}`
-							: 'No backlog found: start a loop or pass a file (e.g. /ralph todos TODO.ralph)',
+						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|stop|resume|status|config]`,
 						'error'
 					);
 					return;
 				}
-				const title = relative(ctx.cwd, todoPath) || todoPath;
-				const loadBacklog = (): Backlog | undefined => {
-					try {
-						const text = readFileSync(todoPath!, 'utf8');
-						// The view only renders ralph-format backlogs; Markdown
-						// backlogs must be imported first (see below).
-						return isRalphBacklog(text) ? Backlog.parse(text) : undefined;
-					} catch {
-						return undefined;
-					}
-				};
-				let initial: Backlog | undefined;
-				try {
-					const text = readFileSync(todoPath, 'utf8');
-					if (!isRalphBacklog(text)) {
-						ctx.ui.notify('Todo entries empty. Import data with /ralph import', 'info');
-						return;
-					}
-					initial = Backlog.parse(text);
-				} catch {
-					initial = undefined;
-				}
-				if (!initial) {
-					ctx.ui.notify(`Could not parse ${todoPath} as a Ralph backlog`, 'error');
+				await openHome(ctx, commandArgs[0]);
+				return;
+			}
+			if (command === '') {
+				if (ctx.mode !== 'tui') {
+					ctx.ui.notify('Usage: /ralph [start|import|stop|resume|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
 					return;
 				}
-				// An active loop already scopes the view to its category; otherwise
-				// let the user choose a list (category) when the backlog has any.
-				// Escape from a list goes back to this overview.
-				const hasPicker = initial.categories().length > 0;
-				// The views render as overlays on top of the chat, so the chat layout
-				// and its scroll position are untouched while they are open (closing a
-				// view no longer disturbs where the chat was scrolled). One overlay
-				// hosts both stages (list picker, task view) and swaps between them
-				// without closing: closing between stages would let the chat behind
-				// flash for a frame. Both stages use the todos view's layout: the
-				// list is pinned to the top, the key hints sit on the bottom line,
-				// and the lines in between are blank so the chat behind is blacked
-				// out; both size to 90% of terminal height so the status footer
-				// stays visible.
-				const OVERLAY_MAX_HEIGHT = '90%';
-				const viewHeight = () => Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9));
-				let viewCategory = state?.enabled ? state.category : undefined;
-				// The backlog instance the view currently renders; refreshed from
-				// disk on every picker round (a view round may have renamed or
-				// added lists).
-				let source: Backlog = initial;
-				await ctx.ui.custom((tui, theme, _keybindings, done) => {
-					// The stage currently rendered. Swapping stages does not close
-					// the overlay, so the chat behind never flashes through.
-					let stage: ListPicker | TodosView | undefined;
-					const showStage = (next: ListPicker | TodosView) => {
-						stage?.dispose();
-						stage = next;
-						tui.requestRender();
-					};
-					const showView = () => {
-						showStage(
-							createTodosView({
-								backlog: source,
-								tui,
-								title,
-								category: viewCategory,
-								theme,
-								height: viewHeight,
-								requestRender: () => tui.requestRender(),
-								onClose: () => done('quit'),
-								onBack: hasPicker ? () => showPicker() : undefined,
-								reload: loadBacklog,
-								mutate: async (backlog, fn) => {
-									try {
-										fn(backlog);
-									} catch (error) {
-										ctx.ui.notify(`Could not update ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
-										return false;
-									}
-									try {
-										await writeFile(todoPath, backlog.render());
-										return true;
-									} catch (error) {
-										ctx.ui.notify(`Could not save ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
-										return false;
-									}
-								},
-								onStartLoop: (loopCategory) => {
-									void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory, goal: false });
-								}
-							})
-						);
-					};
-					const showPicker = () => {
-						const fresh = loadBacklog();
-						if (fresh) source = fresh;
-						const lists = source.categories().map((name) => {
-							const counts = source.counts(name);
-							return { name, open: counts.open, total: counts.total };
-						});
-						showStage(
-							createListPicker({
-								title,
-								lists,
-								theme,
-								height: viewHeight,
-								requestRender: () => tui.requestRender(),
-								onOpen: (name) => {
-									viewCategory = name;
-									showView();
-								},
-								onClose: () => done(undefined),
-								onRename: async (oldName, newName) => {
-									try {
-										const target = loadBacklog() ?? source;
-										target.renameCategory(oldName, newName);
-										await writeFile(todoPath, target.render());
-										return true;
-									} catch {
-										return false;
-									}
-								}
-							})
-						);
-					};
-					if (viewCategory === undefined && hasPicker) showPicker();
-					else showView();
-					return {
-						render: (width: number) => stage?.render(width) ?? [],
-						handleInput: (data: string) => stage?.handleInput(data),
-						invalidate: () => stage?.invalidate(),
-						dispose: () => stage?.dispose()
-					};
-				}, { overlay: true, overlayOptions: { width: '100%', maxHeight: OVERLAY_MAX_HEIGHT } });
+				await openHome(ctx);
 				return;
 			}
 			if (command === 'import') {
