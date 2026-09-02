@@ -544,11 +544,11 @@ export class Backlog {
 
 	// --- mutations --------------------------------------------------------------
 
-	/** Mark the task with the given position number done. Throws when unknown. */
+	/** Mark the task with the given position number done. Clears the context checkpoint (it described in-progress work). Throws when unknown. */
 	complete(number: string, category?: string): Task {
 		const task = this.requireTask(number, category);
-		this.db.prepare('UPDATE tasks SET done = 1 WHERE id = ?').run(task.id);
-		return { ...task, done: true };
+		this.db.prepare('UPDATE tasks SET done = 1, checkpoint = NULL, checkpoint_iteration = NULL WHERE id = ?').run(task.id);
+		return { ...task, done: true, checkpoint: null, checkpointIteration: null };
 	}
 
 	/** Replace the single context checkpoint of the task with the given number. */
@@ -611,12 +611,14 @@ export class Backlog {
 		return renamed.length;
 	}
 
-	/** Mark the task with the given id done or open again. */
+	/** Mark the task with the given id done or open again. Completing clears the context checkpoint (it described in-progress work). */
 	setDoneById(id: number, done: boolean): Task {
 		const task = this.listTasks().find((t) => t.id === id);
 		if (!task) throw new Error(`no task with id ${id}`);
-		this.db.prepare('UPDATE tasks SET done = ? WHERE id = ?').run(done ? 1 : 0, id);
-		return { ...task, done };
+		this.db
+			.prepare('UPDATE tasks SET done = ?, checkpoint = ?, checkpoint_iteration = ? WHERE id = ?')
+			.run(done ? 1 : 0, done ? null : task.checkpoint, done ? null : task.checkpointIteration, id);
+		return { ...task, done, checkpoint: done ? null : task.checkpoint, checkpointIteration: done ? null : task.checkpointIteration };
 	}
 
 	/** Mark the task with the given position number done or open again. */

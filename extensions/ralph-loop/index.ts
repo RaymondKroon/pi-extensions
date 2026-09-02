@@ -387,8 +387,8 @@ The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and
 2. Do not work on a later task${state.category ? ' or on a task in another category' : ''}.
 3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
 4. Add focused tests and run every quality command required by SPEC.md and the backlog.
-5. Only after all acceptance criteria pass, commit the completed iteration locally. Do not push.
-6. Finally, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly. This is the last step of the iteration: stop working when the tool confirms the completion.
+5. Only after all acceptance criteria pass, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly.
+6. Finally, commit the completed iteration locally in a single commit that also includes the ${state.todoPath} update. Do not push. This is the last step of the iteration: stop working when the commit is made.
 
 ${decisionNote}`;
 	}
@@ -399,8 +399,8 @@ ${decisionNote}`;
 2. Select the highest-priority unblocked unchecked TODO item. Do not work on a later item.
 3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
 4. Add focused tests and run every quality command required by SPEC.md and TODO.md.
-5. Only after all acceptance criteria pass, commit the completed iteration locally. Do not push.
-6. Finally, update ${state.todoPath}: check the completed item and add exactly one dated, concise entry for it to the completion log (outcome, changed paths, evidence, verification commands). The completion log is the single completion record: do not also add a completion note under the checked item itself. This is the last step of the iteration: stop working when the TODO is updated.
+5. Only after all acceptance criteria pass, update ${state.todoPath}: check the completed item and add exactly one dated, concise entry for it to the completion log (outcome, changed paths, evidence, verification commands). The completion log is the single completion record: do not also add a completion note under the checked item itself.
+6. Finally, commit the completed iteration locally in a single commit that also includes the ${state.todoPath} update. Do not push. This is the last step of the iteration: stop working when the commit is made.
 
 ${decisionNote}`;
 }
@@ -448,7 +448,7 @@ function completionRecordingPrompt(state: RalphState): string {
 			return `A Ralph TODO task was just completed: ${target}. Verify its progress record now, then stop working; a fresh Ralph iteration will start after this turn.
 
 1. Call ralph_todo with action "list" and ${singular ? 'the task\'s number' : 'each task\'s number'} to check the completion log. If ${singular ? 'the task' : 'a task'} already has a completion log entry (for example, recorded by the "complete" call), do not add another. Only if the entry is missing, call ralph_todo with action "log" for ${target}, today's date, and exactly one concise ${singular ? 'entry' : 'entry per task'}: outcome, changed paths, evidence, and the verification commands that were run. Do not modify any other task.
-2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
+2. Check git status. If the completed work or the ${state.todoPath} update is not committed locally, commit it with a concise message. Do not push.
 3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
 
 Report the completion log ${singular ? 'entry' : 'entries'} (existing or newly recorded) and the commit (if any) succinctly.`;
@@ -456,7 +456,7 @@ Report the completion log ${singular ? 'entry' : 'entries'} (existing or newly r
 		return `A Ralph TODO task was just completed. Verify its progress record now, then stop working; a fresh Ralph iteration will start after this turn.
 
 1. Call ralph_todo with action "list" and identify the task that was just completed (the one you marked complete in the previous turn). Check its completion log: if it already has a completion log entry (for example, recorded by the "complete" call), do not add another. Only if the entry is missing, call ralph_todo with action "log", the task's number, today's date, and exactly one concise entry: outcome, changed paths, evidence, and the verification commands that were run. Do not modify any other task.
-2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
+2. Check git status. If the completed work or the ${state.todoPath} update is not committed locally, commit it with a concise message. Do not push.
 3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
 
 Report the completion log entry (existing or newly recorded) and the commit (if any) succinctly.`;
@@ -465,7 +465,7 @@ Report the completion log entry (existing or newly recorded) and the commit (if 
 
 1. Read ${state.todoPath} and identify the item that was just checked.
 2. Ensure the completion log has exactly one dated, concise entry for it: outcome, changed paths, evidence, and the verification commands that were run. Add or correct the entry if it is missing or incomplete. The completion log is the single completion record: if a completion note was also added under the checked item itself, remove it. Do not modify any other TODO item.
-3. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
+3. Check git status. If the completed work or the ${state.todoPath} update is not committed locally, commit it with a concise message. Do not push.
 4. Do not start work on the next TODO item and do not modify product code beyond the completion record.
 
 Report the recorded entry and the commit (if any) succinctly.`;

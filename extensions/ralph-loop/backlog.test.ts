@@ -248,6 +248,18 @@ describe('mutations', () => {
 		expect(reloaded.findTaskByNumber('2')?.done).toBe(true);
 	});
 
+	test('complete clears the task checkpoint', () => {
+		const backlog = Backlog.parse(SAMPLE);
+		expect(backlog.findTaskByNumber('2')?.checkpoint).not.toBeNull();
+		const done = backlog.complete('2');
+		expect(done).toMatchObject({ done: true, checkpoint: null, checkpointIteration: null });
+		const rendered = backlog.render();
+		expect(rendered.match(/^C 2 /gm)).toBeNull();
+		const reloaded = Backlog.parse(rendered);
+		const task = reloaded.findTaskByNumber('2');
+		expect(task).toMatchObject({ done: true, checkpoint: null, checkpointIteration: null });
+	});
+
 	test('complete with an unknown number lists the known numbers', () => {
 		const backlog = Backlog.parse(SAMPLE);
 		expect(() => backlog.complete('9')).toThrow(/no task 9 \(tasks: 1, 2, 3, 4, 5\)/);
@@ -477,6 +489,22 @@ describe('list management (categories, update, delete)', () => {
 		expect(reloaded.findTaskByNumber('1')?.done).toBe(false);
 		expect(reloaded.findTaskByNumber('3')?.done).toBe(true);
 		expect(() => backlog.setDone('9', true)).toThrow(/no task 9/);
+	});
+
+	test('setDone keeps the checkpoint when reopening and clears it when completing', () => {
+		const backlog = Backlog.parse(SAMPLE);
+		const original = backlog.findTaskByNumber('2');
+		expect(original?.checkpoint).not.toBeNull();
+		// Reopening an open task keeps the checkpoint.
+		const reopened = backlog.setDone('2', false);
+		expect(reopened).toMatchObject({ done: false, checkpoint: original?.checkpoint, checkpointIteration: original?.checkpointIteration });
+		// Completing clears it.
+		const done = backlog.setDone('2', true);
+		expect(done).toMatchObject({ done: true, checkpoint: null, checkpointIteration: null });
+		const rendered = backlog.render();
+		expect(rendered.match(/^C 2 /gm)).toBeNull();
+		const reloaded = Backlog.parse(rendered);
+		expect(reloaded.findTaskByNumber('2')).toMatchObject({ done: true, checkpoint: null, checkpointIteration: null });
 	});
 
 	test('deleteTask removes the task and its log entries', () => {
