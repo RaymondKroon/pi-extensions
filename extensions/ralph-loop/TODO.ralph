@@ -92,6 +92,7 @@ T 13 - "Add a /ralph-init --goal template"
 B 13
   - Generates a SPEC with the goal and acceptance criteria plus a backlog containing a Goal section and no tasks.
   - Acceptance: init test asserting the generated files parse and the goal is present.
+D 13
 
 T 14 - "Add an end-to-end goal loop test"
 B 14
@@ -133,3 +134,6 @@ L 11 11 2026-09-02
 
 L 12 12 2026-09-02
   Status line now shows loop mode and goal state. Goal loops render as `Ralph (goal): <state> · iteration X/Y · task: C/T (iteration N) · goal: open|claimed|done · context: …` in the status widget and as `Ralph goal loop is …` in /ralph status (active line gains the `· goal: <state>` segment); task-mode strings are byte-identical to before (goal segment suppressed outside goal mode, even when the backlog contains a goal). Implementation: goal state cached alongside taskCount via new refreshCounts() at all existing refresh points (start, session_start, settle, rotations, /ralph rotate), cleared on stop/reload, and kept in sync by ralph_goal mutations (syncGoalState + updateStatus after claim/confirm/withdraw so the blocked approval gate shows `claimed` immediately). Changed: extensions/ralph-loop/index.ts, extensions/ralph-loop/index.test.ts. Tests: new suite 'status mode and goal state' (5 tests: task mode unchanged, task mode ignores goal in file, goal mode open, claim→claimed→confirm→done, rejected completion withdraw→open) plus updated goal-mode assertions for the new strings. Evidence: `bun test .` → 267 pass / 0 fail across 5 files (incl. index.e2e.test.ts 4/4, todos-view snapshots unchanged). Committed locally as 94d8492 (not pushed).
+
+L 13 13 2026-09-02
+  Added /ralph-init --goal: the ralph-format backlog is created with the goal derived from the brief (first line = title, full brief = body when longer) and no tasks; the spec prompt now states the goal verbatim and requires explicit, verifiable acceptance criteria; --goal requires a brief; re-running is idempotent (existing goal untouched, goal-less ralph backlog gets the goal added). Changed: index.ts (parseInitFiles --goal, goalFromBrief, initPrompt goal note, ralph-init handler/description/completions), index.test.ts (new --goal describe: goal+no-tasks backlog parses with goal present, brief required, idempotent, adds goal to existing backlog, --todo-only). Evidence: bun test → 272 pass, 0 fail across 5 files (incl. todos-view snapshots, no drift). Committed as 485f6fd.
