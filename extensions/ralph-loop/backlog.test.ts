@@ -117,6 +117,118 @@ L 1 P0.1 2026-08-10
 	});
 });
 
+describe('goal', () => {
+	const GOAL_SAMPLE = `# ralph v2
+
+M source "TODO.md"
+
+G "Rewrite the app in the new framework" open
+GB
+  - Port the routes.
+  - Port the state.
+GE "All routes render; bun test green."
+GC 4
+  Completed: routes. Next step: state.
+
+T 1 - "Port the routes."
+`;
+
+	test('round-trips a goal and render is idempotent', () => {
+		const first = Backlog.parse(GOAL_SAMPLE);
+		expect(first.goal()).toEqual({
+			title: 'Rewrite the app in the new framework',
+			status: 'open',
+			body: '- Port the routes.\n- Port the state.',
+			evidence: 'All routes render; bun test green.',
+			checkpoint: 'Completed: routes. Next step: state.',
+			checkpointIteration: 4
+		});
+		const rendered = first.render();
+		expect(Backlog.parse(rendered).render()).toBe(rendered);
+		// The goal block sits between the meta records and the first task.
+		const lines = rendered.split('\n');
+		expect(lines.indexOf('G "Rewrite the app in the new framework" open'))
+			.toBeGreaterThan(lines.indexOf('M source "TODO.md"'));
+		expect(lines.indexOf('G "Rewrite the app in the new framework" open'))
+			.toBeLessThan(lines.findIndex((line) => line.startsWith('T 1 ')));
+	});
+
+	test('a file without a goal parses as before and renders no G line', () => {
+		const backlog = Backlog.parse(SAMPLE);
+		expect(backlog.goal()).toBeUndefined();
+		expect(backlog.render().split('\n').some((line) => /^G( |$)/.test(line))).toBe(false);
+	});
+
+	test('setGoal creates a goal with status open', () => {
+		const backlog = Backlog.parse(SAMPLE);
+		const goal = backlog.setGoal({ title: 'Ship the rewrite', body: '- Step one.' });
+		expect(goal).toEqual({
+			title: 'Ship the rewrite',
+			status: 'open',
+			body: '- Step one.',
+			evidence: null,
+			checkpoint: null,
+			checkpointIteration: null
+		});
+		expect(backlog.goal()).toEqual(goal);
+	});
+
+	test('setGoal updates title and body but preserves status, evidence, and checkpoint', () => {
+		const backlog = Backlog.parse(GOAL_SAMPLE);
+		// Simulate a claimed goal with evidence and a checkpoint.
+		backlog.db.prepare("UPDATE goal SET status = 'claimed', evidence = 'criteria met' WHERE id = 1").run();
+		const updated = backlog.setGoal({ title: 'Ship the rewrite (v2)', body: '- Step two.' });
+		expect(updated).toMatchObject({
+			title: 'Ship the rewrite (v2)',
+			status: 'claimed',
+			body: '- Step two.',
+			evidence: 'criteria met',
+			checkpoint: 'Completed: routes. Next step: state.',
+			checkpointIteration: 4
+		});
+	});
+
+	test('setGoal requires a non-empty title', () => {
+		const backlog = Backlog.empty();
+		expect(() => backlog.setGoal({ title: '   ' })).toThrow(/goal title is required/);
+	});
+
+	test('deleteGoal removes the goal', () => {
+		const backlog = Backlog.parse(GOAL_SAMPLE);
+		backlog.deleteGoal();
+		expect(backlog.goal()).toBeUndefined();
+		expect(backlog.render().split('\n').some((line) => /^G( |$)/.test(line))).toBe(false);
+	});
+
+	test('escapes quotes and backslashes in the goal title', () => {
+		const backlog = Backlog.empty();
+		backlog.setGoal({ title: 'Say "hi" \\ there' });
+		const rendered = backlog.render();
+		expect(rendered).toContain('G "Say \\"hi\\" \\\\ there" open');
+		expect(Backlog.parse(rendered).goal()?.title).toBe('Say "hi" \\ there');
+	});
+
+	test('rejects goal parse errors', () => {
+		const parse = (text: string): never => {
+			try {
+				Backlog.parse(text);
+			} catch (error) {
+				expect(error).toBeInstanceOf(BacklogParseError);
+				throw error;
+			}
+			throw new Error('expected a parse error');
+		};
+		expect(() => parse('# ralph v2\n\nG "a" open\nG "b" open\n')).toThrow(/duplicate goal record/);
+		expect(() => parse('# ralph v2\n\nG "a" pending\n')).toThrow(/invalid goal status/);
+		expect(() => parse('# ralph v2\n\nGB\n  body\n')).toThrow(/goal body before goal record/);
+		expect(() => parse('# ralph v2\n\nGE "evidence"\n')).toThrow(/goal evidence before goal record/);
+		expect(() => parse('# ralph v2\n\nGC 1\n  note\n')).toThrow(/goal checkpoint before goal record/);
+		expect(() => parse('# ralph v2\n\nG "a" open\nGB\n  one\nGB\n  two\n')).toThrow(/already has a body block/);
+		expect(() => parse('# ralph v2\n\nG "a" open\nGE "one"\nGE "two"\n')).toThrow(/already has evidence/);
+		expect(() => parse('# ralph v2\n\nG "a" open\nGC 1\n  one\nGC 2\n  two\n')).toThrow(/already has a checkpoint block/);
+	});
+});
+
 describe('position numbers', () => {
 	test('numbers tasks in list order', () => {
 		const backlog = Backlog.parse(SAMPLE);

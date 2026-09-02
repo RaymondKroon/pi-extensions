@@ -1,0 +1,91 @@
+# ralph v2
+
+T 1 - "Add Goal section to the ralph backlog format"
+B 1
+  - File format: `## Goal` section between the header and the first list: title, status (open/claimed/done), body block, evidence line, checkpoint line (with iteration).
+  - Parse: absent section = no goal; files without a goal parse exactly as today; render: round-trips and is idempotent.
+  - Backlog API: `goal(): Goal | undefined`, `setGoal({ title, body })`, `deleteGoal()`.
+  - Acceptance: backlog.test.ts tests for round-trip, absent goal, idempotent render; all existing backlog tests pass.
+D 1
+C 1 1
+  Design done, code not yet written (backlog.ts unmodified, verified via git status). Format: records G "<title>" <status> (open|claimed|done), GB body block, GE "<evidence>", GC <iteration> checkpoint block; single-row goal table (id 1); API goal(), setGoal({title, body}) (create -> status open; update preserves status/evidence/checkpoint), deleteGoal(); render inserts the goal block after meta, before tasks (byte-identical output when no goal). The 9-part backlog.ts edit was drafted but the batch failed on the goal() anchor "listMeta(): MetaEntry[] {" (edits[5] not found) - re-read that region for exact text before re-applying. Next step: re-read backlog.ts around listMeta(), re-apply the 9-part edit (header comment, Goal/GoalStatus types, schema, OpenBlock kinds, closeBlock cases, G/GB/GE/GC parse tags, goal(), setGoal/deleteGoal, render block), then add a 'goal' describe block to backlog.test.ts (GOAL_SAMPLE round-trip + idempotence, absent goal -> goal() undefined and no G line in render, setGoal create/preserve, deleteGoal, parse errors: duplicate goal, invalid status, GB/GE/GC before G, duplicate GB/GE/GC, title escaping) and run bun test.
+
+T 2 - "Add goal state transitions to the Backlog API"
+B 2
+  - Methods: `claimGoal(evidence)`, `confirmGoal()`, `withdrawGoal(note)`, `setGoalCheckpoint(note, iteration)`.
+  - Preconditions: claim requires open; confirm requires claimed; withdraw requires claimed and its note becomes the goal checkpoint; checkpoint requires a goal.
+  - Acceptance: unit tests for every valid transition and every invalid transition throwing.
+
+T 3 - "Add goal mode to Ralph state and /ralph start"
+B 3
+  - `mode: 'tasks' | 'goal'` on RalphState; isRalphState + normalizeState (default 'tasks' so persisted sessions are unchanged).
+  - `--goal` flag on /ralph start (parseStartFiles + argument completions).
+  - startLoop: goal mode requires a goal that is open or claimed and allows zero open tasks; task-mode validation is unchanged.
+  - Acceptance: start-validation tests (no goal, goal done, zero open tasks OK, task mode unchanged) and a state persistence round-trip.
+
+T 4 - "Add goal-loop iteration prompts"
+B 4
+  - iterationPrompt goal variants by backlog state: planning (goal open, zero tasks), execution (open tasks: the task prompt plus goal context — keep the plan honest, add/adjust tasks when reality diverges), re-evaluation (goal open, tasks exist, none open: re-check every acceptance criterion, add tasks or complete the goal).
+  - contextCheckpointPrompt goal variant: task-less iterations (planning/re-evaluation) checkpoint via ralph_goal checkpoint.
+  - Acceptance: prompt tests for all three variants and the checkpoint variant.
+
+T 5 - "Register the ralph_goal tool (first cut)"
+B 5
+  - Actions: show (works anywhere; target = active loop's backlog else TODO.ralph), checkpoint (active goal loop), complete (active goal loop; goal open; no open tasks; evidence note required; goal becomes done).
+  - Description/guidelines state the completion bar: full verification run, evidence required, the goal text is the user's contract (model is read-only on it).
+  - Acceptance: tool tests for each action and each gate rejection; show works outside a loop.
+
+T 6 - "Stop the goal loop on goal completion and stall"
+B 6
+  - agent_settled: goal done in the file -> stopLoop; goal open + no open tasks + no plan growth + no completion -> stop with a clear stalled notification.
+  - startFreshIteration: check goal done before starting a fresh iteration.
+  - Acceptance: settle-handler tests for the goal-done stop and the stall stop.
+
+T 7 - "Add plan-grew rotation to the goal loop"
+B 7
+  - New rotation reason 'plan-updated': baseline diff shows new open task ids (no completions) -> recording turn that only commits (no completion log) -> execution iteration.
+  - Acceptance: tests: a planning turn that adds tasks rotates into an execution iteration; editing tasks without changing the open set does not rotate.
+
+T 8 - "Gate goal completion on user approval"
+B 8
+  - complete now claims: goal -> claimed with evidence, blockLoop with the question and evidence, terminate: true (the ralph_request_decision pattern).
+  - autoApproveDecisions: complete goes straight to done with approver 'auto-approved'.
+  - New actions: confirm (claimed -> done) and withdraw (claimed -> open, note becomes the checkpoint).
+  - Tool result text instructs the model on the after-answer procedure: approved -> record decision, ralph_resolve_decision, ralph_goal confirm; rejected -> ralph_goal withdraw with what is missing, then continue working.
+  - Acceptance: tests: blocked state set and turn terminated; confirm/withdraw transitions; auto-approve path.
+
+T 9 - "Extract the shared view kit from todos-view.ts"
+B 9
+  - Move popupBox, the form/confirm/input/reason/editor modes, and footer layout into view-kit.ts; TodosView becomes a consumer.
+  - Acceptance: all existing todos-view tests pass with no snapshot drift.
+
+T 10 - "Build the Ralph home view"
+B 10
+  - ralph-home.ts on the view kit: pinned goal row (status-colored; O expands to criteria/evidence/checkpoint detail rows), list rows with counts plus an (all) row, R renames a list.
+  - Goal keys: A add/edit goal (form popup: title + body), D delete goal (confirm), S start goal loop (confirm -> startLoop with mode goal).
+  - Goal mutations flow through the mutate callback; r reloads; q quits; enter on a list opens the TodosView (Escape back to home).
+  - Acceptance: render + key-handling tests: with/without goal, all three statuses, expansion, form save/cancel, confirms, S start, reload picking up external changes.
+
+T 11 - "Open home on bare /ralph and remove the todos command"
+B 11
+  - Dispatch: no args -> home GUI (TUI) / usage notice (non-TUI); first arg that is not a known subcommand -> backlog file for home (TUI) / error (non-TUI).
+  - Remove the `todos` subcommand, list-picker.ts and its tests; update argument completions and the command description.
+  - Acceptance: command dispatch tests; zero remaining references to list-picker or the todos subcommand.
+
+T 12 - "Show mode and goal state in the status line"
+B 12
+  - updateStatus and /ralph status show: `Ralph (goal): iter 3/50 - task 2/7 - goal: open`; task-mode status is unchanged.
+  - Acceptance: status rendering tests for both modes and each goal state.
+
+T 13 - "Add a /ralph-init --goal template"
+B 13
+  - Generates a SPEC with the goal and acceptance criteria plus a backlog containing a Goal section and no tasks.
+  - Acceptance: init test asserting the generated files parse and the goal is present.
+
+T 14 - "Add an end-to-end goal loop test"
+B 14
+  - Full cycle in the index.e2e.test.ts style: /ralph start --goal on a goal-only backlog -> planning iteration adds tasks -> execution completes a task -> plan exhausted -> re-evaluation -> goal complete -> approval -> loop stops.
+  - Acceptance: the e2e passes and the existing task-loop e2e still passes.
+
+L 1 1 -
+  Added the Goal section to the ralph format: G "<title>" <status> (open|claimed|done), GB body block, GE "<evidence>", GC <iteration> checkpoint block; single-row goal table (id 1); Backlog API goal(), setGoal({title, body}) (create -> open, update preserves status/evidence/checkpoint), deleteGoal(); render inserts the goal block after meta, before tasks, and is byte-identical for goal-less files. Parse rejects duplicate goal, invalid status, GB/GE/GC before G, and duplicate GB/GE/GC. Changed: backlog.ts, backlog.test.ts (new 'goal' describe: round-trip + idempotence, absent goal, setGoal create/preserve, deleteGoal, title escaping, parse errors). Commands: bun install (node_modules was missing peer deps), bun test -> 188 pass / 0 fail across backlog, index, todos-view, index.e2e.
