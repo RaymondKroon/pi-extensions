@@ -37,6 +37,7 @@ B 5
   - Actions: show (works anywhere; target = active loop's backlog else TODO.ralph), checkpoint (active goal loop), complete (active goal loop; goal open; no open tasks; evidence note required; goal becomes done).
   - Description/guidelines state the completion bar: full verification run, evidence required, the goal text is the user's contract (model is read-only on it).
   - Acceptance: tool tests for each action and each gate rejection; show works outside a loop.
+D 5
 
 T 6 - "Stop the goal loop on goal completion and stall"
 B 6
@@ -101,3 +102,6 @@ L 3 3 2026-09-02
 
 L 4 4 -
   Goal variants of iterationPrompt (planning: decompose goal into tasks, no implementation; execution: task prompt plus goal context, keep the plan honest; re-evaluation: re-check every acceptance criterion, add tasks or ralph_goal complete) and contextCheckpointPrompt (task-less goal iterations checkpoint via ralph_goal checkpoint). Changed: index.ts (goalPhase/goalBlock helpers, prompt variants, agent_settled no longer stops a goal loop on an exhausted plan), index.test.ts (6 new prompt tests). bun test: 213 pass, 0 fail. Commit 8e43fba.
+
+L 5 5 -
+  Registered the ralph_goal tool (first cut): show (works anywhere; target = active loop's backlog else TODO.ralph; prints title/status/body/evidence/checkpoint via new backlog.ts formatGoal), checkpoint (active goal loop only; note required; replaces the single goal checkpoint via setGoalCheckpoint), complete (active goal loop only; requires goal open + no open tasks + evidence note; claimGoal + confirmGoal → done with evidence in file). Description/guidelines state the completion bar (full verification run, evidence required) and that the goal text is the user's contract (model read-only). Extracted the shared loadTargetBacklog parse discipline from ralph_todo so both tools share parse → mutate → render → write. Changed: index.ts, backlog.ts, index.test.ts (7 new tests covering each action and each gate rejection). Verified: bun test — 220 pass / 0 fail across 4 files.
