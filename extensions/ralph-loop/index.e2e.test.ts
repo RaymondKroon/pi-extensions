@@ -30,18 +30,23 @@ import { join, resolve } from 'node:path';
 
 const RALPH_EXTENSION = resolve(import.meta.dirname, 'index.ts');
 
-const TODO_V1 = `# Backlog
+const RALPH_V1 = `# ralph v2
 
-- [ ] Task one
-- [ ] Task two
-- [ ] Task three
+T 1 - "Task one"
+
+T 2 - "Task two"
+
+T 3 - "Task three"
 `;
 
-const TODO_V2_TASK_ONE_DONE = `# Backlog
+const RALPH_V2_TASK_ONE_DONE = `# ralph v2
 
-- [x] Task one
-- [ ] Task two
-- [ ] Task three
+T 1 - "Task one"
+D 1
+
+T 2 - "Task two"
+
+T 3 - "Task three"
 `;
 
 const BLOB_MARKER = 'RALPH-E2E-BLOB';
@@ -172,7 +177,7 @@ beforeEach(async () => {
 	agentDir = await mkdtemp(join(tmpdir(), 'ralph-e2e-agent-'));
 	await mkdir(join(agentDir, 'extensions'), { recursive: true });
 	await writeFile(join(projectDir, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
-	await writeFile(join(projectDir, 'TODO.md'), TODO_V1);
+	await writeFile(join(projectDir, 'TODO.ralph'), RALPH_V1);
 	await mkdir(join(projectDir, '.pi'), { recursive: true });
 });
 
@@ -295,7 +300,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// 20k window is 11.5%, above the 10% threshold.
 			endpoint = startMockEndpoint([
 				textResponder(`${BLOB_MARKER} work output. `.repeat(400), { prompt_tokens: 1500, completion_tokens: 800 }),
-				textResponder('Checkpoint recorded in TODO.md.'),
+				textResponder('Checkpoint recorded in TODO.ralph.'),
 				textResponder('Continuing from the checkpoint.')
 			]);
 			const sess = await createRalphSession(endpoint.port, {
@@ -338,9 +343,9 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'completed-task: a turn that checks off a TODO item via the real write tool starts the next iteration',
 		{ timeout: 60000 },
 		async () => {
-			const todoPath = join(projectDir, 'TODO.md');
+			const todoPath = join(projectDir, 'TODO.ralph');
 			endpoint = startMockEndpoint([
-				writeToolCallResponder(todoPath, TODO_V2_TASK_ONE_DONE),
+				writeToolCallResponder(todoPath, RALPH_V2_TASK_ONE_DONE),
 				textResponder('Task one complete.'),
 				// The dedicated progress-recording turn.
 				textResponder('Progress recorded.'),
@@ -356,10 +361,10 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await sess.prompt('/ralph start');
 
 			// Iteration 1: the mock model calls the real write tool, which really
-			// updates TODO.md on disk.
+			// updates TODO.ralph on disk.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
 			const todoOnDisk = await readFile(todoPath, 'utf8');
-			expect(todoOnDisk).toContain('- [x] Task one');
+			expect(todoOnDisk).toContain('D 1');
 
 			// A dedicated recording turn (completion log + commit) runs before the
 			// fresh iteration — it is not the iteration prompt.
@@ -389,7 +394,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				writeToolCallResponder(scratchPath, `${BLOB_MARKER} second step`, { prompt_tokens: 1500, completion_tokens: 800 }),
 				writeToolCallResponder(scratchPath, 'third step'),
 				// The model complies with the steered checkpoint and ends the turn.
-				textResponder('Checkpoint recorded in TODO.md.'),
+				textResponder('Checkpoint recorded in TODO.ralph.'),
 				textResponder('Continuing from the checkpoint.')
 			]);
 			const sess = await createRalphSession(endpoint.port, {
@@ -422,7 +427,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// iteration prompt get plain text answers so the session settles.
 			const smartFallback: ScriptedResponder = (body) => {
 				const text = lastUserText(body);
-				if (text.includes('Create a durable checkpoint now')) return textResponder('Checkpoint recorded in TODO.md.')(body);
+				if (text.includes('Create a durable checkpoint now')) return textResponder('Checkpoint recorded in TODO.ralph.')(body);
 				if (text.includes('Run the Ralph loop')) return textResponder('Continuing from the checkpoint.')(body);
 				if (text.includes('was paused and is now resumed')) return textResponder('Continuing the interrupted iteration.')(body);
 				return endlessWork(body);
