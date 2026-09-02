@@ -229,6 +229,109 @@ T 1 - "Port the routes."
 	});
 });
 
+describe('goal state transitions', () => {
+	const withGoal = (status: 'open' | 'claimed' | 'done' = 'open'): Backlog => {
+		const backlog = Backlog.empty();
+		backlog.setGoal({ title: 'Ship the rewrite', body: '- Step one.' });
+		if (status !== 'open') {
+			backlog.db.prepare(`UPDATE goal SET status = '${status}' WHERE id = 1`).run();
+		}
+		return backlog;
+	};
+
+	test('claimGoal: open → claimed, records the evidence', () => {
+		const backlog = withGoal('open');
+		const goal = backlog.claimGoal('All criteria pass; bun test green.');
+		expect(goal).toMatchObject({ status: 'claimed', evidence: 'All criteria pass; bun test green.' });
+		expect(backlog.goal()).toEqual(goal);
+	});
+
+	test('confirmGoal: claimed → done', () => {
+		const backlog = withGoal('claimed');
+		const goal = backlog.confirmGoal();
+		expect(goal.status).toBe('done');
+		expect(backlog.goal()?.status).toBe('done');
+	});
+
+	test('withdrawGoal: claimed → open, note becomes the checkpoint, evidence cleared', () => {
+		const backlog = withGoal('claimed');
+		backlog.db.prepare("UPDATE goal SET evidence = 'old evidence' WHERE id = 1").run();
+		const goal = backlog.withdrawGoal('State migration still missing.');
+		expect(goal).toMatchObject({
+			status: 'open',
+			evidence: null,
+			checkpoint: 'State migration still missing.',
+			checkpointIteration: null
+		});
+		expect(backlog.goal()).toEqual(goal);
+	});
+
+	test('withdrawGoal keeps the existing checkpoint iteration', () => {
+		const backlog = withGoal('claimed');
+		backlog.setGoalCheckpoint('Iteration work.', 3);
+		const goal = backlog.withdrawGoal('Not done yet.');
+		expect(goal).toMatchObject({ status: 'open', checkpoint: 'Not done yet.', checkpointIteration: 3 });
+	});
+
+	test('setGoalCheckpoint sets and replaces the goal checkpoint', () => {
+		const backlog = withGoal('open');
+		const first = backlog.setGoalCheckpoint('Decomposed the goal.', 1);
+		expect(first).toMatchObject({ checkpoint: 'Decomposed the goal.', checkpointIteration: 1 });
+		const second = backlog.setGoalCheckpoint('Re-evaluating.', 5);
+		expect(second).toMatchObject({ checkpoint: 'Re-evaluating.', checkpointIteration: 5 });
+		expect(backlog.goal()).toEqual(second);
+	});
+
+	test('the full lifecycle round-trips through render/parse', () => {
+		const backlog = withGoal('open');
+		backlog.claimGoal('criteria met');
+		const rendered = backlog.render();
+		expect(rendered).toContain('G "Ship the rewrite" claimed');
+		expect(rendered).toContain('GE "criteria met"');
+		const reloaded = Backlog.parse(rendered);
+		reloaded.withdrawGoal('missing piece');
+		expect(reloaded.render()).toContain('G "Ship the rewrite" open');
+		expect(reloaded.render()).toContain('  missing piece');
+		expect(reloaded.render()).not.toContain('GE ');
+		reloaded.claimGoal('criteria met again');
+		reloaded.confirmGoal();
+		expect(Backlog.parse(reloaded.render()).goal()?.status).toBe('done');
+	});
+
+	test('claimGoal throws on claimed, done, and missing goals', () => {
+		expect(() => withGoal('claimed').claimGoal('evidence')).toThrow(/cannot claim the goal: it is claimed/);
+		expect(() => withGoal('done').claimGoal('evidence')).toThrow(/cannot claim the goal: it is done/);
+		expect(() => Backlog.empty().claimGoal('evidence')).toThrow(/no goal in this backlog/);
+	});
+
+	test('claimGoal requires non-empty evidence', () => {
+		expect(() => withGoal('open').claimGoal('   ')).toThrow(/goal evidence is required/);
+	});
+
+	test('confirmGoal throws on open, done, and missing goals', () => {
+		expect(() => withGoal('open').confirmGoal()).toThrow(/cannot confirm the goal: it is open/);
+		expect(() => withGoal('done').confirmGoal()).toThrow(/cannot confirm the goal: it is done/);
+		expect(() => Backlog.empty().confirmGoal()).toThrow(/no goal in this backlog/);
+	});
+
+	test('withdrawGoal throws on open, done, and missing goals', () => {
+		expect(() => withGoal('open').withdrawGoal('note')).toThrow(/cannot withdraw the goal: it is open/);
+		expect(() => withGoal('done').withdrawGoal('note')).toThrow(/cannot withdraw the goal: it is done/);
+		expect(() => Backlog.empty().withdrawGoal('note')).toThrow(/no goal in this backlog/);
+	});
+
+	test('withdrawGoal requires a non-empty note', () => {
+		expect(() => withGoal('claimed').withdrawGoal('')).toThrow(/withdrawal note is required/);
+	});
+
+	test('setGoalCheckpoint throws without a goal and on bad input', () => {
+		expect(() => Backlog.empty().setGoalCheckpoint('note', 1)).toThrow(/no goal in this backlog/);
+		expect(() => withGoal('open').setGoalCheckpoint('  ', 1)).toThrow(/checkpoint note is required/);
+		expect(() => withGoal('open').setGoalCheckpoint('note', 0)).toThrow(/positive integer/);
+		expect(() => withGoal('open').setGoalCheckpoint('note', 1.5)).toThrow(/positive integer/);
+	});
+});
+
 describe('position numbers', () => {
 	test('numbers tasks in list order', () => {
 		const backlog = Backlog.parse(SAMPLE);

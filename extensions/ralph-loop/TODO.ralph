@@ -15,6 +15,7 @@ B 2
   - Methods: `claimGoal(evidence)`, `confirmGoal()`, `withdrawGoal(note)`, `setGoalCheckpoint(note, iteration)`.
   - Preconditions: claim requires open; confirm requires claimed; withdraw requires claimed and its note becomes the goal checkpoint; checkpoint requires a goal.
   - Acceptance: unit tests for every valid transition and every invalid transition throwing.
+D 2
 
 T 3 - "Add goal mode to Ralph state and /ralph start"
 B 3
@@ -89,3 +90,6 @@ B 14
 
 L 1 1 -
   Added the Goal section to the ralph format: G "<title>" <status> (open|claimed|done), GB body block, GE "<evidence>", GC <iteration> checkpoint block; single-row goal table (id 1); Backlog API goal(), setGoal({title, body}) (create -> open, update preserves status/evidence/checkpoint), deleteGoal(); render inserts the goal block after meta, before tasks, and is byte-identical for goal-less files. Parse rejects duplicate goal, invalid status, GB/GE/GC before G, and duplicate GB/GE/GC. Changed: backlog.ts, backlog.test.ts (new 'goal' describe: round-trip + idempotence, absent goal, setGoal create/preserve, deleteGoal, title escaping, parse errors). Commands: bun install (node_modules was missing peer deps), bun test -> 188 pass / 0 fail across backlog, index, todos-view, index.e2e.
+
+L 2 2 -
+  Added claimGoal(evidence) (open→claimed, records GE evidence), confirmGoal() (claimed→done), withdrawGoal(note) (claimed→open, note becomes checkpoint, evidence cleared), setGoalCheckpoint(note, iteration) to Backlog in backlog.ts; invalid transitions and missing goal throw. Focused tests in backlog.test.ts (goal state transitions: every valid + invalid transition, lifecycle render/parse round-trip). bun test: 200 pass / 0 fail across 4 files.

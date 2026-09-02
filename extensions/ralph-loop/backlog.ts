@@ -642,6 +642,70 @@ export class Backlog {
 		this.db.prepare('DELETE FROM goal WHERE id = 1').run();
 	}
 
+	private requireGoal(): Goal {
+		const goal = this.goal();
+		if (!goal) throw new Error('no goal in this backlog');
+		return goal;
+	}
+
+	/**
+	 * Claim the goal: open → claimed, recording the completion evidence.
+	 * Throws when there is no goal or the goal is not open.
+	 */
+	claimGoal(evidence: string): Goal {
+		const goal = this.requireGoal();
+		if (goal.status !== 'open') {
+			throw new Error(`cannot claim the goal: it is ${goal.status} (claim requires open)`);
+		}
+		const note = evidence.trim();
+		if (!note) throw new Error('goal evidence is required');
+		this.db.prepare("UPDATE goal SET status = 'claimed', evidence = ? WHERE id = 1").run(note);
+		return this.goal()!;
+	}
+
+	/** Confirm the goal: claimed → done. Throws when the goal is not claimed. */
+	confirmGoal(): Goal {
+		const goal = this.requireGoal();
+		if (goal.status !== 'claimed') {
+			throw new Error(`cannot confirm the goal: it is ${goal.status} (confirm requires claimed)`);
+		}
+		this.db.prepare("UPDATE goal SET status = 'done' WHERE id = 1").run();
+		return this.goal()!;
+	}
+
+	/**
+	 * Withdraw the goal: claimed → open. The note becomes the goal checkpoint
+	 * (replacing any existing checkpoint; the checkpoint iteration is kept),
+	 * and the claim's evidence is cleared. Throws when the goal is not claimed.
+	 */
+	withdrawGoal(note: string): Goal {
+		const goal = this.requireGoal();
+		if (goal.status !== 'claimed') {
+			throw new Error(`cannot withdraw the goal: it is ${goal.status} (withdraw requires claimed)`);
+		}
+		const text = note.trim();
+		if (!text) throw new Error('a withdrawal note is required');
+		this.db
+			.prepare("UPDATE goal SET status = 'open', evidence = NULL, checkpoint = ? WHERE id = 1")
+			.run(text);
+		return this.goal()!;
+	}
+
+	/**
+	 * Replace the single goal checkpoint (replaced, never stacked).
+	 * Throws when there is no goal.
+	 */
+	setGoalCheckpoint(note: string, iteration: number): Goal {
+		this.requireGoal();
+		const text = note.trim();
+		if (!text) throw new Error('a checkpoint note is required');
+		if (!Number.isInteger(iteration) || iteration < 1) {
+			throw new Error('checkpoint iteration must be a positive integer');
+		}
+		this.db.prepare('UPDATE goal SET checkpoint = ?, checkpoint_iteration = ? WHERE id = 1').run(text, iteration);
+		return this.goal()!;
+	}
+
 	/** Mark the task with the given position number done. Clears the context checkpoint (it described in-progress work). Throws when unknown. */
 	complete(number: string, category?: string): Task {
 		const task = this.requireTask(number, category);
