@@ -50,6 +50,7 @@ T 7 - "Add plan-grew rotation to the goal loop"
 B 7
   - New rotation reason 'plan-updated': baseline diff shows new open task ids (no completions) -> recording turn that only commits (no completion log) -> execution iteration.
   - Acceptance: tests: a planning turn that adds tasks rotates into an execution iteration; editing tasks without changing the open set does not rotate.
+D 7
 
 T 8 - "Gate goal completion on user approval"
 B 8
@@ -109,3 +110,6 @@ L 5 5 -
 
 L 6 6 2026-09-02
   Goal loop now stops on goal completion and stall. agent_settled: goal done in the file -> stopLoop; goal open + no open tasks + no plan growth + no completion (and under budget, so no context-limit rotation) -> stop with a clear stalled notification. startFreshIteration: goal done -> stopLoop before starting a fresh iteration. Added goalStatus() and planGrew() helpers (index.ts). planGrew is also the shared basis for the task-7 plan-updated rotation. Changed paths: index.ts (helpers + agent_settled + startFreshIteration), index.test.ts (new 'goal loop stop' describe: 5 tests). Evidence: bun test 225 pass / 0 fail across 4 files (backlog, index, todos-view, index.e2e). Committed locally as 1b8fe41 (not pushed).
+
+L 7 7 2026-09-02
+  Added the 'plan-updated' rotation reason to the goal loop. index.ts: RotationReason gains 'plan-updated' (state validation accepts it); agent_settled now queues a plan-updated rotation in goal mode when the baseline diff shows new open task ids with no completions (after the completed-task check, before the context-threshold check, with the same max-iterations guard; also honored in the stopRequested path so a grown plan gets its commit before the loop ends); new commit-only planRecordingPrompt (git commit, explicitly no completion log entry, no new-task work); sendRecordingPrompt and the status line ('recording') branch on it; iterationPrompt gains a plan-updated context note. index.test.ts: new test 'agent_settled rotates a planning iteration that adds tasks into an execution iteration' (recording prompt asserts, then fresh execution iteration with the execution prompt) and 'agent_settled does not rotate when tasks are edited without changing the open set' (no recording turn, no fresh iteration, counters unchanged); the old 'does not stop when the plan grows' test was replaced by the rotation test. Evidence: bun test — 226 pass, 0 fail across 4 files; both new tests pass. Committed locally as cdbd89d (not pushed).
