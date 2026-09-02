@@ -18,8 +18,12 @@ import {
 	visibleWidth
 } from '@earendil-works/pi-tui';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
+import { Backlog, formatBacklog, formatNextTask, formatSearchResults, formatTaskDetail, isRalphBacklog } from './backlog.ts';
+import { createTodosView, type TodosView } from './todos-view.ts';
+import { createListPicker, type ListPicker } from './list-picker.ts';
 
 const STATE_TYPE = 'ralph-loop-state';
 const CONFIG_TYPE = 'ralph-loop-config';
@@ -82,6 +86,10 @@ interface RalphState {
 	blocked: boolean;
 	/** The precise decision question shown to the user and retained across reloads. */
 	blockedItem?: string;
+	/** Only tasks in this category count as open/complete (ralph-format backlogs). */
+	category?: string;
+	/** Task numbers that flipped to done for the pending completed-task rotation. */
+	completedTasks?: string[];
 }
 
 function isRalphState(value: unknown): value is RalphState {
@@ -104,7 +112,10 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.stopRequested === undefined || typeof state.stopRequested === 'boolean') &&
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
 		(state.blocked === undefined || typeof state.blocked === 'boolean') &&
-		(state.blockedItem === undefined || typeof state.blockedItem === 'string')
+		(state.blockedItem === undefined || typeof state.blockedItem === 'string') &&
+			(state.category === undefined || typeof state.category === 'string') &&
+			(state.completedTasks === undefined ||
+				(Array.isArray(state.completedTasks) && state.completedTasks.every((value) => typeof value === 'string')))
 	);
 }
 
@@ -269,27 +280,58 @@ function projectConfigPath(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
 }
 
-function completedTodoItems(todo: string): number {
-	return (todo.match(/^\s*- \[[xX]\]\s+/gm) ?? []).length;
-}
-
 /**
  * Number the task Ralph is currently working on so the status shows an
  * increasing counter (e.g. task 4/12 once three tasks are complete).
  */
-function countTodoTasks(todo: string): { current: number; total: number } {
-	const open = (todo.match(/^\s*- \[ \]\s+/gm) ?? []).length;
-	const total = (todo.match(/^\s*- \[[ xX]\]\s+/gm) ?? []).length;
+function countTodoTasks(todo: string, category?: string): { current: number; total: number } {
+	const { open, total } = todoCounts(todo, category);
 	return { current: open > 0 ? total - open + 1 : total, total };
 }
 
-function hasCompletedTodoItem(previousTodo: string, currentTodo: string): boolean {
-	return completedTodoItems(currentTodo) > completedTodoItems(previousTodo);
+function hasCompletedTodoItem(previousTodo: string, currentTodo: string, category?: string): boolean {
+	return todoCounts(currentTodo, category).completed > todoCounts(previousTodo, category).completed;
 }
 
-/** A Ralph backlog is finished when it contains no unchecked Markdown tasks. */
-function isTodoFinished(todo: string): boolean {
-	return !/^\s*- \[ \]\s+/m.test(todo);
+/**
+ * Identify the tasks that flipped from open to completed between two snapshots
+ * of a ralph-format backlog, addressed by their position number in the newer
+ * snapshot. Returns undefined for non-ralph formats or parse failures so
+ * callers can fall back to the generic identification wording.
+ */
+function completedTaskNumbers(previousTodo: string, currentTodo: string, category?: string): string[] | undefined {
+	if (!isRalphBacklog(previousTodo) || !isRalphBacklog(currentTodo)) return undefined;
+	try {
+		const previousDone = new Map(Backlog.parse(previousTodo).listTasks().map((task) => [task.id, task.done]));
+		const current = Backlog.parse(currentTodo);
+		const numbers = current.taskNumbers(category);
+		const completed = current
+			.listTasks(category)
+			.filter((task) => task.done && previousDone.get(task.id) !== true)
+			.map((task) => numbers.get(task.id))
+			.filter((number): number is string => number !== undefined);
+		return completed.length > 0 ? completed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** A Ralph backlog is finished when it has no open tasks (Markdown: no unchecked boxes). */
+function isBacklogFinished(todo: string, category?: string): boolean {
+	return todoCounts(todo, category).open === 0;
+}
+
+/**
+ * Backlog statistics for either supported TODO format (Markdown or the
+ * ralph text format backed by SQLite), optionally scoped to one category.
+ */
+function todoCounts(todo: string, category?: string): { open: number; total: number; completed: number } {
+	if (isRalphBacklog(todo)) {
+		return Backlog.parse(todo).counts(category);
+	}
+	const open = (todo.match(/^\s*- \[ \]\s+/gm) ?? []).length;
+	const total = (todo.match(/^\s*- \[[ xX]\]\s+/gm) ?? []).length;
+	return { open, total, completed: total - open };
 }
 
 /**
@@ -334,6 +376,24 @@ function iterationPrompt(state: RalphState, reason?: RotationReason): string {
 				? 'A previous TODO item was completed. Start the next independent iteration with a clean review of the repository.'
 				: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
 
+	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
+
+	if (isRalphBacklog(state.baselineTodo)) {
+		const categoryScope = state.category ? ` in category "${state.category}"` : '';
+		return `Run the Ralph loop for this repository. ${contextNote}
+
+The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.
+
+1. Read ${state.specPath} in full, then call ralph_todo with action "next" to get the next open task${categoryScope}: its number, body, and checkpoint. Use action "list" only when that task is blocked and you need the wider backlog to find an unblocked one.
+2. Do not work on a later task${state.category ? ' or on a task in another category' : ''}.
+3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
+4. Add focused tests and run every quality command required by SPEC.md and the backlog.
+5. Only after all acceptance criteria pass, call ralph_todo with action "complete" and the task's number. Do not edit ${state.todoPath} directly.
+6. Commit the completed iteration locally. Do not push.
+
+${decisionNote}`;
+	}
+
 	return `Run the Ralph loop for this repository. ${contextNote}
 
 1. Read ${state.specPath} and ${state.todoPath} in full.
@@ -343,7 +403,7 @@ function iterationPrompt(state: RalphState, reason?: RotationReason): string {
 5. Only after all acceptance criteria pass, update ${state.todoPath}: check the completed item and add exactly one dated, concise entry for it to the completion log (outcome, changed paths, evidence, verification commands). The completion log is the single completion record: do not also add a completion note under the checked item itself.
 6. Commit the completed iteration locally. Do not push.
 
-If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use TODO.md as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
+${decisionNote}`;
 }
 
 /**
@@ -355,12 +415,22 @@ function resumePrompt(state: RalphState): string {
 }
 
 function contextCheckpointPrompt(state: RalphState): string {
+	if (isRalphBacklog(state.baselineTodo)) {
+		return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
+
+1. Call ralph_todo with action "list" and identify the currently selected open task.
+2. Call ralph_todo with action "checkpoint", the task's number, and a concise note: completed implementation/test evidence, relevant changed paths, known failures or risks, and the exact next step. The tool replaces any older checkpoint: keep only the single most recent one, because an older checkpoint's state and next step are stale. Do not record this in the completion log: the task is not complete.
+3. Keep a single exact next step in the checkpoint note.
+4. Do not mark the task complete, do not claim unverified work, do not modify product code, and do not commit. Do not continue implementation after recording the checkpoint.
+
+Report the checkpoint and the next step succinctly.`;
+	}
 	return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
 
 1. Read ${state.todoPath} and identify the currently selected unchecked item.
 2. Update that item in ${state.todoPath} with a concise, non-checkbox “Context checkpoint (iteration ${state.iteration})” note. Include completed implementation/test evidence, relevant changed paths, known failures or risks, and the exact next step. Use the actual iteration number shown above in the label — never a placeholder. If the item already has a “Context checkpoint” note, replace it with this one: keep only the single most recent checkpoint, because an older checkpoint’s state and next step are stale. Do not put this in the completion log: the item is not complete.
-3. If the remaining work is too large for one independently verifiable slice, add ordered unchecked sub-todos immediately below the parent item. Make each concrete and testable. Otherwise, keep a single exact next step in the checkpoint note.
-4. Do not mark the parent item complete, do not claim unverified work, do not modify product code, and do not commit. Do not continue implementation after recording the checkpoint.
+3. Keep a single exact next step in the checkpoint note.
+4. Do not mark the item complete, do not claim unverified work, do not modify product code, and do not commit. Do not continue implementation after recording the checkpoint.
 
 Report the checkpoint path and the next step succinctly.`;
 }
@@ -371,6 +441,28 @@ Report the checkpoint path and the next step succinctly.`;
  * the next iteration starts.
  */
 function completionRecordingPrompt(state: RalphState): string {
+	if (isRalphBacklog(state.baselineTodo)) {
+		const numbers = state.completedTasks ?? [];
+		if (numbers.length > 0) {
+			const singular = numbers.length === 1;
+			const target = singular ? `task ${numbers[0]}` : `tasks ${numbers.join(', ')}`;
+			return `A Ralph TODO task was just completed: ${target}. Record its progress now, then stop working; a fresh Ralph iteration will start after this turn.
+
+1. Call ralph_todo with action "log" for ${target}, today's date, and exactly one concise ${singular ? 'entry' : 'entry per task'}: outcome, changed paths, evidence, and the verification commands that were run. The completion log is the single completion record: do not add more than one entry for ${singular ? 'this task' : 'any of these tasks'} and do not modify any other task.
+2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
+3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
+
+Report the recorded ${singular ? 'entry' : 'entries'} and the commit (if any) succinctly.`;
+		}
+		return `A Ralph TODO task was just completed. Record its progress now, then stop working; a fresh Ralph iteration will start after this turn.
+
+1. Call ralph_todo with action "list" and identify the task that was just completed: the checked task without a completion log entry.
+2. Call ralph_todo with action "log", the task's number, today's date, and exactly one concise entry: outcome, changed paths, evidence, and the verification commands that were run. The completion log is the single completion record: do not add more than one entry for this task and do not modify any other task.
+3. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
+4. Do not start work on the next TODO task and do not modify product code beyond the completion record.
+
+Report the recorded entry and the commit (if any) succinctly.`;
+	}
 	return `A Ralph TODO item was just completed. Record its progress now, then stop working; a fresh Ralph iteration will start after this turn.
 
 1. Read ${state.todoPath} and identify the item that was just checked.
@@ -433,6 +525,7 @@ function parseCommandArguments(args: string): string[] | undefined {
 interface RalphStartFiles {
 	specFile: string;
 	todoFile: string;
+	category?: string;
 }
 
 interface RalphInitFiles {
@@ -446,18 +539,20 @@ interface RalphInitFiles {
 function parseStartFiles(args: string[]): RalphStartFiles | undefined {
 	let specFile = DEFAULT_SPEC;
 	let todoFile = DEFAULT_TODO;
+	let category: string | undefined;
 
 	for (let index = 0; index < args.length; index += 1) {
 		const option = args[index];
-		if (option !== '--spec' && option !== '--todo') return undefined;
+		if (option !== '--spec' && option !== '--todo' && option !== '--category') return undefined;
 		const path = args[index + 1];
 		if (!path || path.startsWith('--')) return undefined;
 		if (option === '--spec') specFile = path;
-		else todoFile = path;
+		else if (option === '--todo') todoFile = path;
+		else category = path;
 		index += 1;
 	}
 
-	return { specFile, todoFile };
+	return { specFile, todoFile, category };
 }
 
 /**
@@ -526,6 +621,150 @@ async function pathExists(path: string): Promise<boolean> {
 		if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
 		return true;
 	}
+}
+
+interface RalphImportArgs {
+	input: string;
+	force: boolean;
+	category?: string;
+}
+
+/** Parse `/ralph import <file.md> [--category name] [--force]`. */
+function parseImportArgs(args: string[]): RalphImportArgs | undefined {
+	let input: string | undefined;
+	let category: string | undefined;
+	let force = false;
+	let index = 0;
+	for (; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === '--force') {
+			if (force) return undefined;
+			force = true;
+		} else if (arg === '--category') {
+			const value = args[index + 1];
+			if (!value || value.startsWith('--') || category !== undefined) return undefined;
+			category = value;
+			index += 1;
+		} else if (arg.startsWith('--')) {
+			return undefined;
+		} else if (input === undefined) {
+			input = arg;
+		} else {
+			return undefined;
+		}
+	}
+	if (!input) return undefined;
+	return { input, force, category };
+}
+
+/** Suggest a category name from a todo filename: TODO.md → General, TODO_EMAIL.md → Email. */
+function suggestCategory(input: string): string {
+	const stem = input.replace(/\.md$/i, '').replace(/^todo[_-]?/i, '');
+	if (!stem) return 'General';
+	return stem
+		.split(/[_\-\s]+/)
+		.filter(Boolean)
+		.map((word) => word[0]!.toUpperCase() + word.slice(1).toLowerCase())
+		.join(' ');
+}
+
+type RalphImportOutcome =
+	| {
+			ok: true;
+			outName: string;
+			category: string;
+			merged?: { tasks: number; logEntries: number };
+			counts: { open: number; total: number };
+	  }
+	| { ok: false; level: 'warning' | 'error'; message: string };
+
+/**
+ * Import a Markdown TODO file into the project's TODO.ralph backlog. Shared by
+ * the `/ralph import` command and the ralph_todo "import" action so both stay
+ * in sync. Existing ralph-format content is merged into; the recorded import
+ * sources (M source records) prevent importing the same file twice.
+ */
+async function importMarkdownBacklog(
+	cwd: string,
+	input: string,
+	options: { category?: string; force?: boolean }
+): Promise<RalphImportOutcome> {
+	const inputPath = resolveProjectFile(cwd, input);
+	if (!inputPath) {
+		return { ok: false, level: 'warning', message: 'Ralph import paths must be relative files inside the project' };
+	}
+	const outName = 'TODO.ralph';
+	const outPath = resolveProjectFile(cwd, outName);
+	if (!outPath) {
+		return { ok: false, level: 'warning', message: 'Ralph import paths must be relative files inside the project' };
+	}
+	if (inputPath === outPath) {
+		return { ok: false, level: 'warning', message: 'The import input and output must be different files' };
+	}
+	// Imports always stamp a category: uncategorized tasks are invisible in the
+	// todos view's list picker. An omitted or empty category falls back to a
+	// name derived from the file name (TODO_EMAIL.md → Email).
+	const category = options.category?.trim() || suggestCategory(input);
+	let markdown: string;
+	try {
+		markdown = await readFile(inputPath, 'utf8');
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not read ${input}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	if (isRalphBacklog(markdown)) {
+		return { ok: false, level: 'warning', message: `${input} is already a ralph-format backlog; nothing to import.` };
+	}
+	let imported: Backlog;
+	try {
+		imported = Backlog.fromMarkdown(markdown, { category });
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not import ${input}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const sourceId = relative(cwd, inputPath) || inputPath;
+	let target: Backlog | undefined;
+	let merged: { tasks: number; logEntries: number } | undefined;
+	if (await pathExists(outPath)) {
+		let outText = '';
+		try {
+			outText = await readFile(outPath, 'utf8');
+		} catch {
+			outText = '';
+		}
+		if (isRalphBacklog(outText)) {
+			let existing: Backlog;
+			try {
+				existing = Backlog.parse(outText);
+			} catch (error) {
+				return { ok: false, level: 'error', message: `Could not parse ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+			}
+			if (existing.sources().includes(sourceId)) {
+				return {
+					ok: false,
+					level: 'warning',
+					message: `${input} was already imported into ${outName} (its source is recorded in the backlog). Remove its tasks manually to re-import it.`
+				};
+			}
+			try {
+				merged = existing.mergeFrom(imported, { category });
+			} catch (error) {
+				return { ok: false, level: 'error', message: `Could not merge ${input} into ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+			}
+			existing.addSource(sourceId);
+			target = existing;
+		} else if (!options.force) {
+			return { ok: false, level: 'warning', message: `Refusing to replace existing ${outName} (it is not a ralph-format backlog). Use force to overwrite.` };
+		}
+	}
+	if (!target) {
+		target = imported;
+		target.addSource(sourceId);
+	}
+	try {
+		await writeFile(outPath, target.render());
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not write ${outPath}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	return { ok: true, outName, category, merged, counts: target.counts() };
 }
 
 function initPrompt(files: RalphInitFiles): string {
@@ -615,7 +854,7 @@ export default function (pi: ExtensionAPI) {
 							: 'on';
 		const status = !state?.enabled
 			? `Ralph: off${autoApproveDecisions ? ' (auto)' : ''}`
-			: `Ralph: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			: `Ralph: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -765,17 +1004,238 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Read/update the SQLite-backed ralph-format backlog. The tool is the only
+	// writer of the backlog file, so the line-oriented format stays valid for
+	// git diffs and re-imports. With an active loop it targets the loop's
+	// backlog; otherwise it manages the project's main backlog (TODO.ralph),
+	// so lists (categories) and entries can be created from chat anytime.
+	pi.registerTool({
+		name: 'ralph_todo',
+		label: 'Ralph backlog',
+		description:
+			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, new-list, log, move, import. "add" adds to the current scope, or to an existing list via "category" (it never creates a list); use "new-list" with a name to create a new list explicitly. "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email).',
+		promptSnippet: 'Read/update the Ralph backlog',
+		promptGuidelines: [
+			'Use ralph_todo to read or update the ralph-format backlog; never read or modify the backlog file by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use action "search" to find tasks by keyword.'
+		],
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal('next'),
+				Type.Literal('list'),
+				Type.Literal('search'),
+				Type.Literal('complete'),
+				Type.Literal('checkpoint'),
+				Type.Literal('add'),
+				Type.Literal('new-list'),
+				Type.Literal('log'),
+				Type.Literal('move'),
+				Type.Literal('import')
+			]),
+			task: Type.Optional(
+				Type.String({ description: 'Task number (as shown by list/next, e.g. "3"): the target of complete/checkpoint/log/move; with list: show that single task\'s detail view (body, checkpoint, completion log) instead of the whole backlog.' })
+			),
+			note: Type.Optional(Type.String({ description: 'Checkpoint note (checkpoint) or completion-log entry (log).' })),
+			title: Type.Optional(Type.String({ description: 'New task title (add).' })),
+			body: Type.Optional(Type.String({ description: 'New task body, markdown bullets (add).' })),
+			name: Type.Optional(Type.String({ description: 'New list name (new-list). Creating a list is explicit and separate from adding a task.' })),
+			category: Type.Optional(Type.String({ description: 'Existing list (list: filter the summary to it; add: target list for a new task; search: restrict the match to it). Must already exist; use new-list to create one first. Omit on add to use the current scope. For import: list stamped on the imported tasks; defaults to a name derived from the file name (TODO_EMAIL.md → Email).' })),
+			query: Type.Optional(Type.String({ description: 'Case-insensitive substring to search for (search) in task titles, bodies, checkpoints, and completion log notes.' })),
+			verbose: Type.Optional(Type.Boolean({ description: 'list: include completed tasks, checkpoints, and completion log entries (default: compact summary of open tasks).' })),
+			date: Type.Optional(Type.String({ description: 'YYYY-MM-DD for the log entry (log; defaults to today).' })),
+			kind: Type.Optional(
+				Type.Union([Type.Literal('done'), Type.Literal('reopen')], {
+					description: 'Log entry kind (log; defaults to done). Use reopen when re-opening a completed task.'
+				})
+			),
+			direction: Type.Optional(
+				Type.Union([Type.Literal('up'), Type.Literal('down')], {
+					description: 'Move direction (move; required for move).'
+				})
+			),
+			by: Type.Optional(Type.Integer({ minimum: 1, description: 'How many positions to move (move; defaults to 1).' })),
+			file: Type.Optional(Type.String({ description: 'Markdown TODO file to import (import); relative path inside the project.' })),
+			force: Type.Optional(Type.Boolean({ description: 'Overwrite an existing non-ralph TODO.ralph (import; defaults to false).' }))
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Import always targets the project's main backlog (TODO.ralph), which
+			// may not exist yet, so it runs before the target read below.
+			if (params.action === 'import') {
+				if (!params.file) throw new Error('import requires the file path.');
+				const outcome = await importMarkdownBacklog(ctx.cwd, params.file, {
+					category: params.category,
+					force: params.force
+				});
+				if (!outcome.ok) throw new Error(outcome.message);
+				const counts = outcome.counts;
+				const categoryNote = ` in category "${outcome.category}"`;
+				const text = outcome.merged
+					? `Merged ${outcome.merged.tasks} tasks${outcome.merged.logEntries ? ` and ${outcome.merged.logEntries} log entries` : ''} from ${params.file} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total).`
+					: `Imported ${counts.total} tasks (${counts.open} open) from ${params.file} to ${outcome.outName}${categoryNote}.`;
+				return {
+					content: [{ type: 'text', text }],
+					details: { action: 'import', file: params.file }
+				};
+			}
+			// Target: the active loop's backlog, else the project's main backlog.
+			const todoPath = state?.enabled ? state.todoPath : resolve(ctx.cwd, 'TODO.ralph');
+			let text: string;
+			try {
+				text = await readRequiredFile(todoPath);
+			} catch (error) {
+				throw new Error(
+					state?.enabled
+						? `could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`
+						: `No Ralph backlog found at ${todoPath}. Create one with /ralph import <file.md> or ralph_todo action "import".`
+				);
+			}
+			if (!isRalphBacklog(text)) {
+				throw new Error(`${todoPath} is not a ralph-format backlog; ralph_todo only works with ralph-format backlogs.`);
+			}
+			let backlog: Backlog;
+			try {
+				backlog = Backlog.parse(text);
+			} catch (error) {
+				throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+
+			let mutated = false;
+			let output: string;
+			const scope = state?.enabled ? state.category : undefined;
+			switch (params.action) {
+				case 'next': {
+					const task = backlog.nextOpenTask(scope);
+					if (!task) {
+						output = `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
+						break;
+					}
+					output = formatNextTask(backlog, task, scope);
+					break;
+				}
+				case 'list': {
+					const listScope = params.category ?? scope;
+					if (params.category !== undefined && !backlog.categories().includes(params.category)) {
+						throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
+					}
+					if (params.task !== undefined) {
+						const task = backlog.findTaskByNumber(params.task, listScope);
+						if (!task) {
+							const known = [...backlog.taskNumbers(listScope).values()].join(', ');
+							throw new Error(`no task ${params.task} (tasks: ${known || 'none'})`);
+						}
+						output = formatTaskDetail(backlog, task, listScope);
+						break;
+					}
+					output = formatBacklog(backlog, listScope, { verbose: params.verbose === true });
+					break;
+				}
+				case 'search': {
+					if (!params.query) throw new Error('search requires the query text.');
+					const searchScope = params.category ?? scope;
+					if (params.category !== undefined && !backlog.categories().includes(params.category)) {
+						throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
+					}
+					output = formatSearchResults(backlog, params.query, searchScope);
+					break;
+				}
+				case 'complete': {
+					if (!params.task) throw new Error('complete requires the task number.');
+					const task = backlog.complete(params.task, scope);
+					mutated = true;
+					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+					output = state?.enabled
+						? `Marked task ${number} "${task.title}" done. Stop working now; the loop records the completion and starts a fresh iteration.`
+						: `Marked task ${number} "${task.title}" done in ${todoPath}.`;
+					break;
+				}
+				case 'checkpoint': {
+					if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
+					if (!params.task || !params.note) throw new Error('checkpoint requires the task number and a note.');
+					const task = backlog.setCheckpoint(params.task, params.note.trim(), state.iteration, scope);
+					mutated = true;
+					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+					output = `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+					break;
+				}
+				case 'add': {
+					if (!params.title) throw new Error('add requires a title.');
+					const targetCategory = params.category;
+					if (targetCategory !== undefined && !backlog.categories().includes(targetCategory)) {
+						throw new Error(`no list named "${targetCategory}" (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`);
+					}
+					const addScope = targetCategory ?? scope;
+					const task = backlog.addTask({
+						title: params.title,
+						body: params.body,
+						category: targetCategory
+					});
+					mutated = true;
+					const number = backlog.taskNumbers(addScope).get(task.id) ?? task.id;
+					output = `Added task ${number} "${task.title}"${task.category ? ` in category "${task.category}"` : ''}.`;
+					break;
+				}
+				case 'new-list': {
+					if (!params.name) throw new Error('new-list requires a name.');
+					backlog.createList(params.name);
+					mutated = true;
+					output = `Created list "${params.name.trim()}". It is empty; add tasks to it with action "add" and category "${params.name.trim()}".`;
+					break;
+				}
+				case 'log': {
+					if (!params.task) throw new Error('log requires the task number.');
+					if (!params.note) throw new Error('log requires a note.');
+					const entry = backlog.addLogEntry({ task: params.task, date: params.date, note: params.note, kind: params.kind }, scope);
+					mutated = true;
+					const number = backlog.taskNumbers(scope).get(entry.taskId) ?? String(entry.taskId);
+					output = `Completion log entry recorded for task ${number}${entry.date ? ` dated ${entry.date}` : ''}.`;
+					break;
+				}
+				case 'move': {
+					if (!params.task) throw new Error('move requires the task number.');
+					if (params.direction !== 'up' && params.direction !== 'down') {
+						throw new Error('move requires direction "up" or "down".');
+					}
+					const steps = params.by ?? 1;
+					const task = backlog.moveTask(params.task, params.direction, steps, scope);
+					mutated = true;
+					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+					output = `Moved task ${number} "${task.title}" ${params.direction} by ${steps}.`;
+					break;
+				}
+			}
+
+			if (mutated) {
+				try {
+					await writeFile(todoPath, backlog.render());
+				} catch (error) {
+					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+			return {
+				content: [{ type: 'text', text: output }],
+				details: { action: params.action, task: params.task ?? null }
+			};
+		},
+		renderResult(result, options) {
+			const text =
+				result.content
+					.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+					.map((part) => part.text)
+					.join('\n') || 'Ralph backlog updated.';
+			return new Markdown(options.isPartial ? '> Ralph backlog…' : text, 0, 0, getMarkdownTheme());
+		}
+	});
+
 	const startFreshIteration = (ctx: ExtensionContext) => {
 		void (async () => {
 			if (!state?.enabled) return;
 			const reason = state.rotationReason ?? 'completed-task';
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				if (isTodoFinished(currentTodo)) {
+				if (isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				taskCount = countTodoTasks(currentTodo);
+				taskCount = countTodoTasks(currentTodo, state?.category);
 				const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
 				const next: RalphState = {
 					...state,
@@ -826,6 +1286,73 @@ export default function (pi: ExtensionAPI) {
 		})();
 	};
 
+	// Shared by /ralph start and the GUI (the backlog view's s key): the same
+	// validation (idle, readable spec + TODO, known category, open tasks) and
+	// the same state setup.
+	const startLoop = async (ctx: ExtensionCommandContext, files: RalphStartFiles): Promise<void> => {
+		if (state?.enabled) {
+			ctx.ui.notify('Ralph loop is already active — /ralph stop to end it first', 'info');
+			return;
+		}
+		if (!ctx.isIdle()) {
+			ctx.ui.notify('Wait for the current agent run to finish before starting Ralph', 'warning');
+			return;
+		}
+
+		const { specFile, todoFile, category } = files;
+		const todoPath = resolve(ctx.cwd, todoFile);
+		const specPath = resolve(ctx.cwd, specFile);
+		try {
+			const baselineTodo = await readRequiredFile(todoPath);
+			await readRequiredFile(specPath);
+			if (category !== undefined) {
+				if (!isRalphBacklog(baselineTodo)) {
+					ctx.ui.notify('--category requires a ralph-format backlog; import your TODO.md first with /ralph import', 'warning');
+					return;
+				}
+				const known = Backlog.parse(baselineTodo).categories();
+				if (!known.includes(category)) {
+					ctx.ui.notify(`Unknown category "${category}" (categories: ${known.join(', ') || 'none'})`, 'warning');
+					return;
+				}
+			}
+			if (isBacklogFinished(baselineTodo, category)) {
+				ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
+				return;
+			}
+			taskCount = countTodoTasks(baselineTodo, category);
+			const next: RalphState = {
+				enabled: true,
+				todoPath,
+				specPath,
+				baselineTodo,
+				iteration: 1,
+				taskIteration: 1,
+				taskNumber: taskCount.current,
+				maxIterations: config.maxIterations,
+				contextThreshold: contextThresholdFor(config, ctx),
+				autoApproveDecisions: config.autoApproveDecisions,
+				rotationQueued: false,
+				rotationReason: undefined,
+				rotationCheckpointing: false,
+				stopRequested: false,
+				paused: false,
+				blocked: false,
+				blockedItem: undefined,
+				category
+			};
+			persistState(next);
+			updateStatus(ctx);
+			pi.sendUserMessage(iterationPrompt(next));
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(
+				`Ralph loop needs readable spec file ${specFile} and TODO file ${todoFile}: ${message}`,
+				'error'
+			);
+		}
+	};
+
 	const sendRecordingPrompt = (ctx: ExtensionContext, options?: { midTurn?: boolean }) => {
 		if (!state) return;
 		const prompt =
@@ -833,14 +1360,27 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
 	};
 
-	const queueRotation = (ctx: ExtensionContext, reason: RotationReason, options?: { midTurn?: boolean }) => {
+	const queueRotation = (
+		ctx: ExtensionContext,
+		reason: RotationReason,
+		options?: { midTurn?: boolean; currentTodo?: string }
+	) => {
 		if (!state?.enabled || state.rotationQueued) return;
+
+		// For completed-task rotations, name the completed task(s) in the
+		// recording prompt instead of making the model re-read the backlog to
+		// find them: the diff against the baseline already identifies them.
+		const completedTasks =
+			reason === 'completed-task' && options?.currentTodo
+				? completedTaskNumbers(state.baselineTodo, options.currentTodo, state.category)
+				: undefined;
 
 		persistState({
 			...state,
 			rotationQueued: true,
 			rotationReason: reason,
-			rotationCheckpointing: true
+			rotationCheckpointing: true,
+			completedTasks
 		});
 		updateStatus(ctx);
 
@@ -926,11 +1466,11 @@ export default function (pi: ExtensionAPI) {
 		if (state?.enabled) {
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				if (isTodoFinished(currentTodo)) {
+				if (isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				taskCount = countTodoTasks(currentTodo);
+				taskCount = countTodoTasks(currentTodo, state?.category);
 				// Re-sync the per-task counter after a reload in case the TODO moved on.
 				if (state.taskNumber !== undefined && state.taskNumber !== taskCount.current) {
 					state = { ...state, taskNumber: taskCount.current, taskIteration: 1 };
@@ -1099,13 +1639,13 @@ export default function (pi: ExtensionAPI) {
 			// ends. Otherwise progress would be lost with the old conversation.
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				taskCount = countTodoTasks(currentTodo);
-				if (isTodoFinished(currentTodo)) {
+				taskCount = countTodoTasks(currentTodo, state?.category);
+				if (isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				if (hasCompletedTodoItem(state.baselineTodo, currentTodo)) {
-					queueRotation(ctx, 'completed-task');
+				if (hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
+					queueRotation(ctx, 'completed-task', { currentTodo });
 					return;
 				}
 			} catch (error) {
@@ -1124,8 +1664,8 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const currentTodo = await readRequiredFile(state.todoPath);
-			taskCount = countTodoTasks(currentTodo);
-			if (isTodoFinished(currentTodo)) {
+			taskCount = countTodoTasks(currentTodo, state?.category);
+			if (isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}
@@ -1134,12 +1674,12 @@ export default function (pi: ExtensionAPI) {
 			// proactive threshold check below: each rotation inserts a marker that
 			// removes preceding turns from model context, while context-limit first
 			// records a durable TODO checkpoint.
-			if (hasCompletedTodoItem(state.baselineTodo, currentTodo)) {
+			if (hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
 				}
-				queueRotation(ctx, 'completed-task');
+				queueRotation(ctx, 'completed-task', { currentTodo });
 				return;
 			}
 		} catch (error) {
@@ -1326,14 +1866,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand('ralph', {
-		description: 'Start or manage the Ralph loop: [start|stop|resume|status|config]',
+		description: 'Start or manage the Ralph loop: [start|import|todos|stop|resume|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
 					value: 'start',
 					label: 'start',
-					description: 'Defaults: SPEC.md and TODO.md. Override either with --spec <file> or --todo <file>.'
+					description: 'Defaults: SPEC.md and TODO.md. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>.'
 				},
+				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into TODO.ralph, merging into an existing backlog. Each source file is only imported once.' },
+				{ value: 'todos', label: 'todos', description: 'Show the backlog in an interactive list: /ralph todos [file] (defaults to the active loop’s backlog). In the list picker: enter: open, R: rename, q: quit. In the view: a/A add and e edit open a popup form (jk/↑↓ or tab: field, enter: edit/confirm field, ctrl+s: save, esc: cancel), x delete, R rename list, s start a loop on the list, q quit.' },
 				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration.' },
 				{ value: 'resume', label: 'resume', description: 'Resume a paused loop (Escape pauses it).' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
@@ -1409,60 +1951,217 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			if (command && command !== 'start') {
-				ctx.ui.notify('Usage: /ralph [start|stop|resume|status|config]', 'warning');
+			if (command && command !== 'start' && command !== 'import' && command !== 'todos') {
+				ctx.ui.notify('Usage: /ralph [start|import|todos|stop|resume|status|config]', 'warning');
+				return;
+			}
+			if (command === 'todos') {
+				const fileArg = commandArgs.slice(1)[0];
+				if (ctx.mode !== 'tui') {
+					ctx.ui.notify('/ralph todos requires TUI mode', 'error');
+					return;
+				}
+				// Source: the active loop's backlog, else an explicit file, else the
+				// conventional names in the project root.
+				const candidates = state?.enabled
+					? [state.todoPath]
+					: fileArg
+						? [resolveProjectFile(ctx.cwd, fileArg)].filter((p): p is string => p !== undefined)
+						: [resolve(ctx.cwd, 'TODO.ralph'), resolve(ctx.cwd, DEFAULT_TODO)];
+				let todoPath: string | undefined;
+				for (const candidate of candidates) {
+					if (candidate && (await pathExists(candidate))) {
+						todoPath = candidate;
+						break;
+					}
+				}
+				if (!todoPath) {
+					ctx.ui.notify(
+						fileArg
+							? `Could not read ${fileArg}`
+							: 'No backlog found: start a loop or pass a file (e.g. /ralph todos TODO.ralph)',
+						'error'
+					);
+					return;
+				}
+				const title = relative(ctx.cwd, todoPath) || todoPath;
+				const loadBacklog = (): Backlog | undefined => {
+					try {
+						const text = readFileSync(todoPath!, 'utf8');
+						// The view only renders ralph-format backlogs; Markdown
+						// backlogs must be imported first (see below).
+						return isRalphBacklog(text) ? Backlog.parse(text) : undefined;
+					} catch {
+						return undefined;
+					}
+				};
+				let initial: Backlog | undefined;
+				try {
+					const text = readFileSync(todoPath, 'utf8');
+					if (!isRalphBacklog(text)) {
+						ctx.ui.notify('Todo entries empty. Import data with /ralph import', 'info');
+						return;
+					}
+					initial = Backlog.parse(text);
+				} catch {
+					initial = undefined;
+				}
+				if (!initial) {
+					ctx.ui.notify(`Could not parse ${todoPath} as a Ralph backlog`, 'error');
+					return;
+				}
+				// An active loop already scopes the view to its category; otherwise
+				// let the user choose a list (category) when the backlog has any.
+				// Escape from a list goes back to this overview.
+				const hasPicker = initial.categories().length > 0;
+				// The views render as overlays on top of the chat, so the chat layout
+				// and its scroll position are untouched while they are open (closing a
+				// view no longer disturbs where the chat was scrolled). One overlay
+				// hosts both stages (list picker, task view) and swaps between them
+				// without closing: closing between stages would let the chat behind
+				// flash for a frame. Both stages use the todos view's layout: the
+				// list is pinned to the top, the key hints sit on the bottom line,
+				// and the lines in between are blank so the chat behind is blacked
+				// out; both size to 90% of terminal height so the status footer
+				// stays visible.
+				const OVERLAY_MAX_HEIGHT = '90%';
+				const viewHeight = () => Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9));
+				let viewCategory = state?.enabled ? state.category : undefined;
+				// The backlog instance the view currently renders; refreshed from
+				// disk on every picker round (a view round may have renamed or
+				// added lists).
+				let source: Backlog = initial;
+				await ctx.ui.custom((tui, theme, _keybindings, done) => {
+					// The stage currently rendered. Swapping stages does not close
+					// the overlay, so the chat behind never flashes through.
+					let stage: ListPicker | TodosView | undefined;
+					const showStage = (next: ListPicker | TodosView) => {
+						stage?.dispose();
+						stage = next;
+						tui.requestRender();
+					};
+					const showView = () => {
+						showStage(
+							createTodosView({
+								backlog: source,
+								tui,
+								title,
+								category: viewCategory,
+								theme,
+								height: viewHeight,
+								requestRender: () => tui.requestRender(),
+								onClose: () => done('quit'),
+								onBack: hasPicker ? () => showPicker() : undefined,
+								reload: loadBacklog,
+								mutate: async (backlog, fn) => {
+									try {
+										fn(backlog);
+									} catch (error) {
+										ctx.ui.notify(`Could not update ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+										return false;
+									}
+									try {
+										await writeFile(todoPath, backlog.render());
+										return true;
+									} catch (error) {
+										ctx.ui.notify(`Could not save ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+										return false;
+									}
+								},
+								onStartLoop: (loopCategory) => {
+									void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory });
+								}
+							})
+						);
+					};
+					const showPicker = () => {
+						const fresh = loadBacklog();
+						if (fresh) source = fresh;
+						const lists = source.categories().map((name) => {
+							const counts = source.counts(name);
+							return { name, open: counts.open, total: counts.total };
+						});
+						showStage(
+							createListPicker({
+								title,
+								lists,
+								theme,
+								height: viewHeight,
+								requestRender: () => tui.requestRender(),
+								onOpen: (name) => {
+									viewCategory = name;
+									showView();
+								},
+								onClose: () => done(undefined),
+								onRename: async (oldName, newName) => {
+									try {
+										const target = loadBacklog() ?? source;
+										target.renameCategory(oldName, newName);
+										await writeFile(todoPath, target.render());
+										return true;
+									} catch {
+										return false;
+									}
+								}
+							})
+						);
+					};
+					if (viewCategory === undefined && hasPicker) showPicker();
+					else showView();
+					return {
+						render: (width: number) => stage?.render(width) ?? [],
+						handleInput: (data: string) => stage?.handleInput(data),
+						invalidate: () => stage?.invalidate(),
+						dispose: () => stage?.dispose()
+					};
+				}, { overlay: true, overlayOptions: { width: '100%', maxHeight: OVERLAY_MAX_HEIGHT } });
+				return;
+			}
+			if (command === 'import') {
+				const importArgs = parseImportArgs(commandArgs.slice(1));
+				if (!importArgs) {
+					ctx.ui.notify('Usage: /ralph import <file.md> [--category name] [--force] (quote paths containing spaces)', 'warning');
+					return;
+				}
+				if (!ctx.isIdle()) {
+					ctx.ui.notify('Wait for the current agent run to finish before importing a backlog', 'warning');
+					return;
+				}
+				// Category: explicit --category wins; in TUI mode ask (suggested
+				// from the file name; empty accepts the suggestion).
+				let category = importArgs.category;
+				if (category === undefined && ctx.mode === 'tui') {
+					const answer = await ctx.ui.input('Category', suggestCategory(importArgs.input));
+					if (answer === undefined) {
+						ctx.ui.notify('Import cancelled', 'info');
+						return;
+					}
+					category = answer.trim() === '' ? undefined : answer.trim();
+				}
+				const outcome = await importMarkdownBacklog(ctx.cwd, importArgs.input, {
+					category,
+					force: importArgs.force
+				});
+				if (!outcome.ok) {
+					ctx.ui.notify(outcome.message, outcome.level);
+					return;
+				}
+				const counts = outcome.counts;
+				const categoryNote = ` in category "${outcome.category}"`;
+				ctx.ui.notify(
+					outcome.merged
+						? `Merged ${outcome.merged.tasks} tasks${outcome.merged.logEntries ? ` and ${outcome.merged.logEntries} log entries` : ''} from ${importArgs.input} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total). Start with: /ralph start --todo ${outcome.outName}`
+						: `Imported ${counts.total} tasks (${counts.open} open) from ${importArgs.input} to ${outcome.outName}${categoryNote}. Start with: /ralph start --todo ${outcome.outName}`,
+					'info'
+				);
 				return;
 			}
 			const startFiles = parseStartFiles(commandArgs.slice(1));
 			if (!startFiles) {
-				ctx.ui.notify('Usage: /ralph start [--spec file] [--todo file]', 'warning');
+				ctx.ui.notify('Usage: /ralph start [--spec file] [--todo file] [--category name]', 'warning');
 				return;
 			}
-			if (!ctx.isIdle()) {
-				ctx.ui.notify('Wait for the current agent run to finish before starting Ralph', 'warning');
-				return;
-			}
-
-			const { specFile, todoFile } = startFiles;
-			const todoPath = resolve(ctx.cwd, todoFile);
-			const specPath = resolve(ctx.cwd, specFile);
-			try {
-				const baselineTodo = await readRequiredFile(todoPath);
-				await readRequiredFile(specPath);
-				if (isTodoFinished(baselineTodo)) {
-					ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
-					return;
-				}
-				taskCount = countTodoTasks(baselineTodo);
-				const next: RalphState = {
-					enabled: true,
-					todoPath,
-					specPath,
-					baselineTodo,
-					iteration: 1,
-					taskIteration: 1,
-					taskNumber: taskCount.current,
-					maxIterations: config.maxIterations,
-					contextThreshold: contextThresholdFor(config, ctx),
-					autoApproveDecisions: config.autoApproveDecisions,
-					rotationQueued: false,
-					rotationReason: undefined,
-					rotationCheckpointing: false,
-					stopRequested: false,
-					paused: false,
-					blocked: false,
-					blockedItem: undefined
-				};
-				persistState(next);
-				updateStatus(ctx);
-				pi.sendUserMessage(iterationPrompt(next));
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(
-					`Ralph loop needs readable spec file ${specFile} and TODO file ${todoFile}: ${message}`,
-					'error'
-				);
-			}
+			await startLoop(ctx, startFiles);
 		}
 	});
 
@@ -1487,7 +2186,7 @@ export default function (pi: ExtensionAPI) {
 			let currentTodo: string;
 			try {
 				currentTodo = await readRequiredFile(state.todoPath);
-				taskCount = countTodoTasks(currentTodo);
+				taskCount = countTodoTasks(currentTodo, state?.category);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Ralph loop could not create a fresh session: ${message}`, 'error');
@@ -1501,7 +2200,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (isTodoFinished(currentTodo)) {
+			if (isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}
@@ -1516,6 +2215,10 @@ export default function (pi: ExtensionAPI) {
 				rotationQueued: true,
 				rotationReason: reason,
 				rotationCheckpointing: true,
+				completedTasks:
+					reason === 'completed-task'
+						? completedTaskNumbers(state.baselineTodo, currentTodo, state.category)
+						: undefined,
 				blocked: false,
 				blockedItem: undefined
 			};
