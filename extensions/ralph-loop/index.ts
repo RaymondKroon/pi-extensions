@@ -24,6 +24,7 @@ import { Type } from 'typebox';
 import {
 	Backlog,
 	formatBacklog,
+	formatGoal,
 	formatNextTask,
 	formatSearchResults,
 	formatTaskDetail,
@@ -1152,6 +1153,33 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Shared parse discipline for the backlog tools (ralph_todo, ralph_goal):
+	// load the target file, require the ralph format, and parse it.
+	const loadTargetBacklog = async (todoPath: string, toolName: string): Promise<Backlog> => {
+		let text: string;
+		try {
+			text = await readRequiredFile(todoPath);
+		} catch (error) {
+			const missing = error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
+			if (missing) {
+				throw new Error(
+					state?.enabled
+						? `${todoPath} is missing; bootstrap it with ralph_todo action "init" or restore the file.`
+						: `No Ralph backlog at ${todoPath}. Bootstrap it with ralph_todo action "init" or import a Markdown TODO with action "import".`
+				);
+			}
+			throw new Error(`could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (!isRalphBacklog(text)) {
+			throw new Error(`${todoPath} is not a ralph-format backlog; ${toolName} only works with ralph-format backlogs.`);
+		}
+		try {
+			return Backlog.parse(text);
+		} catch (error) {
+			throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
 	// Read/update the SQLite-backed ralph-format backlog. The tool is the only
 	// writer of the backlog file, so the line-oriented format stays valid for
 	// git diffs and re-imports. With an active loop it targets the loop's
@@ -1262,31 +1290,7 @@ export default function (pi: ExtensionAPI) {
 					details: { action: 'init', task: null }
 				};
 			}
-			const loadTargetBacklog = async (): Promise<Backlog> => {
-				let text: string;
-				try {
-					text = await readRequiredFile(todoPath);
-				} catch (error) {
-					const missing = error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
-					if (missing) {
-						throw new Error(
-							state?.enabled
-								? `${todoPath} is missing; bootstrap it with ralph_todo action "init" or restore the file.`
-								: `No Ralph backlog at ${todoPath}. Bootstrap it with ralph_todo action "init" or import a Markdown TODO with action "import".`
-						);
-					}
-					throw new Error(`could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-				if (!isRalphBacklog(text)) {
-					throw new Error(`${todoPath} is not a ralph-format backlog; ralph_todo only works with ralph-format backlogs.`);
-				}
-				try {
-					return Backlog.parse(text);
-				} catch (error) {
-					throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			};
-			const backlog = await loadTargetBacklog();
+			const backlog = await loadTargetBacklog(todoPath, 'ralph_todo');
 
 			let mutated = false;
 			let output: string;
@@ -1450,6 +1454,103 @@ export default function (pi: ExtensionAPI) {
 					.map((part) => part.text)
 					.join('\n') || 'Ralph backlog updated.';
 			return new Markdown(options.isPartial ? '> Ralph backlog…' : text, 0, 0, getMarkdownTheme());
+		}
+	});
+
+	// Read/update the single goal of the ralph-format backlog. The goal is the
+	// user's contract: the model is read-only on its title and body and may
+	// only change the goal's state through this tool. With an active loop it
+	// targets the loop's backlog; otherwise the project's main backlog
+	// (TODO.ralph), so the goal can be inspected from chat anytime.
+	pi.registerTool({
+		name: 'ralph_goal',
+		label: 'Ralph goal',
+		description:
+			'Read or update the single goal of the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. The goal is the user\'s contract: you are read-only on its title and body — only the user edits them, and you may only change the goal\'s state through this tool. Actions: show (works anywhere; prints the goal\'s title, status, body, evidence, and checkpoint), checkpoint (active goal loop only; replaces the single goal checkpoint — the durable state of task-less planning/re-evaluation iterations), complete (active goal loop only; requires the goal open and no open tasks; the completion bar is a full verification run — run every verification command required by SPEC.md first and pass the evidence; the goal then becomes done).',
+		promptSnippet: 'Read/update the Ralph goal',
+		promptGuidelines: [
+			'Use ralph_goal for the goal of the active goal loop; the goal text is the user\'s contract — you are read-only on it and may only change its state through this tool.',
+			'ralph_goal complete is the completion bar: run every verification command required by SPEC.md first and pass the evidence; never claim an unverified completion.'
+		],
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal('show'),
+				Type.Literal('checkpoint'),
+				Type.Literal('complete')
+			]),
+			note: Type.Optional(
+				Type.String({ description: 'Checkpoint note (checkpoint) or completion evidence (complete).' })
+			)
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Target: the active loop's backlog, else the project's main backlog.
+			const todoPath = state?.enabled ? state.todoPath : resolve(ctx.cwd, 'TODO.ralph');
+			const backlog = await loadTargetBacklog(todoPath, 'ralph_goal');
+			const goal = backlog.goal();
+
+			let mutated = false;
+			let output: string;
+			switch (params.action) {
+				case 'show': {
+					if (!goal) {
+						output = `No goal in ${todoPath}.`;
+						break;
+					}
+					output = formatGoal(goal);
+					break;
+				}
+				case 'checkpoint': {
+					if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('checkpoint requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!params.note) throw new Error('checkpoint requires a note.');
+					const updated = backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
+					mutated = true;
+					output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+					break;
+				}
+				case 'complete': {
+					if (!state?.enabled) throw new Error('complete requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('complete requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!params.note) throw new Error('complete requires the verification evidence note.');
+					if (!goal) throw new Error(`no goal in ${todoPath}`);
+					if (goal.status !== 'open') {
+						throw new Error(`cannot complete the goal: it is ${goal.status} (complete requires open)`);
+					}
+					const open = backlog.counts().open;
+					if (open > 0) {
+						throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
+					}
+					backlog.claimGoal(params.note.trim());
+					const done = backlog.confirmGoal();
+					mutated = true;
+					output = `Goal "${done.title}" is done (evidence recorded). Stop working now; the loop records the completion.`;
+					break;
+				}
+			}
+
+			if (mutated) {
+				try {
+					await writeFile(todoPath, backlog.render());
+				} catch (error) {
+					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+			return {
+				content: [{ type: 'text', text: output }],
+				details: { action: params.action }
+			};
+		},
+		renderResult(result, options) {
+			const text =
+				result.content
+					.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+					.map((part) => part.text)
+					.join('\n') || 'Ralph goal updated.';
+			return new Markdown(options.isPartial ? '> Ralph goal…' : text, 0, 0, getMarkdownTheme());
 		}
 	});
 

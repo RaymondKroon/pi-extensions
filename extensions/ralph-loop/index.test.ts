@@ -1687,6 +1687,217 @@ D 2
 	});
 });
 
+describe('ralph-loop extension (ralph_goal tool)', () => {
+	const GOAL_OPEN = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+`;
+
+	const GOAL_OPEN_WITH_TASK = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_OPEN_TASKS_DONE = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+D 1
+`;
+
+	const GOAL_CLAIMED = `# ralph v2
+
+G "Rewrite the app" claimed
+GE "All routes render."
+`;
+
+	const GOAL_DONE = `# ralph v2
+
+G "Rewrite the app" done
+GE "All routes render."
+`;
+
+	type GoalTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }> }>;
+	};
+
+	const goalTool = (fake: ReturnType<typeof createFakePi>): GoalTool => {
+		const tool = fake.tools.get('ralph_goal') as GoalTool | undefined;
+		expect(tool).toBeDefined();
+		return tool!;
+	};
+
+	async function startLoopWith(content: string, mode: 'goal' | 'tasks' = 'goal') {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), content);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(`start --todo GOAL.ralph${mode === 'goal' ? ' --goal' : ''}`, fakeCtx.ctx);
+		return { fake, fakeCtx, run: (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx) };
+	}
+
+	test('show works outside a loop on TODO.ralph', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_OPEN);
+
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+		const shown = await run({ action: 'show' });
+		expect(shown.content[0]!.text).toContain('Goal: "Rewrite the app" (status: open)');
+		expect(shown.content[0]!.text).toContain('Port the routes.');
+		expect(shown.content[0]!.text).toContain('Port the state.');
+		expect(shown.content[0]!.text).not.toContain('Evidence');
+		expect(shown.content[0]!.text).not.toContain('Checkpoint');
+
+		// A done goal shows its completion evidence.
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_DONE);
+		const done = await run({ action: 'show' });
+		expect(done.content[0]!.text).toContain('(status: done)');
+		expect(done.content[0]!.text).toContain('Evidence: All routes render.');
+	});
+
+	test('show reports a missing goal, a missing file, and a non-ralph file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		const noGoal = await run({ action: 'show' });
+		expect(noGoal.content[0]!.text).toContain('No goal in');
+
+		await rm(join(dir, 'TODO.ralph'));
+		await expect(run({ action: 'show' })).rejects.toThrow(/No Ralph backlog/);
+
+		await writeFile(join(dir, 'TODO.ralph'), '# Plain\n\n- [ ] task\n');
+		await expect(run({ action: 'show' })).rejects.toThrow(/not a ralph-format backlog/);
+	});
+
+	test('show targets the active loop\'s backlog, not TODO.ralph', async () => {
+		const { fake, run } = await startLoopWith(GOAL_OPEN);
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_DONE);
+
+		const shown = await run({ action: 'show' });
+		expect(shown.content[0]!.text).toContain('(status: open)');
+		expect(shown.content[0]!.text).not.toContain('Evidence');
+		expect(fake.userMessages.length).toBe(1);
+	});
+
+	test('checkpoint requires an active goal loop and a note', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_OPEN);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_OPEN_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active goal loop/);
+
+		// A goal loop still needs the note.
+		const goalLoop = await startLoopWith(GOAL_OPEN);
+		await expect(goalLoop.run({ action: 'checkpoint' })).rejects.toThrow(/requires a note/);
+	});
+
+	test('checkpoint replaces the single goal checkpoint in the file', async () => {
+		const { run } = await startLoopWith(GOAL_OPEN);
+		const file = () => readFile(join(dir, 'GOAL.ralph'), 'utf8');
+
+		const first = await run({ action: 'checkpoint', note: 'Plan drafted; next: review the routes.' });
+		expect(first.content[0]!.text).toContain('Checkpoint recorded for the goal "Rewrite the app" (iteration 1)');
+		let text = await file();
+		expect(text).toContain('GC 1');
+		expect(text).toContain('Plan drafted; next: review the routes.');
+
+		// The checkpoint is replaced, never stacked.
+		const second = await run({ action: 'checkpoint', note: 'Plan reviewed; next: start execution.' });
+		expect(second.content[0]!.text).toContain('(iteration 1)');
+		text = await file();
+		expect(text).toContain('Plan reviewed; next: start execution.');
+		expect(text).not.toContain('Plan drafted; next: review the routes.');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.checkpoint).toBe('Plan reviewed; next: start execution.');
+		expect(goal.checkpointIteration).toBe(1);
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+	});
+
+	test('complete requires an active goal loop, an open goal, no open tasks, and evidence', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_OPEN);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'complete', note: 'verified' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_OPEN_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/active goal loop/);
+
+		// Open tasks block completion; the file is untouched.
+		const openTasks = await startLoopWith(GOAL_OPEN_WITH_TASK);
+		await expect(openTasks.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/1 task still open/);
+		expect(await readFile(join(dir, 'GOAL.ralph'), 'utf8')).toContain('G "Rewrite the app" open');
+
+		// Missing evidence is refused before any state change.
+		const noEvidence = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+		await expect(noEvidence.run({ action: 'complete' })).rejects.toThrow(/verification evidence/);
+
+		// A claimed goal cannot be completed again.
+		const claimed = await startLoopWith(GOAL_CLAIMED);
+		await expect(claimed.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/complete requires open/);
+
+		// A done goal cannot be completed again (a done goal cannot start a
+		// loop, so finish one first and retry).
+		const finished = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+		await finished.run({ action: 'complete', note: 'verified' });
+		await expect(finished.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/complete requires open/);
+	});
+
+	test('complete marks the goal done with the evidence in the file', async () => {
+		const { run } = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done');
+
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" done');
+		expect(text).toContain('GE "All criteria verified: bun test green."');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.status).toBe('done');
+		expect(goal.evidence).toBe('All criteria verified: bun test green.');
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+	});
+});
+
 describe('ralph-loop extension (/ralph todos view)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);

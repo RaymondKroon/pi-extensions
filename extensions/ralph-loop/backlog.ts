@@ -1320,6 +1320,26 @@ export function formatNextTask(backlog: Backlog, task: Task, category?: string):
 	}
 	return lines.join('\n');
 }
+
+/**
+ * Readable goal view for the ralph_goal "show" action: the goal's title,
+ * status, body, completion evidence, and checkpoint.
+ */
+export function formatGoal(goal: Goal): string {
+	const lines: string[] = [];
+	lines.push(`Goal: "${goal.title}" (status: ${goal.status})`);
+	if (goal.body) {
+		lines.push('', 'Body:', goal.body.trim());
+	}
+	if (goal.evidence !== null) {
+		lines.push('', `Evidence: ${goal.evidence}`);
+	}
+	if (goal.checkpoint !== null) {
+		lines.push('', `Checkpoint (iteration ${goal.checkpointIteration ?? '?'}):`, goal.checkpoint);
+	}
+	return lines.join('\n');
+}
+
 /**
  * Single-task detail view for the ralph_todo "list" action with a task
  * number: the task's body, checkpoint, and full completion log, without
