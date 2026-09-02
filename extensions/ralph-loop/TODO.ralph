@@ -65,6 +65,7 @@ T 9 - "Extract the shared view kit from todos-view.ts"
 B 9
   - Move popupBox, the form/confirm/input/reason/editor modes, and footer layout into view-kit.ts; TodosView becomes a consumer.
   - Acceptance: all existing todos-view tests pass with no snapshot drift.
+D 9
 
 T 10 - "Build the Ralph home view"
 B 10
@@ -117,3 +118,6 @@ L 7 7 2026-09-02
 
 L 8 8 2026-09-02
   Goal completion is now gated on user approval. ralph_goal complete claims the goal (open -> claimed with evidence); with autoApproveDecisions it confirms straight to done (approver 'auto-approved'), otherwise it blockLoops with the approval question + evidence and returns terminate: true (ralph_request_decision pattern), with result text instructing the after-answer procedure (approved -> record decision, ralph_resolve_decision, ralph_goal confirm; rejected -> ralph_goal withdraw with what is missing, then keep working). New actions confirm (claimed -> done) and withdraw (claimed -> open, note becomes the goal checkpoint), both requiring an active goal loop; tool description and prompt guidelines updated. Changed: extensions/ralph-loop/index.ts, extensions/ralph-loop/index.test.ts. Evidence: new tests cover blocked state + terminated turn (status 'waiting', ralph-decision widget, notify), confirm/withdraw transitions and preconditions, and the auto-approve path; updated the two goal-loop-stop tests to the claim -> resolve -> confirm flow. Verification: bun test . -> 231 pass, 0 fail (backlog, index, todos-view, e2e suites).
+
+L 9 9 2026-09-02
+  Extracted the shared view kit: new view-kit.ts holds popupBox/popupInnerWidth/inputPromptLine, the input/reason/form/confirm/editor mode types, renderModeBody, the mode controller (createModeController: beginInput/beginReason/beginForm/setMode/handleInput, incl. the built-in Editor body editing), layoutFooter, dimmedTheme, the theme type (RalphViewTheme), and the key constants. todos-view.ts is now a consumer: browse rendering, scrolling, and task mutations stay; popup machinery is delegated to the controller; TodosViewTheme and layoutFooter are re-exported for compatibility (list-picker.ts untouched). Also dropped a dead second argument to Backlog.addTask in saveForm (pre-existing type error; scope already carried via form.category). Evidence: bun test — 231 pass / 0 fail across all 4 suites (backlog, index, todos-view, index.e2e); tsc --noEmit on the touched files is clean (remaining errors are pre-existing in backlog.ts/index.ts); render-diff harness rendered browse/expand/reason/form/editing/editor/confirm/input states at multiple widths against the pre-change code — byte-identical output (no snapshot drift). Commit 66a4f0d.
