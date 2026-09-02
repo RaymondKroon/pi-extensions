@@ -29,7 +29,8 @@ import {
 	formatSearchResults,
 	formatTaskDetail,
 	isRalphBacklog,
-	type Goal
+	type Goal,
+	type GoalStatus
 } from './backlog.ts';
 import { createTodosView, type TodosView } from './todos-view.ts';
 import { createListPicker, type ListPicker } from './list-picker.ts';
@@ -372,6 +373,43 @@ function goalBlock(goal: Goal): string {
 		lines.push(`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${goal.checkpoint}`);
 	}
 	return lines.join('\n');
+}
+
+/**
+ * The goal's status in a backlog snapshot, or undefined when the file is not a
+ * ralph backlog, has no goal, or fails to parse. Used by the goal loop to
+ * detect goal completion (done) and the stall state (open) from the file.
+ */
+function goalStatus(todo: string): GoalStatus | undefined {
+	if (!isRalphBacklog(todo)) return undefined;
+	try {
+		return Backlog.parse(todo).goal()?.status;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether the plan grew between two snapshots: a task that is open in the newer
+ * snapshot but was not open in the older one (a new task, or a previously
+ * completed task re-opened). The goal loop uses this to tell a progress turn
+ * (the plan grew) from a stalled one, and to trigger a plan-updated rotation.
+ */
+function planGrew(previousTodo: string, currentTodo: string, category?: string): boolean {
+	if (!isRalphBacklog(previousTodo) || !isRalphBacklog(currentTodo)) return false;
+	try {
+		const previousOpen = new Set(
+			Backlog.parse(previousTodo)
+				.listTasks(category)
+				.filter((task) => !task.done)
+				.map((task) => task.id)
+		);
+		return Backlog.parse(currentTodo)
+			.listTasks(category)
+			.some((task) => !task.done && !previousOpen.has(task.id));
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -1566,6 +1604,11 @@ export default function (pi: ExtensionAPI) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
+				// Goal mode: never start a fresh iteration once the goal is done.
+				if (state.mode === 'goal' && goalStatus(currentTodo) === 'done') {
+					stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
+					return;
+				}
 				taskCount = countTodoTasks(currentTodo, state?.category);
 				const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
 				const next: RalphState = {
@@ -2024,6 +2067,11 @@ export default function (pi: ExtensionAPI) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}
+			// Goal mode: the loop ends when the goal is done in the file.
+			if (state.mode === 'goal' && goalStatus(currentTodo) === 'done') {
+				stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
+				return;
+			}
 
 			// Completing an item is a hard context boundary. It must win over the
 			// proactive threshold check below: each rotation inserts a marker that
@@ -2037,18 +2085,36 @@ export default function (pi: ExtensionAPI) {
 				queueRotation(ctx, 'completed-task', { currentTodo });
 				return;
 			}
+
+			// Start the checkpoint only after the current run has settled. Completed
+			// items take the clean cutoff above; unfinished work gets a durable TODO
+			// checkpoint followed by a fresh model context.
+			const contextFraction = contextUsageFraction(ctx);
+			if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
+				queueRotation(ctx, 'context-limit');
+				return;
+			}
+
+			// Goal mode: a turn that made no progress — the goal is still open, no
+			// task is open, nothing was completed, and the plan did not grow — and
+			// did not rotate (under budget) is a stall. Stop with a clear notice
+			// instead of looping on an empty plan.
+			if (
+				state.mode === 'goal' &&
+				goalStatus(currentTodo) === 'open' &&
+				isBacklogFinished(currentTodo, state.category) &&
+				!planGrew(state.baselineTodo, currentTodo, state.category)
+			) {
+				stopLoop(
+					ctx,
+					'Ralph goal loop stopped: the goal is still open but this iteration made no progress (no task completed and no new tasks added). Add tasks to the plan or complete the goal to continue.'
+				);
+				return;
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(`Ralph loop could not read ${state.todoPath}: ${message}`, 'error');
 			return;
-		}
-
-		// Start the checkpoint only after the current run has settled. Completed
-		// items take the clean cutoff above; unfinished work gets a durable TODO
-		// checkpoint followed by a fresh model context.
-		const contextFraction = contextUsageFraction(ctx);
-		if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
-			queueRotation(ctx, 'context-limit');
 		}
 	});
 

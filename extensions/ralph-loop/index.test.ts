@@ -1898,6 +1898,135 @@ GE "All routes render."
 	});
 });
 
+describe('ralph-loop extension (goal loop stop)', () => {
+	const GOAL_NO_TASKS = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+`;
+
+	const GOAL_OPEN_TASKS_DONE = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+D 1
+`;
+
+	const GOAL_EXECUTION = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+
+T 1 - "Port the routes."
+
+T 2 - "Port the state."
+`;
+
+	type GoalTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }> }>;
+	};
+
+	async function startGoalLoopWith(content: string) {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), content);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const goal = fake.tools.get('ralph_goal') as GoalTool;
+		const todo = fake.tools.get('ralph_todo') as GoalTool;
+		return {
+			fake,
+			fakeCtx,
+			run: (params: Record<string, unknown>) => goal.execute('t', params, undefined, undefined, fakeCtx.ctx),
+			todo: (params: Record<string, unknown>) => todo.execute('t', params, undefined, undefined, fakeCtx.ctx)
+		};
+	}
+
+	test('agent_settled stops the goal loop when the goal is done in the file', async () => {
+		const { fake, fakeCtx, run } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		// The re-evaluation iteration verifies the goal and completes it, then settles.
+		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
+	});
+
+	test('agent_settled stops the goal loop when a planning iteration makes no progress', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
+
+		// The planning iteration settles without adding any tasks (no progress).
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
+	});
+
+	test('agent_settled stops the goal loop when a re-evaluation iteration makes no progress', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		// The re-evaluation iteration settles without adding tasks or completing the goal.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
+	});
+
+	test('agent_settled does not stop the goal loop when the plan grows', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
+
+		// The planning iteration decomposes the goal into tasks (the plan grew) and settles.
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_EXECUTION);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The loop is still active (execution phase), not stalled.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
+	});
+
+	test('startFreshIteration does not start a fresh iteration once the goal is done', async () => {
+		const { fake, fakeCtx, run, todo } = await startGoalLoopWith(GOAL_EXECUTION);
+
+		// The execution iteration settles at/above the context threshold: a
+		// context-limit rotation is queued (recording), not a stall.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+
+		// The recording turn completes the remaining tasks and the goal, then settles.
+		await todo({ action: 'complete', task: '1', note: 'done' });
+		await todo({ action: 'complete', task: '2', note: 'done' });
+		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The fresh iteration is not started; the loop stops on the done goal.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
+	});
+});
+
 describe('ralph-loop extension (/ralph todos view)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);
