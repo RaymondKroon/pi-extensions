@@ -30,6 +30,7 @@ B 4
   - iterationPrompt goal variants by backlog state: planning (goal open, zero tasks), execution (open tasks: the task prompt plus goal context — keep the plan honest, add/adjust tasks when reality diverges), re-evaluation (goal open, tasks exist, none open: re-check every acceptance criterion, add tasks or complete the goal).
   - contextCheckpointPrompt goal variant: task-less iterations (planning/re-evaluation) checkpoint via ralph_goal checkpoint.
   - Acceptance: prompt tests for all three variants and the checkpoint variant.
+D 4
 
 T 5 - "Register the ralph_goal tool (first cut)"
 B 5
@@ -97,3 +98,6 @@ L 2 2 -
 
 L 3 3 2026-09-02
   Goal mode on RalphState (mode: 'tasks' | 'goal', normalized to 'tasks' for old sessions) and /ralph start --goal: goal validation (missing/done goal refused, zero open tasks allowed), task-mode validation unchanged, finished-backlog stop skipped in goal mode (start/restore/rotate), taskNumber undefined when no task is current. Changed: index.ts, index.test.ts (7 new tests in 'goal mode start'). Verified: bun test 207 pass / 0 fail.
+
+L 4 4 -
+  Goal variants of iterationPrompt (planning: decompose goal into tasks, no implementation; execution: task prompt plus goal context, keep the plan honest; re-evaluation: re-check every acceptance criterion, add tasks or ralph_goal complete) and contextCheckpointPrompt (task-less goal iterations checkpoint via ralph_goal checkpoint). Changed: index.ts (goalPhase/goalBlock helpers, prompt variants, agent_settled no longer stops a goal loop on an exhausted plan), index.test.ts (6 new prompt tests). bun test: 213 pass, 0 fail. Commit 8e43fba.
