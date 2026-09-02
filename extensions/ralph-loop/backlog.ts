@@ -184,6 +184,11 @@ export class Backlog {
 
 	// --- construction -------------------------------------------------------
 
+	/** Create an empty in-memory backlog (no lists, tasks, or log entries). */
+	static empty(): Backlog {
+		return new Backlog(newDatabase());
+	}
+
 	/** Parse a ralph-format backlog file into an in-memory SQLite store. */
 	static parse(text: string): Backlog {
 		const db = newDatabase();

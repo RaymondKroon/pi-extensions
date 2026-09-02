@@ -19,7 +19,7 @@ import {
 } from '@earendil-works/pi-tui';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
 import { Backlog, formatBacklog, formatNextTask, formatSearchResults, formatTaskDetail, isRalphBacklog } from './backlog.ts';
 import { createTodosView, type TodosView } from './todos-view.ts';
@@ -33,8 +33,8 @@ const CONTEXT_BOUNDARY_TYPE = 'ralph-loop-context-boundary';
 const DEFAULT_TODO = 'TODO.md';
 const DEFAULT_SPEC = 'SPEC.md';
 /** Generic documents bundled with this extension for /ralph-init to adapt. */
-const INIT_TEMPLATE_SPEC = join(import.meta.dirname, DEFAULT_SPEC);
-const INIT_TEMPLATE_TODO = join(import.meta.dirname, DEFAULT_TODO);
+const INIT_TEMPLATE_SPEC = join(import.meta.dirname, 'SPEC.template.md');
+const INIT_TEMPLATE_TODO = join(import.meta.dirname, 'TODO.template.md');
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
 const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -623,6 +623,25 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
+/**
+ * Inspect an init output target before writing. Shared by /ralph-init and
+ * ralph_todo action "init" to decide whether the file can be created, already
+ * holds a ralph backlog (init is idempotent on it), or must not be replaced.
+ */
+async function inspectInitTarget(path: string): Promise<
+	| { kind: 'missing' }
+	| { kind: 'exists'; ralph: boolean }
+	| { kind: 'error'; message: string }
+> {
+	try {
+		const text = await readFile(path, 'utf8');
+		return { kind: 'exists', ralph: isRalphBacklog(text) };
+	} catch (error) {
+		if (error instanceof Error && (error as { code?: unknown }).code === 'ENOENT') return { kind: 'missing' };
+		return { kind: 'error', message: `could not read ${path}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
 interface RalphImportArgs {
 	input: string;
 	force: boolean;
@@ -1013,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, new-list, log, move, import. "add" adds to the current scope, or to an existing list via "category" (it never creates a list); use "new-list" with a name to create a new list explicitly. "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email).',
+			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph, which must exist first (create it with action "init" or "import"). Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, add-many, new-list, log, move, import, init. "add" adds to the current scope, or to an existing list via "category" (it never creates a list); use "new-list" with a name to create a new list explicitly. "add-many" adds several tasks at once via the "tasks" array (all-or-nothing; each entry may set its own category). "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email). "init" explicitly bootstraps an empty backlog at the target path when it does not exist yet (idempotent; refuses to overwrite a non-ralph file).',
 		promptSnippet: 'Read/update the Ralph backlog',
 		promptGuidelines: [
 			'Use ralph_todo to read or update the ralph-format backlog; never read or modify the backlog file by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use action "search" to find tasks by keyword.'
@@ -1026,10 +1045,12 @@ export default function (pi: ExtensionAPI) {
 				Type.Literal('complete'),
 				Type.Literal('checkpoint'),
 				Type.Literal('add'),
+				Type.Literal('add-many'),
 				Type.Literal('new-list'),
 				Type.Literal('log'),
 				Type.Literal('move'),
-				Type.Literal('import')
+				Type.Literal('import'),
+				Type.Literal('init')
 			]),
 			task: Type.Optional(
 				Type.String({ description: 'Task number (as shown by list/next, e.g. "3"): the target of complete/checkpoint/log/move; with list: show that single task\'s detail view (body, checkpoint, completion log) instead of the whole backlog.' })
@@ -1037,6 +1058,16 @@ export default function (pi: ExtensionAPI) {
 			note: Type.Optional(Type.String({ description: 'Checkpoint note (checkpoint) or completion-log entry (log).' })),
 			title: Type.Optional(Type.String({ description: 'New task title (add).' })),
 			body: Type.Optional(Type.String({ description: 'New task body, markdown bullets (add).' })),
+			tasks: Type.Optional(
+				Type.Array(
+					Type.Object({
+						title: Type.String({ description: 'Task title.' }),
+						body: Type.Optional(Type.String({ description: 'Task body, markdown bullets.' })),
+						category: Type.Optional(Type.String({ description: 'Existing list for this task; omit for the current scope.' }))
+					}),
+					{ description: 'Tasks to add in order (add-many). The batch is all-or-nothing: if any entry is invalid, nothing is added.' }
+				)
+			),
 			name: Type.Optional(Type.String({ description: 'New list name (new-list). Creating a list is explicit and separate from adding a task.' })),
 			category: Type.Optional(Type.String({ description: 'Existing list (list: filter the summary to it; add: target list for a new task; search: restrict the match to it). Must already exist; use new-list to create one first. Omit on add to use the current scope. For import: list stamped on the imported tasks; defaults to a name derived from the file name (TODO_EMAIL.md → Email).' })),
 			query: Type.Optional(Type.String({ description: 'Case-insensitive substring to search for (search) in task titles, bodies, checkpoints, and completion log notes.' })),
@@ -1078,25 +1109,55 @@ export default function (pi: ExtensionAPI) {
 			}
 			// Target: the active loop's backlog, else the project's main backlog.
 			const todoPath = state?.enabled ? state.todoPath : resolve(ctx.cwd, 'TODO.ralph');
-			let text: string;
-			try {
-				text = await readRequiredFile(todoPath);
-			} catch (error) {
-				throw new Error(
-					state?.enabled
-						? `could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`
-						: `No Ralph backlog found at ${todoPath}. Create one with /ralph import <file.md> or ralph_todo action "import".`
-				);
+			// Init bootstraps a missing backlog file, so it runs before the target read.
+			if (params.action === 'init') {
+				const status = await inspectInitTarget(todoPath);
+				if (status.kind === 'error') throw new Error(status.message);
+				if (status.kind === 'exists') {
+					if (status.ralph) {
+						return {
+							content: [{ type: 'text', text: `${todoPath} already exists as a ralph-format backlog; nothing to do.` }],
+							details: { action: 'init', task: null }
+						};
+					}
+					throw new Error(`${todoPath} exists but is not a ralph-format backlog; refusing to overwrite it.`);
+				}
+				try {
+					await mkdir(dirname(todoPath), { recursive: true });
+					await writeFile(todoPath, Backlog.empty().render());
+				} catch (error) {
+					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return {
+					content: [{ type: 'text', text: `Created empty Ralph backlog at ${todoPath}. Add tasks with action "add" and lists with action "new-list".` }],
+					details: { action: 'init', task: null }
+				};
 			}
-			if (!isRalphBacklog(text)) {
-				throw new Error(`${todoPath} is not a ralph-format backlog; ralph_todo only works with ralph-format backlogs.`);
-			}
-			let backlog: Backlog;
-			try {
-				backlog = Backlog.parse(text);
-			} catch (error) {
-				throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-			}
+			const loadTargetBacklog = async (): Promise<Backlog> => {
+				let text: string;
+				try {
+					text = await readRequiredFile(todoPath);
+				} catch (error) {
+					const missing = error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
+					if (missing) {
+						throw new Error(
+							state?.enabled
+								? `${todoPath} is missing; bootstrap it with ralph_todo action "init" or restore the file.`
+								: `No Ralph backlog at ${todoPath}. Bootstrap it with ralph_todo action "init" or import a Markdown TODO with action "import".`
+						);
+					}
+					throw new Error(`could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				if (!isRalphBacklog(text)) {
+					throw new Error(`${todoPath} is not a ralph-format backlog; ralph_todo only works with ralph-format backlogs.`);
+				}
+				try {
+					return Backlog.parse(text);
+				} catch (error) {
+					throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			};
+			const backlog = await loadTargetBacklog();
 
 			let mutated = false;
 			let output: string;
@@ -1171,6 +1232,37 @@ export default function (pi: ExtensionAPI) {
 					mutated = true;
 					const number = backlog.taskNumbers(addScope).get(task.id) ?? task.id;
 					output = `Added task ${number} "${task.title}"${task.category ? ` in category "${task.category}"` : ''}.`;
+					break;
+				}
+				case 'add-many': {
+					const items = params.tasks;
+					if (!Array.isArray(items) || items.length === 0) {
+						throw new Error('add-many requires a non-empty "tasks" array.');
+					}
+					// Validate the whole batch first so an invalid entry adds nothing.
+					const missingLists = [
+						...new Set(
+							items
+								.map((item) => item.category)
+								.filter((category): category is string => category !== undefined && !backlog.categories().includes(category))
+						)
+					];
+					if (missingLists.length > 0) {
+						throw new Error(
+							`no list named ${missingLists.map((name) => `"${name}"`).join(', ')} (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`
+						);
+					}
+					const added = items.map((item) =>
+						backlog.addTask({ title: item.title, body: item.body, category: item.category })
+					);
+					mutated = true;
+					const summary = added
+						.map((task) => {
+							const number = backlog.taskNumbers(task.category ?? scope).get(task.id) ?? task.id;
+							return `${number} "${task.title}"${task.category ? ` [${task.category}]` : ''}`;
+						})
+						.join(', ');
+					output = `Added ${added.length} task${added.length === 1 ? '' : 's'}: ${summary}.`;
 					break;
 				}
 				case 'new-list': {
@@ -1846,11 +1938,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (!initFiles.force) {
-				const existing = (
-					await Promise.all(
-						paths.map(async ({ file, path }) => ((await pathExists(path!)) ? file : undefined))
-					)
-				).filter((file): file is string => file !== undefined);
+				const statuses = await Promise.all(
+					paths.map(async ({ file, path }) => ({ file, status: await inspectInitTarget(path!) }))
+				);
+				const unreadable = statuses.find(({ status }) => status.kind === 'error');
+				if (unreadable) {
+					ctx.ui.notify(unreadable.status.message, 'warning');
+					return;
+				}
+				const existing = statuses.filter(({ status }) => status.kind === 'exists').map(({ file }) => file);
 				if (existing.length > 0) {
 					ctx.ui.notify(
 						`Refusing to replace existing ${existing.join(', ')}. Choose new names or add --force.`,

@@ -1104,6 +1104,57 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await expect(run({ action: 'checkpoint', task: '2', note: 'x' })).rejects.toThrow(/active Ralph loop/);
 	});
 
+	test('ralph_todo add-many adds a batch of tasks all-or-nothing', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await importTodo(fake, fakeCtx, 'import TODO.md');
+
+		const tool = fake.tools.get('ralph_todo') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		};
+		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// A batch spanning the default list and an explicit list.
+		await run({ action: 'new-list', name: 'Docs' });
+		const batch = await run({
+			action: 'add-many',
+			tasks: [
+				{ title: 'First batch task.' },
+				{ title: 'Second batch task.', body: '- detail' },
+				{ title: 'Doc task.', category: 'Docs' }
+			]
+		});
+		expect(batch.content[0]!.text).toContain('Added 3 tasks:');
+		expect(batch.content[0]!.text).toContain('[Docs]');
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.listTasks().slice(-3).map((t) => t.title)).toEqual([
+			'First batch task.',
+			'Second batch task.',
+			'Doc task.'
+		]);
+		expect(backlog.listTasks().at(-1)?.category).toBe('Docs');
+		expect(backlog.listTasks().at(-2)?.body).toBe('- detail');
+
+		// An unknown category refuses the whole batch: nothing is added.
+		const before = backlog.listTasks().length;
+		await expect(
+			run({ action: 'add-many', tasks: [{ title: 'X.' }, { title: 'Y.', category: 'Nope' }] })
+		).rejects.toThrow(/no list named "Nope"/);
+		const after = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(after.listTasks().length).toBe(before);
+
+		// An empty batch is refused.
+		await expect(run({ action: 'add-many', tasks: [] })).rejects.toThrow(/non-empty/);
+	});
+
 	test('ralph_todo search finds tasks by keyword without writing the file', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1228,7 +1279,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('recording');
 	});
 
-	test('ralph_todo without a loop needs a ralph backlog; a Markdown loop is refused', async () => {
+	test('ralph_todo without a loop needs a backlog; init bootstraps it; a Markdown loop is refused', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1241,12 +1292,27 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 				signal: unknown,
 				onUpdate: unknown,
 				ctx: unknown
-			) => Promise<unknown>;
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
 		};
-		// No loop and no TODO.ralph: point at the import command.
-		await expect(tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			/No Ralph backlog found.*\/ralph import/s
+		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop and no TODO.ralph: actions point at init (or import).
+		await expect(run({ action: 'list' })).rejects.toThrow(
+			/No Ralph backlog at .*Bootstrap it with ralph_todo action "init"/s
 		);
+		await expect(run({ action: 'add', title: 'Nope.' })).rejects.toThrow(/Bootstrap it with ralph_todo action "init"/);
+		await expect(readFile(join(dir, 'TODO.ralph'), 'utf8')).rejects.toThrow();
+
+		// init creates the file; new-list and add then work on it.
+		const created = await run({ action: 'init' });
+		expect(created.content[0]!.text).toContain('Created empty Ralph backlog');
+		const listCreated = await run({ action: 'new-list', name: 'Docs' });
+		expect(listCreated.content[0]!.text).toContain('Created list "Docs"');
+		const added = await run({ action: 'add', title: 'Write the onboarding doc.', category: 'Docs' });
+		expect(added.content[0]!.text).toContain('category "Docs"');
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		const task = backlog.listTasks().find((t) => t.title === 'Write the onboarding doc.');
+		expect(task?.category).toBe('Docs');
 
 		// Start a Markdown-based loop: the tool must refuse the Markdown file.
 		const ralph = fake.commands.get('ralph')!;
@@ -1254,6 +1320,37 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await expect(tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
 			/not a ralph-format backlog/
 		);
+	});
+
+	test('ralph_todo init bootstraps a missing backlog and is idempotent', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const tool = fake.tools.get('ralph_todo') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		};
+		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// init creates the missing file.
+		const created = await run({ action: 'init' });
+		expect(created.content[0]!.text).toContain('Created empty Ralph backlog');
+		expect((await readFile(join(dir, 'TODO.ralph'), 'utf8')).startsWith('# ralph v2')).toBe(true);
+
+		// init is idempotent on an existing ralph backlog.
+		const again = await run({ action: 'init' });
+		expect(again.content[0]!.text).toContain('already exists');
+
+		// init refuses to overwrite a non-ralph file.
+		await writeFile(join(dir, 'TODO.ralph'), '# not a backlog\n');
+		await expect(run({ action: 'init' })).rejects.toThrow(/refusing to overwrite/);
 	});
 });
 
