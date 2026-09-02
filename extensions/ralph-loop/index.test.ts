@@ -2833,4 +2833,66 @@ describe('/ralph-init (ralph-format-only)', () => {
 		expect((await readFile(join(dir, 'TODO.ralph'), 'utf8')).startsWith('# ralph v2')).toBe(true);
 		expect(fake.userMessages).toHaveLength(1);
 	});
+
+	describe('--goal', () => {
+		test('creates a backlog with the goal and no tasks, and a goal-aware spec prompt', async () => {
+			await rm(join(dir, 'SPEC.md'));
+			await init('--goal Build a lamp that dims.');
+
+			const text = await readFile(join(dir, 'TODO.ralph'), 'utf8');
+			const backlog = Backlog.parse(text);
+			const goal = backlog.goal();
+			expect(goal?.title).toBe('Build a lamp that dims.');
+			expect(goal?.status).toBe('open');
+			expect(goal?.body).toBeNull();
+			expect(backlog.counts()).toEqual({ open: 0, total: 0, completed: 0 });
+
+			// The LLM is asked for the spec only, and the spec must state the
+			// goal verbatim with acceptance criteria.
+			expect(fake.userMessages).toHaveLength(1);
+			const prompt = fake.userMessages[0]!.text;
+			expect(prompt).toContain('Goal: Build a lamp that dims.');
+			expect(prompt).toContain('acceptance criteria');
+			expect(prompt).toContain('exactly as given');
+			expect(prompt).not.toContain('backlog: ');
+		});
+
+		test('requires a brief', async () => {
+			await init('--goal');
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph-init [--goal]');
+			expect(fake.userMessages).toHaveLength(0);
+			await expect(readFile(join(dir, 'TODO.ralph'), 'utf8')).rejects.toThrow();
+		});
+
+		test('is idempotent on an existing goal', async () => {
+			await rm(join(dir, 'SPEC.md'));
+			await init('--goal --todo TODO.ralph Build a lamp that dims.');
+			const first = await readFile(join(dir, 'TODO.ralph'), 'utf8');
+			fakeCtx.notifications.length = 0;
+			await init('--goal --todo TODO.ralph Build a lamp that dims.');
+			expect(await readFile(join(dir, 'TODO.ralph'), 'utf8')).toBe(first);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('already has the goal');
+			expect(fake.userMessages).toHaveLength(0);
+		});
+
+		test('adds the goal to an existing ralph backlog that has none', async () => {
+			await rm(join(dir, 'SPEC.md'));
+			await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+			await init('--goal Build a lamp that dims.');
+
+			const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+			expect(backlog.goal()?.title).toBe('Build a lamp that dims.');
+			// The existing tasks are untouched.
+			expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
+		});
+
+		test('--goal --todo creates only the goal backlog without an LLM prompt', async () => {
+			await init('--goal --todo TODO.ralph Build a lamp that dims.');
+			const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+			expect(backlog.goal()?.title).toBe('Build a lamp that dims.');
+			expect(backlog.counts()).toEqual({ open: 0, total: 0, completed: 0 });
+			expect(fake.userMessages).toHaveLength(0);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Created Ralph backlog with goal');
+		});
+	});
 });
