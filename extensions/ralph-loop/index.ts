@@ -62,6 +62,8 @@ interface RalphState {
 	contextThreshold: number;
 	autoApproveDecisions: boolean;
 	enabled: boolean;
+	/** Loop policy: the finite task backlog or the single goal. */
+	mode: 'tasks' | 'goal';
 	todoPath: string;
 	specPath: string;
 	baselineTodo: string;
@@ -96,6 +98,7 @@ function isRalphState(value: unknown): value is RalphState {
 	const state = value as Partial<RalphState>;
 	return (
 		typeof state.enabled === 'boolean' &&
+		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal') &&
 		typeof state.todoPath === 'string' &&
 		typeof state.specPath === 'string' &&
 		typeof state.baselineTodo === 'string' &&
@@ -122,6 +125,7 @@ function isRalphState(value: unknown): value is RalphState {
 function normalizeState(state: RalphState): RalphState {
 	return {
 		...state,
+		mode: state.mode ?? 'tasks',
 		autoApproveDecisions: state.autoApproveDecisions ?? DEFAULT_AUTO_APPROVE_DECISIONS,
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
@@ -286,6 +290,14 @@ function projectConfigPath(cwd: string): string {
 function countTodoTasks(todo: string, category?: string): { current: number; total: number } {
 	const { open, total } = todoCounts(todo, category);
 	return { current: open > 0 ? total - open + 1 : total, total };
+}
+
+/**
+ * The current task number for RalphState, or undefined when no task is
+ * current (goal mode with an exhausted plan): task numbers are 1-based.
+ */
+function currentTaskNumber(current: number): number | undefined {
+	return current > 0 ? current : undefined;
 }
 
 function hasCompletedTodoItem(previousTodo: string, currentTodo: string, category?: string): boolean {
@@ -524,6 +536,8 @@ interface RalphStartFiles {
 	specFile: string;
 	todoFile: string;
 	category?: string;
+	/** Start the goal loop instead of the task loop. */
+	goal: boolean;
 }
 
 interface RalphInitFiles {
@@ -538,9 +552,15 @@ function parseStartFiles(args: string[]): RalphStartFiles | undefined {
 	let specFile = DEFAULT_SPEC;
 	let todoFile = DEFAULT_TODO;
 	let category: string | undefined;
+	let goal = false;
 
 	for (let index = 0; index < args.length; index += 1) {
 		const option = args[index];
+		if (option === '--goal') {
+			if (goal) return undefined;
+			goal = true;
+			continue;
+		}
 		if (option !== '--spec' && option !== '--todo' && option !== '--category') return undefined;
 		const path = args[index + 1];
 		if (!path || path.startsWith('--')) return undefined;
@@ -550,7 +570,7 @@ function parseStartFiles(args: string[]): RalphStartFiles | undefined {
 		index += 1;
 	}
 
-	return { specFile, todoFile, category };
+	return { specFile, todoFile, category, goal };
 }
 
 /**
@@ -1329,7 +1349,9 @@ export default function (pi: ExtensionAPI) {
 			const reason = state.rotationReason ?? 'completed-task';
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				if (isBacklogFinished(currentTodo, state?.category)) {
+				// Goal mode is done when the goal is done, not when the plan is
+				// exhausted: an empty plan is the planning state.
+				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
@@ -1340,7 +1362,7 @@ export default function (pi: ExtensionAPI) {
 					baselineTodo: currentTodo,
 					iteration: state.iteration + 1,
 					taskIteration: taskChanged ? 1 : state.taskIteration + 1,
-					taskNumber: taskCount.current,
+					taskNumber: currentTaskNumber(taskCount.current),
 					rotationQueued: false,
 					rotationReason: undefined,
 					rotationCheckpointing: false
@@ -1397,7 +1419,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const { specFile, todoFile, category } = files;
+		const { specFile, todoFile, category, goal } = files;
 		const todoPath = resolve(ctx.cwd, todoFile);
 		const specPath = resolve(ctx.cwd, specFile);
 		try {
@@ -1410,14 +1432,28 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			const backlog = Backlog.parse(baselineTodo);
+			if (goal) {
+				const goalRecord = backlog.goal();
+				if (!goalRecord) {
+					ctx.ui.notify(`Ralph goal loop will not start because ${todoFile} has no goal`, 'warning');
+					return;
+				}
+				if (goalRecord.status === 'done') {
+					ctx.ui.notify('Ralph goal loop will not start because the goal is already complete', 'info');
+					return;
+				}
+			}
 			if (category !== undefined) {
-				const known = Backlog.parse(baselineTodo).categories();
+				const known = backlog.categories();
 				if (!known.includes(category)) {
 					ctx.ui.notify(`Unknown category "${category}" (categories: ${known.join(', ') || 'none'})`, 'warning');
 					return;
 				}
 			}
-			if (isBacklogFinished(baselineTodo, category)) {
+			// Goal mode allows zero open tasks: an empty plan is the planning
+			// state, not a finished loop.
+			if (!goal && isBacklogFinished(baselineTodo, category)) {
 				ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
 				return;
 			}
@@ -1429,7 +1465,7 @@ export default function (pi: ExtensionAPI) {
 				baselineTodo,
 				iteration: 1,
 				taskIteration: 1,
-				taskNumber: taskCount.current,
+				taskNumber: currentTaskNumber(taskCount.current),
 				maxIterations: config.maxIterations,
 				contextThreshold: contextThresholdFor(config, ctx),
 				autoApproveDecisions: config.autoApproveDecisions,
@@ -1440,6 +1476,7 @@ export default function (pi: ExtensionAPI) {
 				paused: false,
 				blocked: false,
 				blockedItem: undefined,
+				mode: goal ? 'goal' : 'tasks',
 				category
 			};
 			persistState(next);
@@ -1567,16 +1604,18 @@ export default function (pi: ExtensionAPI) {
 		if (state?.enabled) {
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				if (isBacklogFinished(currentTodo, state?.category)) {
+				// Goal mode is done when the goal is done, not when the plan is
+				// exhausted: an empty plan is the planning state.
+				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
 				taskCount = countTodoTasks(currentTodo, state?.category);
 				// Re-sync the per-task counter after a reload in case the TODO moved on.
 				if (state.taskNumber !== undefined && state.taskNumber !== taskCount.current) {
-					state = { ...state, taskNumber: taskCount.current, taskIteration: 1 };
+					state = { ...state, taskNumber: currentTaskNumber(taskCount.current), taskIteration: 1 };
 				} else if (state.taskNumber === undefined) {
-					state = { ...state, taskNumber: taskCount.current };
+					state = { ...state, taskNumber: currentTaskNumber(taskCount.current) };
 				}
 			} catch {
 				// The normal iteration path will surface a readable TODO error.
@@ -2014,7 +2053,7 @@ export default function (pi: ExtensionAPI) {
 				{
 					value: 'start',
 					label: 'start',
-					description: 'Defaults: SPEC.md and TODO.ralph. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>. Markdown TODOs must be imported first: /ralph import TODO.md.'
+					description: 'Defaults: SPEC.md and TODO.ralph. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into TODO.ralph, merging into an existing backlog. Each source file is only imported once.' },
 				{ value: 'todos', label: 'todos', description: 'Show the backlog in an interactive list: /ralph todos [file] (defaults to the active loop’s backlog). In the list picker: enter: open, R: rename, q: quit. In the view: a/A add and e edit open a popup form (jk/↑↓ or tab: field, enter: edit/confirm field, ctrl+s: save, esc: cancel), x delete, R rename list, s start a loop on the list, q quit.' },
@@ -2211,7 +2250,7 @@ export default function (pi: ExtensionAPI) {
 									}
 								},
 								onStartLoop: (loopCategory) => {
-									void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory });
+									void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory, goal: false });
 								}
 							})
 						);
@@ -2300,7 +2339,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const startFiles = parseStartFiles(commandArgs.slice(1));
 			if (!startFiles) {
-				ctx.ui.notify('Usage: /ralph start [--spec file] [--todo file] [--category name]', 'warning');
+				ctx.ui.notify('Usage: /ralph start [--spec file] [--todo file] [--category name] [--goal]', 'warning');
 				return;
 			}
 			await startLoop(ctx, startFiles);
@@ -2342,7 +2381,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (isBacklogFinished(currentTodo, state?.category)) {
+			// Goal mode is done when the goal is done, not when the plan is
+			// exhausted: an empty plan is the planning state.
+			if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}

@@ -1406,6 +1406,162 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 	});
 });
 
+describe('ralph-loop extension (goal mode start)', () => {
+	const GOAL_OPEN = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_DONE = `# ralph v2
+
+G "Rewrite the app" done
+GE "All routes render."
+
+T 1 - "Port the routes."
+D 1
+`;
+
+	const GOAL_NO_TASKS = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+`;
+
+	const RALPH_FINISHED = `# ralph v2
+
+T 1 - "Task one"
+D 1
+
+T 2 - "Task two"
+D 2
+`;
+
+	const stateEntries = (fake: ReturnType<typeof createFakePi>) =>
+		fake.entries.filter((entry) => entry.customType === 'ralph-loop-state');
+
+	test('start --goal is refused when the backlog has no goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo TODO.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('has no goal');
+	});
+
+	test('start --goal is refused when the goal is already complete', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_DONE);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is already complete');
+	});
+
+	test('start --goal starts with an open goal and zero open tasks', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 0/0 (iteration 1)');
+		expect(stateEntries(fake).at(-1)!.data.mode).toBe('goal');
+	});
+
+	test('start --goal starts with an open goal and open tasks', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 1/1 (iteration 1)');
+		expect(stateEntries(fake).at(-1)!.data.mode).toBe('goal');
+	});
+
+	test('start without --goal is unchanged: finished backlog refused, goal ignored', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'FINISHED.ralph'), RALPH_FINISHED);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+
+		await ralph.handler('start --todo FINISHED.ralph', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('all TODO items are complete');
+
+		// A goal in the backlog does not change task-mode validation.
+		fakeCtx.notifications.length = 0;
+		await ralph.handler('start --todo GOAL.ralph', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 1/1 (iteration 1)');
+		expect(stateEntries(fake).at(-1)!.data.mode).toBe('tasks');
+	});
+
+	test('goal mode round-trips through persisted state and survives an exhausted plan', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+
+		const entry = stateEntries(fake).at(-1)!;
+		expect(entry.data.mode).toBe('goal');
+
+		// Reload the session: the goal loop stays active with zero open tasks
+		// (the planning state) instead of stopping as a finished task loop.
+		const reloaded = createFakePi();
+		extension(reloaded.pi as never);
+		const reloadedCtx = createFakeCtx(dir);
+		reloadedCtx.ctx.sessionManager.getBranch = () => [entry];
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
+		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
+		expect(reloadedCtx.notifications.at(-1)?.message).toContain('Ralph loop is active');
+	});
+
+	test('persisted state without a mode normalizes to the task loop', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+
+		// A session persisted before the mode existed: strip it and reload.
+		// The exhausted plan now stops the loop, exactly as task mode always did.
+		const legacy = { ...stateEntries(fake).at(-1)!, data: { ...stateEntries(fake).at(-1)!.data, mode: undefined } };
+		const reloaded = createFakePi();
+		extension(reloaded.pi as never);
+		const reloadedCtx = createFakeCtx(dir);
+		reloadedCtx.ctx.sessionManager.getBranch = () => [legacy];
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
+		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
+		expect(reloadedCtx.notifications.at(-1)?.message).toBe('Ralph loop is stopped');
+	});
+});
+
 describe('ralph-loop extension (/ralph todos view)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);

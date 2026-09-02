@@ -23,6 +23,7 @@ B 3
   - `--goal` flag on /ralph start (parseStartFiles + argument completions).
   - startLoop: goal mode requires a goal that is open or claimed and allows zero open tasks; task-mode validation is unchanged.
   - Acceptance: start-validation tests (no goal, goal done, zero open tasks OK, task mode unchanged) and a state persistence round-trip.
+D 3
 
 T 4 - "Add goal-loop iteration prompts"
 B 4
@@ -93,3 +94,6 @@ L 1 1 -
 
 L 2 2 -
   Added claimGoal(evidence) (open→claimed, records GE evidence), confirmGoal() (claimed→done), withdrawGoal(note) (claimed→open, note becomes checkpoint, evidence cleared), setGoalCheckpoint(note, iteration) to Backlog in backlog.ts; invalid transitions and missing goal throw. Focused tests in backlog.test.ts (goal state transitions: every valid + invalid transition, lifecycle render/parse round-trip). bun test: 200 pass / 0 fail across 4 files.
+
+L 3 3 2026-09-02
+  Goal mode on RalphState (mode: 'tasks' | 'goal', normalized to 'tasks' for old sessions) and /ralph start --goal: goal validation (missing/done goal refused, zero open tasks allowed), task-mode validation unchanged, finished-backlog stop skipped in goal mode (start/restore/rotate), taskNumber undefined when no task is current. Changed: index.ts, index.test.ts (7 new tests in 'goal mode start'). Verified: bun test 207 pass / 0 fail.
