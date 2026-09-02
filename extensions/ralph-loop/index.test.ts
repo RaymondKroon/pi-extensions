@@ -1536,7 +1536,7 @@ D 2
 		reloadedCtx.ctx.sessionManager.getBranch = () => [entry];
 		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
 		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
-		expect(reloadedCtx.notifications.at(-1)?.message).toContain('Ralph loop is active');
+		expect(reloadedCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is active');
 	});
 
 	test('persisted state without a mode normalizes to the task loop', async () => {
@@ -1559,6 +1559,151 @@ D 2
 		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
 		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
 		expect(reloadedCtx.notifications.at(-1)?.message).toBe('Ralph loop is stopped');
+	});
+});
+
+describe('ralph-loop extension (status mode and goal state)', () => {
+	type GoalTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
+	};
+
+	const GOAL_OPEN = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_NO_TASKS = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+`;
+
+	const goalTool = (fake: ReturnType<typeof createFakePi>): GoalTool => {
+		const tool = fake.tools.get('ralph_goal') as GoalTool | undefined;
+		expect(tool).toBeDefined();
+		return tool!;
+	};
+
+	test('task-mode status is unchanged: no mode marker, no goal segment', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: on');
+		expect(status).not.toContain('Ralph (goal)');
+		expect(status).not.toContain('goal:');
+		expect(status).toContain('iteration 1/10');
+		expect(status).toContain('task: 1/3 (iteration 1)');
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop is active · iteration 1/10 · task: 1/3 (iteration 1)');
+	});
+
+	test('task-mode status ignores a goal present in the backlog', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph', fakeCtx.ctx);
+
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: on');
+		expect(status).not.toContain('Ralph (goal)');
+		expect(status).not.toContain('goal:');
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe(
+			'Ralph loop is active · iteration 1/10 · task: 1/1 (iteration 1)'
+		);
+	});
+
+	test('goal-mode status shows the mode marker and an open goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (goal): on');
+		expect(status).toContain('iteration 1/10');
+		expect(status).toContain('task: 1/1 (iteration 1)');
+		expect(status).toContain('goal: open');
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe(
+			'Ralph goal loop is active · iteration 1/10 · task: 1/1 (iteration 1) · goal: open'
+		);
+	});
+
+	test('goal status follows claim and confirm', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) =>
+			goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Claim: the loop blocks on the approval gate and the status shows claimed.
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBe(true);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('goal: claimed');
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is awaiting your decision');
+
+		// Approve: the user decision is resolved, then confirm flips the goal to done.
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
+		await run({ action: 'confirm' });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('goal: done');
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is active');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('· goal: done');
+	});
+
+	test('goal status returns to open after a rejected completion', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) =>
+			goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Claim, then the user rejects: withdraw returns the goal to open.
+		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { recordPath: 'docs/decisions/goal.md', resolution: 'Goal rejected' }, undefined, undefined, fakeCtx.ctx);
+		await run({ action: 'withdraw', note: 'The new framework migration is missing.' });
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('goal: open');
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe(
+			'Ralph goal loop is active · iteration 1/10 · task: 0/0 (iteration 1) · goal: open'
+		);
 	});
 });
 
@@ -1913,7 +2058,7 @@ GE "All routes render."
 
 		// The loop is blocked: the status shows waiting, the decision widget is
 		// set, and the user is notified.
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('paused');
 	});
@@ -2087,12 +2232,12 @@ T 2 - "Port the state."
 		// blocks pending the user's approval and the turn terminates.
 		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
 		expect(result.terminate).toBe(true);
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
 		// The blocked turn settles: nothing rotates, nothing stops.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
 		// The user approves; the model records the decision and resolves it.
 		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
@@ -2109,7 +2254,7 @@ T 2 - "Port the state."
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
 	});
 
@@ -2120,7 +2265,7 @@ T 2 - "Port the state."
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
 	});
 
@@ -2131,7 +2276,7 @@ T 2 - "Port the state."
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
 	});
 
@@ -2147,7 +2292,7 @@ T 2 - "Port the state."
 		// A commit-only recording turn runs before the fresh iteration: the plan
 		// update is committed, but no completion log entry is written.
 		let status = statusLine(fakeCtx.widgets);
-		expect(status).toContain('Ralph: recording');
+		expect(status).toContain('Ralph (goal): recording');
 		const recordingPrompt = fake.userMessages.at(-1)?.text ?? '';
 		expect(recordingPrompt).toContain('plan was just updated');
 		expect(recordingPrompt).toContain('Check git status');
@@ -2161,14 +2306,14 @@ T 2 - "Port the state."
 		await flush();
 
 		status = statusLine(fakeCtx.widgets);
-		expect(status).toContain('Ralph: starting');
+		expect(status).toContain('Ralph (goal): starting');
 		expect(status).toContain('iteration 2/10');
 		expect(status).toContain('task: 1/2 (iteration 2)');
 
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('message_update', fakeCtx.ctx);
 		status = statusLine(fakeCtx.widgets);
-		expect(status).toContain('Ralph: on');
+		expect(status).toContain('Ralph (goal): on');
 		const iterationPrompt = fake.userMessages.at(-1)?.text ?? '';
 		expect(iterationPrompt).toContain('The plan was just updated with new tasks');
 		expect(iterationPrompt).toContain('You are executing the goal');
@@ -2187,7 +2332,7 @@ T 2 - "Port the state."
 		await flush();
 
 		// No rotation: the open set is unchanged, so no recording turn and no fresh iteration.
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 		expect(fake.userMessages.length).toBe(1);
 		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
@@ -2215,7 +2360,7 @@ T 2 - "Port the state."
 
 		// The blocked turn settles: the loop waits — it does not rotate or start
 		// a fresh iteration.
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
 		// The user approves; the model resolves the decision and confirms the goal.
 		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
@@ -2231,7 +2376,7 @@ T 2 - "Port the state."
 		await flush();
 
 		// The fresh iteration is not started; the loop stops on the done goal.
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
 	});
 });

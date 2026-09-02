@@ -1009,6 +1009,10 @@ export default function (pi: ExtensionAPI) {
 	// the status widget can show the current task number without reading the file
 	// on every streamed message update.
 	let taskCount: { current: number; total: number } | undefined;
+	// Cached from the TODO file at each refresh point (start, settle, rotation) so
+	// the status widget can show the current goal state without reading the file
+	// on every streamed message update.
+	let goalState: GoalStatus | undefined;
 	// Display-only: set when a fresh iteration prompt is sent and cleared when the
 	// new turn starts streaming or settles, so the status bar visibly stays in the
 	// "starting" phase instead of flipping back to "on" within milliseconds.
@@ -1022,6 +1026,11 @@ export default function (pi: ExtensionAPI) {
 	// aborted recording turn must not count as recorded progress.
 	let lastAssistantStopReason: string | undefined;
 
+	/** Refresh the cached task counter and goal state from a backlog snapshot. */
+	const refreshCounts = (todo: string, category?: string) => {
+		taskCount = countTodoTasks(todo, category);
+		goalState = goalStatus(todo);
+	};
 
 	const persistConfig = (ctx: ExtensionContext, next: RalphConfig) => {
 		config = next;
@@ -1060,9 +1069,10 @@ export default function (pi: ExtensionAPI) {
 						: state?.rotationQueued || freshIterationPending
 							? 'starting'
 							: 'on';
+		const label = state?.mode === 'goal' ? 'Ralph (goal)' : 'Ralph';
 		const status = !state?.enabled
-			? `Ralph: off${autoApproveDecisions ? ' (auto)' : ''}`
-			: `Ralph: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: off${autoApproveDecisions ? ' (auto)' : ''}`
+			: `${label}: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -1101,6 +1111,7 @@ export default function (pi: ExtensionAPI) {
 	const stopLoop = (ctx: ExtensionContext, message: string) => {
 		if (!state) return;
 		taskCount = undefined;
+		goalState = undefined;
 		freshIterationPending = false;
 		persistState({
 			...state,
@@ -1556,6 +1567,11 @@ export default function (pi: ExtensionAPI) {
 			let mutated = false;
 			let terminated = false;
 			let output: string;
+			// Keep the cached status-line state in sync with a goal mutation before
+			// the loop reacts to it (e.g. the blocked approval gate).
+			const syncGoalState = () => {
+				if (state?.enabled && state.todoPath === todoPath) goalState = backlog.goal()?.status;
+			};
 			switch (params.action) {
 				case 'show': {
 					if (!goal) {
@@ -1593,10 +1609,12 @@ export default function (pi: ExtensionAPI) {
 					const evidence = params.note.trim();
 					const claimed = backlog.claimGoal(evidence);
 					mutated = true;
+					syncGoalState();
 					if (state.autoApproveDecisions) {
 						// Delegated approval, consistent with the decision semantics:
 						// the claim is confirmed immediately.
 						const done = backlog.confirmGoal();
+						syncGoalState();
 						output = `Goal "${done.title}" is done (approver: auto-approved). Stop working now; the loop records the completion.`;
 						break;
 					}
@@ -1616,6 +1634,7 @@ export default function (pi: ExtensionAPI) {
 					if (!goal) throw new Error(`no goal in ${todoPath}`);
 					const done = backlog.confirmGoal();
 					mutated = true;
+					syncGoalState();
 					output = `Goal "${done.title}" is done (approved). Stop working now; the loop records the completion.`;
 					break;
 				}
@@ -1628,6 +1647,7 @@ export default function (pi: ExtensionAPI) {
 					if (!goal) throw new Error(`no goal in ${todoPath}`);
 					const withdrawn = backlog.withdrawGoal(params.note.trim());
 					mutated = true;
+					syncGoalState();
 					output = `Goal "${withdrawn.title}" is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
 					break;
 				}
@@ -1639,6 +1659,9 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) {
 					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
 				}
+				// The status widget captures its label when updateStatus runs; refresh
+				// it so the new goal state is visible without waiting for the settle.
+				if (state?.enabled) updateStatus(ctx);
 			}
 			return {
 				content: [{ type: 'text', text: output }],
@@ -1673,7 +1696,7 @@ export default function (pi: ExtensionAPI) {
 					stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
 					return;
 				}
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				refreshCounts(currentTodo, state?.category);
 				const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
 				const next: RalphState = {
 					...state,
@@ -1775,7 +1798,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
 				return;
 			}
-			taskCount = countTodoTasks(baselineTodo, category);
+			refreshCounts(baselineTodo, category);
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
@@ -1874,6 +1897,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on('session_start', async (_event, ctx) => {
 		state = undefined;
 		taskCount = undefined;
+		goalState = undefined;
 		freshIterationPending = false;
 		turnStartedOverBudget = false;
 		lastAssistantStopReason = undefined;
@@ -1932,7 +1956,7 @@ export default function (pi: ExtensionAPI) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				refreshCounts(currentTodo, state?.category);
 				// Re-sync the per-task counter after a reload in case the TODO moved on.
 				if (state.taskNumber !== undefined && state.taskNumber !== taskCount.current) {
 					state = { ...state, taskNumber: currentTaskNumber(taskCount.current), taskIteration: 1 };
@@ -2101,7 +2125,7 @@ export default function (pi: ExtensionAPI) {
 			// ends. Otherwise progress would be lost with the old conversation.
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				refreshCounts(currentTodo, state?.category);
 				// Goal mode is done when the goal is done, not when the plan is
 				// exhausted: an empty plan is the planning state.
 				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
@@ -2134,7 +2158,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const currentTodo = await readRequiredFile(state.todoPath);
-			taskCount = countTodoTasks(currentTodo, state?.category);
+			refreshCounts(currentTodo, state?.category);
 			// Goal mode is done when the goal is done, not when the plan is
 			// exhausted: an empty plan is the planning state.
 			if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
@@ -2626,22 +2650,23 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (command === 'status') {
+				const loopName = state?.mode === 'goal' ? 'Ralph goal loop' : 'Ralph loop';
 				ctx.ui.notify(
 					!state?.enabled
-						? 'Ralph loop is stopped'
+						? `${loopName} is stopped`
 						: state.blocked
-							? `Ralph loop is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
+							? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
 							: state.paused
-								? 'Ralph loop is paused — /ralph resume to continue'
+								? `${loopName} is paused — /ralph resume to continue`
 								: state.rotationCheckpointing
 									? state.rotationReason === 'completed-task'
-										? 'Ralph loop is recording the completed task’s progress'
-										: 'Ralph loop is recording a durable context checkpoint'
+										? `${loopName} is recording the completed task’s progress`
+										: `${loopName} is recording a durable context checkpoint`
 									: state.stopRequested
-										? 'Ralph loop will stop after the current iteration'
+										? `${loopName} will stop after the current iteration`
 										: state.rotationQueued
-											? 'Ralph loop is starting a fresh iteration'
-											: `Ralph loop is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}`,
+											? `${loopName} is starting a fresh iteration`
+											: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}`,
 					'info'
 				);
 				return;
@@ -2736,7 +2761,7 @@ export default function (pi: ExtensionAPI) {
 			let currentTodo: string;
 			try {
 				currentTodo = await readRequiredFile(state.todoPath);
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				refreshCounts(currentTodo, state?.category);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Ralph loop could not create a fresh session: ${message}`, 'error');
