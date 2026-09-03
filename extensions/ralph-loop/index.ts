@@ -271,25 +271,36 @@ function contextUsageFraction(ctx: ExtensionContext): number | undefined {
 	return percent / 100;
 }
 
-function formatTokenCount(tokens: number): string {
-	return `${Math.round(tokens / 1000)}k`;
-}
-
 function rightAlign(line: string, width: number): string {
 	const fitted = truncateToWidth(line, width);
 	return `${' '.repeat(Math.max(0, width - visibleWidth(fitted)))}${fitted}`;
+}
+
+/**
+ * Wrap the ' · '-separated status into lines that fit the width, keeping each
+ * segment intact so the bar grows to multiple lines instead of truncating.
+ */
+function wrapStatusSegments(status: string, width: number): string[] {
+	const lines: string[] = [];
+	let current = '';
+	for (const segment of status.split(' · ')) {
+		const candidate = current ? `${current} · ${segment}` : segment;
+		if (!current || visibleWidth(candidate) <= width) {
+			current = candidate;
+		} else {
+			lines.push(current);
+			current = segment;
+		}
+	}
+	if (current) lines.push(current);
+	return lines;
 }
 
 function contextUsageLabel(ctx: ExtensionContext, threshold: number): string {
 	const fraction = contextUsageFraction(ctx);
 	if (fraction === undefined) return `calculating… / ${contextThresholdLabel(threshold)}`;
 	const percentage = `${fraction * 100 < 10 ? (fraction * 100).toFixed(1) : Math.round(fraction * 100)}%`;
-	const usage = ctx.getContextUsage();
-	const thresholdTokens = ctx.model ? ctx.model.contextWindow * threshold : undefined;
-	if (usage?.tokens === null || usage?.tokens === undefined || thresholdTokens === undefined) {
-		return `${percentage} / ${contextThresholdLabel(threshold)}`;
-	}
-	return `${percentage} / ${contextThresholdLabel(threshold)} (${formatTokenCount(usage.tokens)} / ${formatTokenCount(thresholdTokens)})`;
+	return `${percentage} / ${contextThresholdLabel(threshold)}`;
 }
 
 function projectConfigPath(cwd: string): string {
@@ -1265,7 +1276,7 @@ export default function (pi: ExtensionAPI) {
 			(_tui, theme) => ({
 				invalidate() {},
 				render(width: number): string[] {
-					return [rightAlign(theme.fg('dim', status), width)];
+					return wrapStatusSegments(status, width).map((line) => rightAlign(theme.fg('dim', line), width));
 				}
 			}),
 			{ placement: 'aboveEditor' }
