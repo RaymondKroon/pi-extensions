@@ -526,8 +526,8 @@ You are executing the goal: keep the plan honest — when reality diverges from 
 2. Do not work on a later task${categoryGuard}.
 3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
 4. Add focused tests and run every quality command required by SPEC.md and the backlog.
-5. Only after all acceptance criteria pass, call ralph_todo with action "complete" and the task's number. Do not edit ${state.todoPath} directly.
-6. Commit the completed iteration locally. Do not push.
+5. Only after all acceptance criteria pass, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly.
+6. Finally, commit the completed iteration locally in a single commit that also includes the ${state.todoPath} update. Do not push. This is the last step of the iteration: stop working when the commit is made.
 
 ${decisionNote}`;
 		}
