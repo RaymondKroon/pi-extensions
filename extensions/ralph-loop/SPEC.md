@@ -30,6 +30,10 @@ repository; the pi core is untouched.
   backlog: `## Goal` section with title, status, body, evidence, checkpoint.
 - `/ralph start --goal`: the goal loop — planning → execution →
   re-evaluation → completion.
+- `/ralph set-goal <file>`: set the backlog's goal from a file (first
+  non-empty line, optionally an H1 heading, is the title; the rest is the
+  body). Targets the active loop's backlog or `TODO.ralph`; replaces an
+  open goal, refuses claimed/done goals.
 - A `ralph_goal` tool: `show`, `checkpoint`, `complete`, `confirm`,
   `withdraw` — separate from `ralph_todo`.
 - User approval gate for goal completion, reusing the existing decision

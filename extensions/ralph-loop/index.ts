@@ -817,6 +817,146 @@ function goalFromBrief(brief: string): { title: string; body?: string } {
 	return { title: firstLine, body };
 }
 
+interface RalphSetGoalArgs {
+	goalFile: string;
+	todoFile?: string;
+}
+
+/** Parse `set-goal <goal-file> [--todo <backlog-file>]`. */
+function parseSetGoalArgs(args: string[]): RalphSetGoalArgs | undefined {
+	let goalFile: string | undefined;
+	let todoFile: string | undefined;
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === '--todo') {
+			const path = args[index + 1];
+			if (!path || path.startsWith('--')) return undefined;
+			if (todoFile) return undefined;
+			todoFile = path;
+			index += 1;
+			continue;
+		}
+		if (arg.startsWith('--')) return undefined;
+		if (goalFile) return undefined;
+		goalFile = arg;
+	}
+	if (!goalFile) return undefined;
+	return { goalFile, todoFile };
+}
+
+/**
+ * Derive the goal record of a set-goal file: the first non-empty line is the
+ * title (a leading `# ` H1 marker is stripped), the remaining lines are the
+ * body (omitted when empty). Unlike goalFromBrief the body does not repeat
+ * the title line, which the G record already stores.
+ */
+function goalFromFile(text: string): { title: string; body?: string } | undefined {
+	const trimmed = text.trim();
+	const lines = trimmed.split(/\r?\n/);
+	const firstIndex = lines.findIndex((line) => line.trim() !== '');
+	if (firstIndex === -1) return undefined;
+	const firstLine = lines[firstIndex]!.trim();
+	const h1 = firstLine.match(/^#\s+(.*)$/);
+	const title = (h1?.[1] ?? firstLine).trim();
+	if (!title) return undefined;
+	const body = lines.slice(firstIndex + 1).join('\n').trim();
+	return { title, body: body || undefined };
+}
+
+interface SetGoalOutcome {
+	ok: boolean;
+	level: 'info' | 'warning' | 'error';
+	message: string;
+}
+
+/**
+ * Set the single goal of a ralph-format backlog from a goal file. The target
+ * backlog is the explicit --todo file, else the active loop's backlog, else
+ * the conventional TODO.ralph. An existing goal must be open (a claimed or
+ * done goal must be resolved first); setting replaces the title and body.
+ */
+async function setGoalFromFile(cwd: string, loopState: RalphState | undefined, args: RalphSetGoalArgs): Promise<SetGoalOutcome> {
+	const goalPath = resolveProjectFile(cwd, args.goalFile);
+	if (!goalPath) {
+		return { ok: false, level: 'warning', message: 'The goal file must be a relative file inside the project' };
+	}
+	const todoPath = args.todoFile
+		? resolveProjectFile(cwd, args.todoFile)
+		: loopState?.enabled
+			? loopState.todoPath
+			: resolve(cwd, DEFAULT_TODO);
+	if (!todoPath) {
+		return { ok: false, level: 'warning', message: 'The backlog file must be a relative file inside the project' };
+	}
+	if (goalPath === todoPath) {
+		return { ok: false, level: 'warning', message: 'The goal file and the backlog must be different files' };
+	}
+	const outName = relative(cwd, todoPath) || todoPath;
+	let text: string;
+	try {
+		text = await readFile(goalPath, 'utf8');
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not read ${args.goalFile}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const goal = goalFromFile(text);
+	if (!goal) {
+		return {
+			ok: false,
+			level: 'error',
+			message: `No goal in ${args.goalFile}: the first non-empty line must be a title (optionally an H1 heading)`
+		};
+	}
+	let todo: string;
+	try {
+		todo = await readFile(todoPath, 'utf8');
+	} catch {
+		return {
+			ok: false,
+			level: 'error',
+			message: `No backlog at ${outName} — create it first (e.g. /ralph-init --todo ${outName}) or pass --todo <file>`
+		};
+	}
+	if (!isRalphBacklog(todo)) {
+		return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
+	}
+	let backlog: Backlog;
+	try {
+		backlog = Backlog.parse(todo);
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not parse ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const existing = backlog.goal();
+	if (existing && existing.status !== 'open') {
+		return {
+			ok: false,
+			level: 'warning',
+			message: `The goal "${existing.title}" is ${existing.status} — resolve it first (confirm or withdraw a claimed goal, delete a done goal), then set the new goal`
+		};
+	}
+	backlog.setGoal(goal);
+	try {
+		await writeFile(todoPath, backlog.render());
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not write ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const set = existing
+		? `Replaced the goal in ${outName}: "${existing.title}" → "${goal.title}"`
+		: `Set goal "${goal.title}" in ${outName}`;
+	if (loopState?.enabled && loopState.todoPath === todoPath) {
+		return {
+			ok: true,
+			level: 'info',
+			message: `${set}. ${
+				loopState.mode === 'goal'
+					? 'The active goal loop picks it up from the next iteration.'
+					: 'The active task loop is unaffected.'
+			}`
+		};
+	}
+	const todoFlag = todoPath === resolve(cwd, DEFAULT_TODO) ? '' : ` --todo ${outName}`;
+	return { ok: true, level: 'info', message: `${set}. Start the goal loop with: /ralph start --goal${todoFlag}` };
+}
+
 /** Restrict generated Ralph documents to files below the project root. */
 function resolveProjectFile(cwd: string, file: string): string | undefined {
 	if (!file || isAbsolute(file)) return undefined;
@@ -2652,7 +2792,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand('ralph', {
-		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|stop|resume|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|resume|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
@@ -2661,6 +2801,7 @@ export default function (pi: ExtensionAPI) {
 					description: 'Defaults: SPEC.md and TODO.ralph. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into TODO.ralph, merging into an existing backlog. Each source file is only imported once.' },
+				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md> [--todo <backlog>]. The first non-empty line (optionally an H1 heading) is the title, the rest is the body. Targets the active loop’s backlog or TODO.ralph. Replaces an open goal; a claimed or done goal must be resolved first.' },
 				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration.' },
 				{ value: 'resume', label: 'resume', description: 'Resume a paused loop (Escape pauses it).' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
@@ -2737,12 +2878,12 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const knownCommands = ['start', 'import', 'stop', 'resume', 'status', 'config'];
+			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'resume', 'status', 'config'];
 			if (command !== '' && !knownCommands.includes(command)) {
 				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
 					ctx.ui.notify(
-						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|stop|resume|status|config]`,
+						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|resume|status|config]`,
 						'error'
 					);
 					return;
@@ -2752,10 +2893,24 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === '') {
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('Usage: /ralph [start|import|stop|resume|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
+					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|resume|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
 					return;
 				}
 				await openHome(ctx);
+				return;
+			}
+			if (command === 'set-goal') {
+				const setGoalArgs = parseSetGoalArgs(commandArgs.slice(1));
+				if (!setGoalArgs) {
+					ctx.ui.notify('Usage: /ralph set-goal <goal-file> [--todo <backlog-file>]', 'warning');
+					return;
+				}
+				if (!ctx.isIdle()) {
+					ctx.ui.notify('Wait for the current agent run to finish before setting the goal', 'warning');
+					return;
+				}
+				const outcome = await setGoalFromFile(ctx.cwd, state, setGoalArgs);
+				ctx.ui.notify(outcome.message, outcome.level);
 				return;
 			}
 			if (command === 'import') {

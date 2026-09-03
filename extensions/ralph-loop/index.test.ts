@@ -2758,6 +2758,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		expect((command.getArgumentCompletions('') ?? []).map((o) => o.value)).toEqual([
 			'start',
 			'import',
+			'set-goal',
 			'stop',
 			'resume',
 			'status',
@@ -2894,5 +2895,233 @@ describe('/ralph-init (ralph-format-only)', () => {
 			expect(fake.userMessages).toHaveLength(0);
 			expect(fakeCtx.notifications.at(-1)?.message).toContain('Created Ralph backlog with goal');
 		});
+	});
+});
+
+const GOAL_H1 = `# Port the complete app
+
+Port the app from the source to the target.
+
+- Criterion one holds.
+- Criterion two holds.
+`;
+
+const GOAL_PLAIN = `Ship the thing
+Criterion one holds.
+Criterion two holds.
+`;
+
+describe('ralph-loop extension (set-goal command)', () => {
+	beforeEach(async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		await writeFile(join(dir, 'GOAL.md'), GOAL_H1);
+	});
+
+	async function setGoal(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx, args: string) {
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(args, fakeCtx.ctx);
+	}
+
+	test('sets the goal from a file with an H1 title into TODO.ralph', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.goal()?.title).toBe('Port the complete app');
+		expect(backlog.goal()?.status).toBe('open');
+		expect(backlog.goal()?.body).toBe('Port the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
+		// The existing tasks are untouched.
+		expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
+		const notification = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(notification).toContain('Set goal "Port the complete app" in TODO.ralph');
+		expect(notification).toContain('Start the goal loop with: /ralph start --goal');
+	});
+
+	test('uses the first line as the title without an H1; the body excludes the title', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'PLAIN.md'), GOAL_PLAIN);
+
+		await setGoal(fake, fakeCtx, 'set-goal PLAIN.md');
+
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.goal()?.title).toBe('Ship the thing');
+		expect(backlog.goal()?.body).toBe('Criterion one holds.\nCriterion two holds.');
+	});
+
+	test('replaces an existing open goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+		await writeFile(join(dir, 'SECOND.md'), '# Second goal\nSecond body.\n');
+		fakeCtx.notifications.length = 0;
+		await fake.commands.get('ralph')!.handler('set-goal SECOND.md', fakeCtx.ctx);
+
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.goal()?.title).toBe('Second goal');
+		expect(backlog.goal()?.body).toBe('Second body.');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Replaced the goal in TODO.ralph: "Port the complete app" → "Second goal"');
+	});
+
+	test('refuses a claimed goal and leaves the file untouched', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		const claimed = `# ralph v2
+
+G "Old goal" claimed
+GE "evidence"
+
+T 1 - "Task one"
+`;
+		await writeFile(join(dir, 'TODO.ralph'), claimed);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('is claimed — resolve it first');
+		expect(await readFile(join(dir, 'TODO.ralph'), 'utf8')).toBe(claimed);
+	});
+
+	test('refuses a done goal and leaves the file untouched', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		const done = `# ralph v2
+
+G "Old goal" done
+GE "evidence"
+
+T 1 - "Task one"
+D 1
+`;
+		await writeFile(join(dir, 'TODO.ralph'), done);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('is done — resolve it first');
+		expect(await readFile(join(dir, 'TODO.ralph'), 'utf8')).toBe(done);
+	});
+
+	test('targets the active loop’s backlog when --todo is omitted', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'OTHER.ralph'), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo OTHER.ralph', fakeCtx.ctx);
+
+		await fake.commands.get('ralph')!.handler('set-goal GOAL.md', fakeCtx.ctx);
+
+		const other = Backlog.parse(await readFile(join(dir, 'OTHER.ralph'), 'utf8'));
+		expect(other.goal()?.title).toBe('Port the complete app');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('The active task loop is unaffected.');
+	});
+
+	test('--todo overrides the target backlog', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'OTHER.ralph'), RALPH_V1);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md --todo OTHER.ralph');
+
+		expect(Backlog.parse(await readFile(join(dir, 'OTHER.ralph'), 'utf8')).goal()?.title).toBe('Port the complete app');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Start the goal loop with: /ralph start --goal --todo OTHER.ralph');
+	});
+
+	test('refuses a missing goal file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal MISSING.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Could not read MISSING.md');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+	});
+
+	test('refuses a goal file without a title line', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'EMPTY.md'), '\n   \n');
+
+		await setGoal(fake, fakeCtx, 'set-goal EMPTY.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('No goal in EMPTY.md');
+	});
+
+	test('refuses a non-ralph backlog target', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'NOTRALPH.ralph'), '# not ralph\n');
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md --todo NOTRALPH.ralph');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('NOTRALPH.ralph is not a ralph-format backlog');
+	});
+
+	test('refuses a missing backlog target', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md --todo MISSING.ralph');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('No backlog at MISSING.ralph');
+	});
+
+	test('refuses the backlog itself as the goal file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal TODO.ralph');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('must be different files');
+	});
+
+	test('refuses paths outside the project', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, `set-goal ${join(dir, 'GOAL.md')}`);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('relative file inside the project');
+
+		fakeCtx.notifications.length = 0;
+		await fake.commands.get('ralph')!.handler('set-goal GOAL.md --todo /etc/passwd', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('relative file inside the project');
+	});
+
+	test('shows usage without a goal file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Usage: /ralph set-goal <goal-file> [--todo <backlog-file>]');
+	});
+
+	test('waits for the agent to be idle', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.idle.value = false;
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Wait for the current agent run to finish before setting the goal');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
 	});
 });
