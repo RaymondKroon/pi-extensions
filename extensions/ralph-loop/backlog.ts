@@ -13,6 +13,11 @@
 //
 //   M <key> "<value>"                meta record (e.g. M source "TODO.md"
 //                                       tracks which files were imported)
+//   G "<title>" <status>             goal record (at most one per file);
+//                                       status is open, claimed, or done
+//   GB                               goal body block
+//   GE "<evidence>"                   goal completion evidence
+//   GC <iteration>                    goal checkpoint block
 //   T <id> <category|-> "<title>"
 //   B <id>                             task; optional body block
 //   D <id>                             task is done
@@ -98,6 +103,20 @@ export interface MetaEntry {
 	position: number;
 }
 
+export type GoalStatus = 'open' | 'claimed' | 'done';
+
+/** The single goal of a goal-mode backlog (the `## Goal` section). */
+export interface Goal {
+	title: string;
+	status: GoalStatus;
+	body: string | null;
+	/** Completion evidence recorded when the goal was claimed. */
+	evidence: string | null;
+	/** The single most recent goal checkpoint (replaced, never stacked). */
+	checkpoint: string | null;
+	checkpointIteration: number | null;
+}
+
 export interface BacklogCounts {
 	open: number;
 	total: number;
@@ -136,6 +155,15 @@ CREATE TABLE meta (
 	value TEXT NOT NULL,
 	position INTEGER NOT NULL
 );
+CREATE TABLE goal (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	title TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'open',
+	body TEXT,
+	evidence TEXT,
+	checkpoint TEXT,
+	checkpoint_iteration INTEGER
+);
 `;
 
 function newDatabase(): SqliteDb {
@@ -156,7 +184,7 @@ function indentBlock(text: string): string[] {
 }
 
 interface OpenBlock {
-	kind: 'legacy-section-body' | 'task-body' | 'checkpoint' | 'log-note';
+	kind: 'legacy-section-body' | 'task-body' | 'checkpoint' | 'log-note' | 'goal-body' | 'goal-checkpoint';
 	id: number;
 	iteration?: number;
 	ref?: string | null;
@@ -250,6 +278,12 @@ export class Backlog {
 					// Collected, not inserted: the final pass links the entry to
 					// its task or drops it (entries always belong to a task).
 					pendingLogs.push({ id: current.id, ref: current.ref ?? null, date: current.date ?? null, kind: current.logKind ?? 'done', note: body });
+					break;
+				case 'goal-body':
+					db.prepare('UPDATE goal SET body = ? WHERE id = 1').run(body);
+					break;
+				case 'goal-checkpoint':
+					db.prepare('UPDATE goal SET checkpoint = ?, checkpoint_iteration = ? WHERE id = 1').run(body, current.iteration ?? 0);
 					break;
 			}
 		};
@@ -400,6 +434,33 @@ export class Backlog {
 					logKind = tokens[4];
 				}
 				block = { kind: 'log-note', id, ref, date, logKind, lines: [] };
+			} else if (tag === 'G') {
+				if (tokens.length !== 3) fail('goal record is: G "<title>" <status>');
+				const status = tokens[2];
+				if (status !== 'open' && status !== 'claimed' && status !== 'done') {
+					fail(`invalid goal status "${status}" (expected open, claimed, or done)`);
+				}
+				if (db.prepare('SELECT id FROM goal WHERE id = 1').get()) fail('duplicate goal record');
+				db.prepare('INSERT INTO goal (id, title, status) VALUES (1, ?, ?)').run(tokens[1], status);
+			} else if (tag === 'GB') {
+				if (tokens.length !== 1) fail('goal body record is: GB');
+				const goal = db.prepare('SELECT body FROM goal WHERE id = 1').get() as { body: string | null } | undefined;
+				if (!goal) throw new BacklogParseError(lineNo, 'goal body before goal record');
+				if (goal.body !== null) fail('goal already has a body block');
+				block = { kind: 'goal-body', id: 1, lines: [] };
+			} else if (tag === 'GE') {
+				if (tokens.length !== 2) fail('goal evidence record is: GE "<evidence>"');
+				const goal = db.prepare('SELECT evidence FROM goal WHERE id = 1').get() as { evidence: string | null } | undefined;
+				if (!goal) throw new BacklogParseError(lineNo, 'goal evidence before goal record');
+				if (goal.evidence !== null) fail('goal already has evidence');
+				db.prepare('UPDATE goal SET evidence = ? WHERE id = 1').run(tokens[1]);
+			} else if (tag === 'GC') {
+				if (tokens.length !== 2) fail('goal checkpoint record is: GC <iteration>');
+				const iteration = intField(tokens[1], 'iteration');
+				const goal = db.prepare('SELECT checkpoint FROM goal WHERE id = 1').get() as { checkpoint: string | null } | undefined;
+				if (!goal) throw new BacklogParseError(lineNo, 'goal checkpoint before goal record');
+				if (goal.checkpoint !== null) fail('goal already has a checkpoint block');
+				block = { kind: 'goal-checkpoint', id: 1, iteration, lines: [] };
 			} else {
 				fail(`unknown record tag "${tag}"`);
 			}
@@ -511,6 +572,20 @@ export class Backlog {
 		);
 	}
 
+	/** The single goal of this backlog, if any. */
+	goal(): Goal | undefined {
+		const row = this.db.prepare('SELECT * FROM goal WHERE id = 1').get() as Record<string, unknown> | undefined;
+		if (!row) return undefined;
+		return {
+			title: row.title as string,
+			status: row.status as GoalStatus,
+			body: (row.body as string | null) ?? null,
+			evidence: (row.evidence as string | null) ?? null,
+			checkpoint: (row.checkpoint as string | null) ?? null,
+			checkpointIteration: (row.checkpoint_iteration as number | null) ?? null
+		};
+	}
+
 	/** Source files that were imported into this backlog (M source records). */
 	sources(): string[] {
 		return this.listMeta()
@@ -543,6 +618,93 @@ export class Backlog {
 	}
 
 	// --- mutations --------------------------------------------------------------
+
+	/**
+	 * Create or update the single goal of this backlog. Creating sets the
+	 * status to 'open'; updating preserves the existing status, evidence,
+	 * and checkpoint (goal state changes go through the state machine).
+	 */
+	setGoal(options: { title: string; body?: string }): Goal {
+		const title = options.title.trim();
+		if (!title) throw new Error('a goal title is required');
+		const body = options.body?.trim() || null;
+		const existing = this.goal();
+		if (existing) {
+			this.db.prepare('UPDATE goal SET title = ?, body = ? WHERE id = 1').run(title, body);
+		} else {
+			this.db.prepare('INSERT INTO goal (id, title, status, body) VALUES (?, ?, ?, ?)').run(1, title, 'open', body);
+		}
+		return this.goal()!;
+	}
+
+	/** Delete the goal (with its evidence and checkpoint). */
+	deleteGoal(): void {
+		this.db.prepare('DELETE FROM goal WHERE id = 1').run();
+	}
+
+	private requireGoal(): Goal {
+		const goal = this.goal();
+		if (!goal) throw new Error('no goal in this backlog');
+		return goal;
+	}
+
+	/**
+	 * Claim the goal: open → claimed, recording the completion evidence.
+	 * Throws when there is no goal or the goal is not open.
+	 */
+	claimGoal(evidence: string): Goal {
+		const goal = this.requireGoal();
+		if (goal.status !== 'open') {
+			throw new Error(`cannot claim the goal: it is ${goal.status} (claim requires open)`);
+		}
+		const note = evidence.trim();
+		if (!note) throw new Error('goal evidence is required');
+		this.db.prepare("UPDATE goal SET status = 'claimed', evidence = ? WHERE id = 1").run(note);
+		return this.goal()!;
+	}
+
+	/** Confirm the goal: claimed → done. Throws when the goal is not claimed. */
+	confirmGoal(): Goal {
+		const goal = this.requireGoal();
+		if (goal.status !== 'claimed') {
+			throw new Error(`cannot confirm the goal: it is ${goal.status} (confirm requires claimed)`);
+		}
+		this.db.prepare("UPDATE goal SET status = 'done' WHERE id = 1").run();
+		return this.goal()!;
+	}
+
+	/**
+	 * Withdraw the goal: claimed → open. The note becomes the goal checkpoint
+	 * (replacing any existing checkpoint; the checkpoint iteration is kept),
+	 * and the claim's evidence is cleared. Throws when the goal is not claimed.
+	 */
+	withdrawGoal(note: string): Goal {
+		const goal = this.requireGoal();
+		if (goal.status !== 'claimed') {
+			throw new Error(`cannot withdraw the goal: it is ${goal.status} (withdraw requires claimed)`);
+		}
+		const text = note.trim();
+		if (!text) throw new Error('a withdrawal note is required');
+		this.db
+			.prepare("UPDATE goal SET status = 'open', evidence = NULL, checkpoint = ? WHERE id = 1")
+			.run(text);
+		return this.goal()!;
+	}
+
+	/**
+	 * Replace the single goal checkpoint (replaced, never stacked).
+	 * Throws when there is no goal.
+	 */
+	setGoalCheckpoint(note: string, iteration: number): Goal {
+		this.requireGoal();
+		const text = note.trim();
+		if (!text) throw new Error('a checkpoint note is required');
+		if (!Number.isInteger(iteration) || iteration < 1) {
+			throw new Error('checkpoint iteration must be a positive integer');
+		}
+		this.db.prepare('UPDATE goal SET checkpoint = ?, checkpoint_iteration = ? WHERE id = 1').run(text, iteration);
+		return this.goal()!;
+	}
 
 	/** Mark the task with the given position number done. Clears the context checkpoint (it described in-progress work). Throws when unknown. */
 	complete(number: string, category?: string): Task {
@@ -791,6 +953,20 @@ export class Backlog {
 		const out: string[] = [RALPH_HEADER];
 		for (const meta of this.listMeta()) {
 			out.push(`M ${meta.key} ${quote(meta.value)}`);
+		}
+		const goal = this.goal();
+		if (goal) {
+			out.push(`G ${quote(goal.title)} ${goal.status}`);
+			if (goal.body !== null && goal.body !== '') {
+				out.push('GB');
+				out.push(...indentBlock(goal.body));
+			}
+			if (goal.evidence !== null) out.push(`GE ${quote(goal.evidence)}`);
+			if (goal.checkpoint !== null) {
+				out.push(`GC ${goal.checkpointIteration ?? 1}`);
+				out.push(...indentBlock(goal.checkpoint));
+			}
+			out.push('');
 		}
 		out.push('');
 		for (const task of this.listTasks()) {
@@ -1144,6 +1320,26 @@ export function formatNextTask(backlog: Backlog, task: Task, category?: string):
 	}
 	return lines.join('\n');
 }
+
+/**
+ * Readable goal view for the ralph_goal "show" action: the goal's title,
+ * status, body, completion evidence, and checkpoint.
+ */
+export function formatGoal(goal: Goal): string {
+	const lines: string[] = [];
+	lines.push(`Goal: "${goal.title}" (status: ${goal.status})`);
+	if (goal.body) {
+		lines.push('', 'Body:', goal.body.trim());
+	}
+	if (goal.evidence !== null) {
+		lines.push('', `Evidence: ${goal.evidence}`);
+	}
+	if (goal.checkpoint !== null) {
+		lines.push('', `Checkpoint (iteration ${goal.checkpointIteration ?? '?'}):`, goal.checkpoint);
+	}
+	return lines.join('\n');
+}
+
 /**
  * Single-task detail view for the ralph_todo "list" action with a task
  * number: the task's body, checkpoint, and full completion log, without

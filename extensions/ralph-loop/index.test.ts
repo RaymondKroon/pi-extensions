@@ -1406,12 +1406,987 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 	});
 });
 
-describe('ralph-loop extension (/ralph todos view)', () => {
+describe('ralph-loop extension (goal mode start)', () => {
+	const GOAL_OPEN = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_DONE = `# ralph v2
+
+G "Rewrite the app" done
+GE "All routes render."
+
+T 1 - "Port the routes."
+D 1
+`;
+
+	const GOAL_NO_TASKS = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+`;
+
+	const RALPH_FINISHED = `# ralph v2
+
+T 1 - "Task one"
+D 1
+
+T 2 - "Task two"
+D 2
+`;
+
+	const stateEntries = (fake: ReturnType<typeof createFakePi>) =>
+		fake.entries.filter((entry) => entry.customType === 'ralph-loop-state');
+
+	test('start --goal is refused when the backlog has no goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo TODO.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('has no goal');
+	});
+
+	test('start --goal is refused when the goal is already complete', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_DONE);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is already complete');
+	});
+
+	test('start --goal starts with an open goal and zero open tasks', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 0/0 (iteration 1)');
+		expect(stateEntries(fake).at(-1)!.data.mode).toBe('goal');
+	});
+
+	test('start --goal starts with an open goal and open tasks', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 1/1 (iteration 1)');
+		expect(stateEntries(fake).at(-1)!.data.mode).toBe('goal');
+	});
+
+	test('start without --goal is unchanged: finished backlog refused, goal ignored', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'FINISHED.ralph'), RALPH_FINISHED);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+
+		await ralph.handler('start --todo FINISHED.ralph', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('all TODO items are complete');
+
+		// A goal in the backlog does not change task-mode validation.
+		fakeCtx.notifications.length = 0;
+		await ralph.handler('start --todo GOAL.ralph', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 1/1 (iteration 1)');
+		expect(stateEntries(fake).at(-1)!.data.mode).toBe('tasks');
+	});
+
+	test('goal mode round-trips through persisted state and survives an exhausted plan', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+
+		const entry = stateEntries(fake).at(-1)!;
+		expect(entry.data.mode).toBe('goal');
+
+		// Reload the session: the goal loop stays active with zero open tasks
+		// (the planning state) instead of stopping as a finished task loop.
+		const reloaded = createFakePi();
+		extension(reloaded.pi as never);
+		const reloadedCtx = createFakeCtx(dir);
+		reloadedCtx.ctx.sessionManager.getBranch = () => [entry];
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
+		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
+		expect(reloadedCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is active');
+	});
+
+	test('persisted state without a mode normalizes to the task loop', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(1);
+
+		// A session persisted before the mode existed: strip it and reload.
+		// The exhausted plan now stops the loop, exactly as task mode always did.
+		const legacy = { ...stateEntries(fake).at(-1)!, data: { ...stateEntries(fake).at(-1)!.data, mode: undefined } };
+		const reloaded = createFakePi();
+		extension(reloaded.pi as never);
+		const reloadedCtx = createFakeCtx(dir);
+		reloadedCtx.ctx.sessionManager.getBranch = () => [legacy];
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
+		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
+		expect(reloadedCtx.notifications.at(-1)?.message).toBe('Ralph loop is stopped');
+	});
+});
+
+describe('ralph-loop extension (status mode and goal state)', () => {
+	type GoalTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
+	};
+
+	const GOAL_OPEN = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_NO_TASKS = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+`;
+
+	const goalTool = (fake: ReturnType<typeof createFakePi>): GoalTool => {
+		const tool = fake.tools.get('ralph_goal') as GoalTool | undefined;
+		expect(tool).toBeDefined();
+		return tool!;
+	};
+
+	test('task-mode status is unchanged: no mode marker, no goal segment', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: on');
+		expect(status).not.toContain('Ralph (goal)');
+		expect(status).not.toContain('goal:');
+		expect(status).toContain('iteration 1/10');
+		expect(status).toContain('task: 1/3 (iteration 1)');
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop is active · iteration 1/10 · task: 1/3 (iteration 1)');
+	});
+
+	test('task-mode status ignores a goal present in the backlog', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph', fakeCtx.ctx);
+
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: on');
+		expect(status).not.toContain('Ralph (goal)');
+		expect(status).not.toContain('goal:');
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe(
+			'Ralph loop is active · iteration 1/10 · task: 1/1 (iteration 1)'
+		);
+	});
+
+	test('goal-mode status shows the mode marker and an open goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (goal): on');
+		expect(status).toContain('iteration 1/10');
+		expect(status).toContain('task: 1/1 (iteration 1)');
+		expect(status).toContain('goal: open');
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe(
+			'Ralph goal loop is active · iteration 1/10 · task: 1/1 (iteration 1) · goal: open'
+		);
+	});
+
+	test('goal status follows claim and confirm', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) =>
+			goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Claim: the loop blocks on the approval gate and the status shows claimed.
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBe(true);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('goal: claimed');
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is awaiting your decision');
+
+		// Approve: the user decision is resolved, then confirm flips the goal to done.
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
+		await run({ action: 'confirm' });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('goal: done');
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is active');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('· goal: done');
+	});
+
+	test('goal status returns to open after a rejected completion', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_NO_TASKS);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) =>
+			goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Claim, then the user rejects: withdraw returns the goal to open.
+		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { recordPath: 'docs/decisions/goal.md', resolution: 'Goal rejected' }, undefined, undefined, fakeCtx.ctx);
+		await run({ action: 'withdraw', note: 'The new framework migration is missing.' });
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('goal: open');
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe(
+			'Ralph goal loop is active · iteration 1/10 · task: 0/0 (iteration 1) · goal: open'
+		);
+	});
+});
+
+describe('ralph-loop extension (goal loop prompts)', () => {
+	const GOAL_PLANNING = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+`;
+
+	const GOAL_EXECUTION = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+
+T 1 - "Port the routes."
+
+T 2 - "Port the state."
+`;
+
+	const GOAL_REEVALUATION = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+
+T 1 - "Port the routes."
+D 1
+
+T 2 - "Port the state."
+D 2
+`;
+
+	async function startGoalLoop(content: string, goal = true) {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), content);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(`start --todo GOAL.ralph${goal ? ' --goal' : ''}`, fakeCtx.ctx);
+		return { fake, fakeCtx };
+	}
+
+	test('planning prompt: goal open, zero tasks', async () => {
+		const { fake } = await startGoalLoop(GOAL_PLANNING);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph goal loop');
+		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
+		expect(prompt).toContain('Port the routes.');
+		expect(prompt).toContain('Port the state.');
+		expect(prompt).toContain('This is a planning iteration: the goal is open and the backlog has no tasks yet.');
+		expect(prompt).toContain('Decompose the goal into small, ordered tasks');
+		expect(prompt).toContain('action "add-many"');
+		expect(prompt).toContain('Do not implement the goal in this iteration');
+		// Planning does not select a task.
+		expect(prompt).not.toContain('action "next"');
+	});
+
+	test('execution prompt: goal open, open tasks', async () => {
+		const { fake } = await startGoalLoop(GOAL_EXECUTION);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph goal loop');
+		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
+		expect(prompt).toContain('You are executing the goal');
+		expect(prompt).toContain('keep the plan honest');
+		expect(prompt).toContain('add or adjust tasks with ralph_todo');
+		// The task workflow is the task prompt plus the goal context.
+		expect(prompt).toContain('action "next"');
+		expect(prompt).toContain('action "complete"');
+		expect(prompt).not.toContain('planning iteration');
+		expect(prompt).not.toContain('re-evaluation iteration');
+	});
+
+	test('re-evaluation prompt: goal open, tasks exist, none open', async () => {
+		const { fake } = await startGoalLoop(GOAL_REEVALUATION);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph goal loop');
+		expect(prompt).toContain('This is a re-evaluation iteration: the goal is open and every planned task is complete.');
+		expect(prompt).toContain('Re-check every acceptance criterion of the goal against the repository');
+		expect(prompt).toContain('add tasks for the missing work with ralph_todo');
+		expect(prompt).toContain('ralph_goal with action "complete"');
+		expect(prompt).not.toContain('action "next"');
+	});
+
+	test('task-less goal iterations checkpoint via ralph_goal', async () => {
+		const { fake, fakeCtx } = await startGoalLoop(GOAL_PLANNING);
+
+		// The planning iteration settles at/above the context threshold.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		const prompt = fake.userMessages.at(-1)!.text;
+		expect(prompt).toContain('durable checkpoint');
+		expect(prompt).toContain('iteration 1 of 10');
+		expect(prompt).toContain('ralph_goal with action "checkpoint"');
+		expect(prompt).toContain('keep only the single most recent one');
+		// The task checkpoint tool is not offered for a task-less iteration.
+		expect(prompt).not.toContain('ralph_todo');
+	});
+
+	test('goal execution iterations still checkpoint the task via ralph_todo', async () => {
+		const { fake, fakeCtx } = await startGoalLoop(GOAL_EXECUTION);
+
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		const prompt = fake.userMessages.at(-1)!.text;
+		expect(prompt).toContain('durable checkpoint');
+		expect(prompt).toContain('ralph_todo with action "checkpoint"');
+		expect(prompt).not.toContain('ralph_goal');
+	});
+
+	test('task-mode prompt is unchanged when the backlog has a goal', async () => {
+		const { fake } = await startGoalLoop(GOAL_EXECUTION, false);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Run the Ralph loop for this repository');
+		expect(prompt).not.toContain('goal loop');
+		expect(prompt).not.toContain('planning iteration');
+		expect(prompt).not.toContain('re-evaluation iteration');
+		expect(prompt).not.toContain('executing the goal');
+	});
+});
+
+describe('ralph-loop extension (ralph_goal tool)', () => {
+	const GOAL_OPEN = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+`;
+
+	const GOAL_OPEN_WITH_TASK = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_OPEN_TASKS_DONE = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+D 1
+`;
+
+	const GOAL_CLAIMED = `# ralph v2
+
+G "Rewrite the app" claimed
+GE "All routes render."
+`;
+
+	const GOAL_CLAIMED_WITH_TASK = `# ralph v2
+
+G "Rewrite the app" claimed
+GE "All routes render."
+
+T 1 - "Port the routes."
+`;
+
+	const GOAL_DONE = `# ralph v2
+
+G "Rewrite the app" done
+GE "All routes render."
+`;
+
+	type GoalTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
+	};
+
+	const goalTool = (fake: ReturnType<typeof createFakePi>): GoalTool => {
+		const tool = fake.tools.get('ralph_goal') as GoalTool | undefined;
+		expect(tool).toBeDefined();
+		return tool!;
+	};
+
+	async function startLoopWith(content: string, mode: 'goal' | 'tasks' = 'goal') {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), content);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(`start --todo GOAL.ralph${mode === 'goal' ? ' --goal' : ''}`, fakeCtx.ctx);
+		return { fake, fakeCtx, run: (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx) };
+	}
+
+	test('show works outside a loop on TODO.ralph', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_OPEN);
+
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+		const shown = await run({ action: 'show' });
+		expect(shown.content[0]!.text).toContain('Goal: "Rewrite the app" (status: open)');
+		expect(shown.content[0]!.text).toContain('Port the routes.');
+		expect(shown.content[0]!.text).toContain('Port the state.');
+		expect(shown.content[0]!.text).not.toContain('Evidence');
+		expect(shown.content[0]!.text).not.toContain('Checkpoint');
+
+		// A done goal shows its completion evidence.
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_DONE);
+		const done = await run({ action: 'show' });
+		expect(done.content[0]!.text).toContain('(status: done)');
+		expect(done.content[0]!.text).toContain('Evidence: All routes render.');
+	});
+
+	test('show reports a missing goal, a missing file, and a non-ralph file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		const noGoal = await run({ action: 'show' });
+		expect(noGoal.content[0]!.text).toContain('No goal in');
+
+		await rm(join(dir, 'TODO.ralph'));
+		await expect(run({ action: 'show' })).rejects.toThrow(/No Ralph backlog/);
+
+		await writeFile(join(dir, 'TODO.ralph'), '# Plain\n\n- [ ] task\n');
+		await expect(run({ action: 'show' })).rejects.toThrow(/not a ralph-format backlog/);
+	});
+
+	test('show targets the active loop\'s backlog, not TODO.ralph', async () => {
+		const { fake, run } = await startLoopWith(GOAL_OPEN);
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_DONE);
+
+		const shown = await run({ action: 'show' });
+		expect(shown.content[0]!.text).toContain('(status: open)');
+		expect(shown.content[0]!.text).not.toContain('Evidence');
+		expect(fake.userMessages.length).toBe(1);
+	});
+
+	test('checkpoint requires an active goal loop and a note', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_OPEN);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_OPEN_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active goal loop/);
+
+		// A goal loop still needs the note.
+		const goalLoop = await startLoopWith(GOAL_OPEN);
+		await expect(goalLoop.run({ action: 'checkpoint' })).rejects.toThrow(/requires a note/);
+	});
+
+	test('checkpoint replaces the single goal checkpoint in the file', async () => {
+		const { run } = await startLoopWith(GOAL_OPEN);
+		const file = () => readFile(join(dir, 'GOAL.ralph'), 'utf8');
+
+		const first = await run({ action: 'checkpoint', note: 'Plan drafted; next: review the routes.' });
+		expect(first.content[0]!.text).toContain('Checkpoint recorded for the goal "Rewrite the app" (iteration 1)');
+		let text = await file();
+		expect(text).toContain('GC 1');
+		expect(text).toContain('Plan drafted; next: review the routes.');
+
+		// The checkpoint is replaced, never stacked.
+		const second = await run({ action: 'checkpoint', note: 'Plan reviewed; next: start execution.' });
+		expect(second.content[0]!.text).toContain('(iteration 1)');
+		text = await file();
+		expect(text).toContain('Plan reviewed; next: start execution.');
+		expect(text).not.toContain('Plan drafted; next: review the routes.');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.checkpoint).toBe('Plan reviewed; next: start execution.');
+		expect(goal.checkpointIteration).toBe(1);
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+	});
+
+	test('complete requires an active goal loop, an open goal, no open tasks, and evidence', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_OPEN);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'complete', note: 'verified' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_OPEN_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/active goal loop/);
+
+		// Open tasks block completion; the file is untouched.
+		const openTasks = await startLoopWith(GOAL_OPEN_WITH_TASK);
+		await expect(openTasks.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/1 task still open/);
+		expect(await readFile(join(dir, 'GOAL.ralph'), 'utf8')).toContain('G "Rewrite the app" open');
+
+		// Missing evidence is refused before any state change.
+		const noEvidence = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+		await expect(noEvidence.run({ action: 'complete' })).rejects.toThrow(/verification evidence/);
+
+		// A claimed goal cannot be completed again.
+		const claimed = await startLoopWith(GOAL_CLAIMED);
+		await expect(claimed.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/complete requires open/);
+
+		// A claimed goal (from a pending approval) cannot be completed again
+		// either: complete only claims; the approval flow confirms.
+		const finished = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+		await finished.run({ action: 'complete', note: 'verified' });
+		await expect(finished.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/complete requires open/);
+	});
+
+	test('complete claims the goal, blocks the loop, and terminates the turn', async () => {
+		const { fake, fakeCtx, run } = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		// The turn terminates so the model cannot act before the user answers.
+		expect(result.terminate).toBe(true);
+		// The result instructs the after-answer procedure for both outcomes.
+		expect(result.content[0]!.text).toContain('claimed');
+		expect(result.content[0]!.text).toContain('ralph_resolve_decision');
+		expect(result.content[0]!.text).toContain('ralph_goal with action "confirm"');
+		expect(result.content[0]!.text).toContain('ralph_goal with action "withdraw"');
+
+		// The goal is claimed (not done) with the evidence in the file.
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" claimed');
+		expect(text).toContain('GE "All criteria verified: bun test green."');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.status).toBe('claimed');
+		expect(goal.evidence).toBe('All criteria verified: bun test green.');
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+
+		// The loop is blocked: the status shows waiting, the decision widget is
+		// set, and the user is notified.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
+		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('paused');
+	});
+
+	test('complete goes straight to done when auto-approve decisions is enabled', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: true, maxIterations: 10 }, null, '\t')}\n`
+		);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_OPEN_TASKS_DONE);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Delegated approval: the claim is confirmed immediately, no block, no
+		// terminated turn.
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approver: auto-approved)');
+
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" done');
+		expect(text).toContain('GE "All criteria verified: bun test green."');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('waiting');
+	});
+
+	test('confirm requires an active goal loop and a claimed goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_CLAIMED);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'confirm' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_CLAIMED_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'confirm' })).rejects.toThrow(/active goal loop/);
+
+		// An open goal cannot be confirmed.
+		const open = await startLoopWith(GOAL_OPEN);
+		await expect(open.run({ action: 'confirm' })).rejects.toThrow(/confirm requires claimed/);
+	});
+
+	test('confirm marks a claimed goal done, keeping its evidence', async () => {
+		const { run } = await startLoopWith(GOAL_CLAIMED);
+
+		const result = await run({ action: 'confirm' });
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approved)');
+
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" done');
+		expect(text).toContain('GE "All routes render."');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.status).toBe('done');
+		expect(goal.evidence).toBe('All routes render.');
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+	});
+
+	test('withdraw requires an active goal loop, a claimed goal, and a note', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, 'TODO.ralph'), GOAL_CLAIMED);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// No loop at all.
+		await expect(run({ action: 'withdraw', note: 'missing' })).rejects.toThrow(/active Ralph loop/);
+
+		// A task-mode loop is not a goal loop.
+		const taskLoop = await startLoopWith(GOAL_CLAIMED_WITH_TASK, 'tasks');
+		await expect(taskLoop.run({ action: 'withdraw', note: 'missing' })).rejects.toThrow(/active goal loop/);
+
+		// An open goal cannot be withdrawn.
+		const open = await startLoopWith(GOAL_OPEN);
+		await expect(open.run({ action: 'withdraw', note: 'missing' })).rejects.toThrow(/withdraw requires claimed/);
+
+		// A claimed goal still needs the note.
+		const claimed = await startLoopWith(GOAL_CLAIMED);
+		await expect(claimed.run({ action: 'withdraw' })).rejects.toThrow(/requires a note/);
+	});
+
+	test('withdraw returns a claimed goal to open with the note as checkpoint', async () => {
+		const { run } = await startLoopWith(GOAL_CLAIMED);
+
+		const result = await run({ action: 'withdraw', note: 'Criterion 2 not met: the state was not ported.' });
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('open again');
+
+		const text = await readFile(join(dir, 'GOAL.ralph'), 'utf8');
+		expect(text).toContain('G "Rewrite the app" open');
+		const goal = Backlog.parse(text).goal()!;
+		expect(goal.status).toBe('open');
+		expect(goal.evidence).toBeNull();
+		expect(goal.checkpoint).toBe('Criterion 2 not met: the state was not ported.');
+		// The file stays valid ralph format.
+		expect(text.startsWith('# ralph v2')).toBe(true);
+	});
+});
+
+describe('ralph-loop extension (goal loop stop)', () => {
+	const GOAL_NO_TASKS = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+`;
+
+	const GOAL_OPEN_TASKS_DONE = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+T 1 - "Port the routes."
+D 1
+`;
+
+	const GOAL_EXECUTION = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+  - Port the state.
+
+T 1 - "Port the routes."
+
+T 2 - "Port the state."
+`;
+
+	type GoalTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
+	};
+
+	async function startGoalLoopWith(content: string) {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), content);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const goal = fake.tools.get('ralph_goal') as GoalTool;
+		const todo = fake.tools.get('ralph_todo') as GoalTool;
+		return {
+			fake,
+			fakeCtx,
+			run: (params: Record<string, unknown>) => goal.execute('t', params, undefined, undefined, fakeCtx.ctx),
+			todo: (params: Record<string, unknown>) => todo.execute('t', params, undefined, undefined, fakeCtx.ctx)
+		};
+	}
+
+	test('agent_settled stops the goal loop after the approved completion', async () => {
+		const { fake, fakeCtx, run } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		// The re-evaluation iteration verifies the goal and claims it: the loop
+		// blocks pending the user's approval and the turn terminates.
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBe(true);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
+
+		// The blocked turn settles: nothing rotates, nothing stops.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
+
+		// The user approves; the model records the decision and resolves it.
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute(
+			't',
+			{ recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+
+		// The model confirms the goal; the settle stops the loop on the done goal.
+		await run({ action: 'confirm' });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
+	});
+
+	test('agent_settled stops the goal loop when a planning iteration makes no progress', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
+
+		// The planning iteration settles without adding any tasks (no progress).
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
+	});
+
+	test('agent_settled stops the goal loop when a re-evaluation iteration makes no progress', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		// The re-evaluation iteration settles without adding tasks or completing the goal.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
+	});
+
+	test('agent_settled rotates a planning iteration that adds tasks into an execution iteration', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
+
+		// The planning iteration decomposes the goal into tasks (the plan grew) and settles.
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_EXECUTION);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// A commit-only recording turn runs before the fresh iteration: the plan
+		// update is committed, but no completion log entry is written.
+		let status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (goal): recording');
+		const recordingPrompt = fake.userMessages.at(-1)?.text ?? '';
+		expect(recordingPrompt).toContain('plan was just updated');
+		expect(recordingPrompt).toContain('Check git status');
+		expect(recordingPrompt).toContain('Do not push');
+		expect(recordingPrompt).toContain('Do not add a completion log entry');
+		expect(recordingPrompt).toContain('Do not start work on the new tasks');
+		expect(recordingPrompt).not.toContain('action "log"');
+
+		// The recording turn settles: the fresh iteration starts in the execution phase.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (goal): starting');
+		expect(status).toContain('iteration 2/10');
+		expect(status).toContain('task: 1/2 (iteration 2)');
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (goal): on');
+		const iterationPrompt = fake.userMessages.at(-1)?.text ?? '';
+		expect(iterationPrompt).toContain('The plan was just updated with new tasks');
+		expect(iterationPrompt).toContain('You are executing the goal');
+		expect(iterationPrompt).toContain('action "next"');
+		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
+	});
+
+	test('agent_settled does not rotate when tasks are edited without changing the open set', async () => {
+		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_EXECUTION);
+
+		// The execution iteration rewords a task (same ids, same open set) and settles.
+		const edited = GOAL_EXECUTION.replace('T 1 - "Port the routes."', 'T 1 - "Port the HTTP routes."');
+		await writeFile(join(dir, 'GOAL.ralph'), edited);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// No rotation: the open set is unchanged, so no recording turn and no fresh iteration.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		expect(fake.userMessages.length).toBe(1);
+		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
+	});
+
+	test('startFreshIteration does not start a fresh iteration once the goal is done', async () => {
+		const { fake, fakeCtx, run, todo } = await startGoalLoopWith(GOAL_EXECUTION);
+
+		// The execution iteration settles at/above the context threshold: a
+		// context-limit rotation is queued (recording), not a stall.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+
+		// The recording turn completes the remaining tasks and claims the goal:
+		// the loop blocks pending the user's approval.
+		await todo({ action: 'complete', task: '1', note: 'done' });
+		await todo({ action: 'complete', task: '2', note: 'done' });
+		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(result.terminate).toBe(true);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The blocked turn settles: the loop waits — it does not rotate or start
+		// a fresh iteration.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
+
+		// The user approves; the model resolves the decision and confirms the goal.
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute(
+			't',
+			{ recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		await run({ action: 'confirm' });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The fresh iteration is not started; the loop stops on the done goal.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
+	});
+});
+
+describe('ralph-loop extension (/ralph home view)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);
 	});
 
-	test('opens the backlog view for the active loop and closes on q', async () => {
+	test('bare /ralph opens the home view for the active loop; enter opens the task view, q closes it', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1422,7 +2397,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 
 		// One overlay hosts both stages, so the chat scroll position is
 		// untouched and the stages swap without the chat flashing through.
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(1);
 		expect(fakeCtx.customOptions[0]).toEqual({
 			overlay: true,
@@ -1432,8 +2407,13 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, (r?: string) => {
 			closed = r;
 		}) as { render: (width: number) => string[]; handleInput: (data: string) => void };
-		// The import stamped the "General" list, so the picker opens first;
-		// selecting it swaps to the view scoped to the list.
+		// The home view shows the list rows (the import stamped "General");
+		// with no goal the (all) row is highlighted first.
+		const home = component.render(100).join('\n');
+		expect(home).toContain('Ralph home — TODO.ralph');
+		expect(home).toContain('> (all) — 2 open / 3 total');
+		expect(home).toContain('General — 2 open / 3 total');
+		// Enter on (all) opens the unchanged task view.
 		component.handleInput('\r');
 		const rendered = component.render(100).join('\n');
 		expect(rendered).toContain('Ralph backlog — TODO.ralph');
@@ -1444,7 +2424,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		expect(closed).toBe('quit');
 	});
 
-	test('scopes the view to the loop category', async () => {
+	test('opens the task view scoped to the list chosen in the home view', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1460,17 +2440,22 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		);
 		await ralph.handler('start --todo TODO.ralph --category dossier', fakeCtx.ctx);
 
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
+			handleInput: (data: string) => void;
 		};
+		// Rows: (all), dossier, auth (first-appearance order). Highlight
+		// dossier and open it.
+		component.handleInput('j');
+		component.handleInput('\r');
 		const rendered = component.render(100).join('\n');
 		expect(rendered).toContain('category "dossier"');
 		expect(rendered).toContain('Establish a clean local developer contract.');
 		expect(rendered).not.toContain('Add sign-in.');
 	});
 
-	test('asks to choose a list when the backlog has categories', async () => {
+	test('shows the lists with counts; enter opens the task view for each list', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1484,62 +2469,53 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		);
 		await importTodo(fake, fakeCtx, 'import EMAIL.md --category Email');
 
-		// Without an active loop the picker opens first; selecting a list
-		// swaps to the view scoped to it (the same overlay).
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		// The home view opens on the lists; selecting one swaps to the view
+		// scoped to it (the same overlay).
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(1);
 		expect(fakeCtx.customOptions[0]).toEqual({ overlay: true, overlayOptions: { width: '100%', maxHeight: '90%' } });
 		const host = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
 		};
-		// The picker opens first.
-		const pickerText = host.render(100).join('\n');
-		expect(pickerText).toContain('> General — 2 open / 3 total');
-		expect(pickerText).toContain('Email — 1 open / 1 total');
-		expect(pickerText).toContain('R: rename');
-		// Like the todos view: pinned to the top, padded to 90% of the
+		// The home view shows one row per list with open/total counts.
+		const homeText = host.render(100).join('\n');
+		expect(homeText).toContain('Ralph home — TODO.ralph');
+		expect(homeText).toContain('> (all) — 3 open / 4 total');
+		expect(homeText).toContain('General — 2 open / 3 total');
+		expect(homeText).toContain('Email — 1 open / 1 total');
+		expect(homeText).toContain('R: rename list');
+		// Like the task view: pinned to the top, padded to 90% of the
 		// terminal height, key hints on the bottom line.
-		const pickerLines = host.render(100);
-		expect(pickerLines.length).toBe(Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9)));
-		expect(pickerLines[0]).toContain('Ralph lists');
-		expect(pickerLines[pickerLines.length - 1]).toContain('q: quit');
-		expect(pickerLines[pickerLines.length - 2]).toBe('');
+		const homeLines = host.render(100);
+		expect(homeLines.length).toBe(Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9)));
+		expect(homeLines[0]).toContain('Ralph home');
+		expect(homeLines[homeLines.length - 1]).toContain('q: quit');
 		// Selecting a list swaps to the view scoped to it (same overlay).
+		host.handleInput('j'); // General
 		host.handleInput('\r');
 		expect(host.render(100).join('\n')).toContain('category "General"');
 		expect(host.render(100).join('\n')).not.toContain('Fetch mail.');
 
-
 		// Picking the second list scopes the view to it.
 		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		const second = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
 		};
-		second.handleInput('j');
+		second.handleInput('j'); // General
+		second.handleInput('j'); // Email
 		second.handleInput('\r');
 		const rendered = second.render(100).join('\n');
 		expect(rendered).toContain('category "Email"');
 		expect(rendered).toContain('Fetch mail.');
 		expect(rendered).not.toContain('Establish a clean local developer contract.');
 
-
-		// Cancelling the picker opens no view.
+		// Escape in the view goes back to the home view inside the same
+		// overlay; q in the home view closes it.
 		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
-		expect(fakeCtx.customFactories.length).toBe(1); // single overlay, picker stage
-		const cancelled = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
-			render: (width: number) => string[];
-		};
-		expect(cancelled.render(100).join('\n')).toContain('Ralph lists');
-
-
-		// Escape in the view goes back to the list overview inside the same
-		// overlay; q in the overview closes it.
-		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		let closed = false;
 		let result: string | undefined;
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, (r?: string) => {
@@ -1547,21 +2523,20 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 			result = r;
 		}) as { render: (width: number) => string[]; handleInput: (data: string) => void };
 		component.handleInput('j');
-		component.handleInput('\r'); // open the Email view
-		component.handleInput('\x1b'); // back to the list overview
-		expect(component.render(100).join('\n')).toContain('Ralph lists');
+		component.handleInput('\r'); // open the General view
+		component.handleInput('\x1b'); // back to the home view
+		expect(component.render(100).join('\n')).toContain('Ralph home');
 		expect(closed).toBe(false);
 		component.handleInput('q');
 		expect(closed).toBe(true);
 		expect(result).toBeUndefined();
 
-
-		// Re-opening a list from the overview swaps back to the view.
-		component.handleInput('\r');
-		expect(component.render(100).join('\n')).toContain('category "General"');
+		// Re-opening a list from the home view swaps back to the view.
+		component.handleInput('\r'); // (all) row
+		expect(component.render(100).join('\n')).toContain('Ralph backlog — TODO.ralph');
 	});
 
-	test('the list picker renames a list inline', async () => {
+	test('R renames the highlighted list from the home view', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1575,42 +2550,43 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		);
 		await importTodo(fake, fakeCtx, 'import EMAIL.md --category Email');
 
-		// The picker opens; close it after the rename round.
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
-		const picker = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
+		// The home view opens; close it after the rename round.
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		const home = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
 		};
 
-		// R starts the inline rename of the highlighted list, prefilled with
-		// its name; appending and pressing enter saves it to disk.
-		picker.handleInput('R');
-		picker.handleInput('2');
-		picker.handleInput('\r');
+		// Highlight General; R starts the inline rename prefilled with its
+		// name. Appending and pressing enter saves it to disk.
+		home.handleInput('j');
+		home.handleInput('R');
+		home.handleInput('2');
+		home.handleInput('\r');
 		await flush();
 		const onDisk = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
 		expect(onDisk.categories()).toEqual(['General2', 'Email']);
 		expect(onDisk.listTasks().find((t) => t.title === 'Establish a clean local developer contract.')?.category).toBe('General2');
-		// The picker shows the renamed list in place with a saved notice.
-		const renamed = picker.render(100).join('\n');
+		// The home view shows the renamed list in place with a saved notice.
+		const renamed = home.render(100).join('\n');
 		expect(renamed).toContain('> General2 — 2 open / 3 total');
 		expect(renamed).toContain('saved');
 
 		// Colliding names are refused: the row keeps its name, nothing is written.
-		picker.handleInput('R');
-		for (let i = 0; i < 'General2'.length; i += 1) picker.handleInput('\x7f');
-		for (const ch of 'Email') picker.handleInput(ch);
-		picker.handleInput('\r');
+		home.handleInput('R');
+		for (let i = 0; i < 'General2'.length; i += 1) home.handleInput('\x7f');
+		for (const ch of 'Email') home.handleInput(ch);
+		home.handleInput('\r');
 		await flush();
 		const after = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
 		expect(after.categories()).toEqual(['General2', 'Email']);
-		expect(picker.render(100).join('\n')).toContain('not saved');
+		expect(home.render(100).join('\n')).toContain('not saved');
 
 		// Escape cancels the inline rename.
-		picker.handleInput('R');
-		picker.handleInput('x');
-		picker.handleInput('\x1b');
-		expect(picker.render(100).join('\n')).toContain('> General2 — 2 open / 3 total');
+		home.handleInput('R');
+		home.handleInput('x');
+		home.handleInput('\x1b');
+		expect(home.render(100).join('\n')).toContain('> General2 — 2 open / 3 total');
 	});
 
 	test('falls back to a file argument, then conventional names; errors without TUI', async () => {
@@ -1622,7 +2598,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 
 		// No loop, no TODO.ralph: a Markdown TODO.md has no todo entries; the
 		// view suggests importing it instead.
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Todo entries empty. Import data with /ralph import');
 
@@ -1630,7 +2606,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		await ralph.handler('import TODO.md', fakeCtx.ctx);
 		fakeCtx.customFactories.length = 0;
 		// The import stamped the "General" list; opening it shows the view.
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		const host = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			render: (width: number) => string[];
 			handleInput: (data: string) => void;
@@ -1641,19 +2617,22 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		// Missing file: error notification, no view.
 		fakeCtx.notifications.length = 0;
 		fakeCtx.customFactories.length = 0;
-		await ralph.handler('todos missing.md', fakeCtx.ctx);
+		await ralph.handler('missing.md', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Could not read missing.md');
 
-		// Non-TUI mode: refused.
+		// Non-TUI mode: bare /ralph shows the usage, a file argument errors.
 		fakeCtx.notifications.length = 0;
 		(fakeCtx.ctx as { mode: string }).mode = 'rpc';
-		await ralph.handler('todos', fakeCtx.ctx);
+		await ralph.handler('', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('requires TUI mode');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph');
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(0);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Unknown subcommand');
 	});
 
-	test('edits from the view are written back to the backlog file', async () => {
+	test('edits from the task view are written back to the backlog file', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1661,8 +2640,8 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		const ralph = fake.commands.get('ralph')!;
 		await importTodo(fake, fakeCtx, 'import TODO.md --category General');
 
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
-		// The picker opens first; opening the list swaps to the view.
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		// The home view opens first; opening the (all) row swaps to the view.
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as {
 			handleInput: (data: string) => void;
 		};
@@ -1687,12 +2666,13 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		await writeFile(join(dir, 'EMAIL.md'), `# Email backlog\n\n## Priority 1 — email\n\n- [ ] **E1.1 Fetch mail.**\n`);
 		await importTodo(fake, fakeCtx, 'import EMAIL.md --category Email');
 
-		await ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
 		let closed: string | undefined;
 		const component = fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, (r?: string) => {
 			closed = r;
 		}) as { handleInput: (data: string) => void };
-		component.handleInput('j'); // highlight the Email list
+		component.handleInput('j'); // General
+		component.handleInput('j'); // Email
 		component.handleInput('\r'); // open it
 		component.handleInput('s');
 		component.handleInput('y');
@@ -1706,7 +2686,7 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('category: Email');
 	});
 
-	test('the list picker refreshes after a view round renames a list', async () => {
+	test('the home view refreshes after a task-view round renames a list', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -1716,21 +2696,74 @@ describe('ralph-loop extension (/ralph todos view)', () => {
 
 		const created: unknown[] = [];
 		fakeCtx.customControl.factoryHook = (component) => created.push(component);
-		const handler = ralph.handler('todos TODO.ralph', fakeCtx.ctx);
+		const handler = ralph.handler('TODO.ralph', fakeCtx.ctx);
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		const host = created[0] as { render: (width: number) => string[]; handleInput: (data: string) => void };
-		// Open the list, rename it from the view, and go back to the overview.
+		// Open the General view, rename the list from the view, and go back
+		// to the home view.
+		host.handleInput('j');
 		host.handleInput('\r');
 		host.handleInput('R');
 		host.handleInput('x');
 		host.handleInput('\r');
 		await flush();
 		host.handleInput('\x1b');
-		// The overview re-read the file: the list is renamed.
+		// The home view re-read the file: the list is renamed.
 		expect(host.render(100).join('\n')).toContain('Generalx — 2 open / 3 total');
 		host.handleInput('q');
 		await handler;
 		fakeCtx.customControl.factoryHook = undefined;
+	});
+
+	test('dispatch: subcommands stay, a bare /ralph and a file argument open the home view', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await importTodo(fake, fakeCtx, 'import TODO.md --category General');
+
+		// Bare /ralph opens the home view on the conventional backlog.
+		await ralph.handler('', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(1);
+		expect(
+			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
+		).toContain('Ralph home — TODO.ralph');
+
+		// A first argument that is not a subcommand is a backlog file.
+		fakeCtx.customFactories.length = 0;
+		await ralph.handler('TODO.ralph', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(1);
+		expect(
+			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
+		).toContain('Ralph home — TODO.ralph');
+
+		// Known subcommands are untouched: start still starts the task loop.
+		fakeCtx.customFactories.length = 0;
+		await ralph.handler('start --todo TODO.ralph', fakeCtx.ctx);
+		expect(fakeCtx.customFactories.length).toBe(0);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+
+		// The command description and argument completions no longer offer
+		// the removed todos subcommand.
+		const command = fake.commands.get('ralph') as unknown as {
+			description: string;
+			getArgumentCompletions: (prefix: string) => Array<{ value: string }> | null;
+		};
+		expect(command.description).not.toContain('todos');
+		for (const prefix of ['', 't', 's', 'i', 'st', 're', 'co']) {
+			const values = (command.getArgumentCompletions(prefix) ?? []).map((o) => o.value);
+			expect(values).not.toContain('todos');
+		}
+		expect((command.getArgumentCompletions('') ?? []).map((o) => o.value)).toEqual([
+			'start',
+			'import',
+			'set-goal',
+			'stop',
+			'resume',
+			'status',
+			'config'
+		]);
 	});
 });
 
@@ -1800,5 +2833,295 @@ describe('/ralph-init (ralph-format-only)', () => {
 		await init('--force Build a lamp.');
 		expect((await readFile(join(dir, 'TODO.ralph'), 'utf8')).startsWith('# ralph v2')).toBe(true);
 		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	describe('--goal', () => {
+		test('creates a backlog with the goal and no tasks, and a goal-aware spec prompt', async () => {
+			await rm(join(dir, 'SPEC.md'));
+			await init('--goal Build a lamp that dims.');
+
+			const text = await readFile(join(dir, 'TODO.ralph'), 'utf8');
+			const backlog = Backlog.parse(text);
+			const goal = backlog.goal();
+			expect(goal?.title).toBe('Build a lamp that dims.');
+			expect(goal?.status).toBe('open');
+			expect(goal?.body).toBeNull();
+			expect(backlog.counts()).toEqual({ open: 0, total: 0, completed: 0 });
+
+			// The LLM is asked for the spec only, and the spec must state the
+			// goal verbatim with acceptance criteria.
+			expect(fake.userMessages).toHaveLength(1);
+			const prompt = fake.userMessages[0]!.text;
+			expect(prompt).toContain('Goal: Build a lamp that dims.');
+			expect(prompt).toContain('acceptance criteria');
+			expect(prompt).toContain('exactly as given');
+			expect(prompt).not.toContain('backlog: ');
+		});
+
+		test('requires a brief', async () => {
+			await init('--goal');
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph-init [--goal]');
+			expect(fake.userMessages).toHaveLength(0);
+			await expect(readFile(join(dir, 'TODO.ralph'), 'utf8')).rejects.toThrow();
+		});
+
+		test('is idempotent on an existing goal', async () => {
+			await rm(join(dir, 'SPEC.md'));
+			await init('--goal --todo TODO.ralph Build a lamp that dims.');
+			const first = await readFile(join(dir, 'TODO.ralph'), 'utf8');
+			fakeCtx.notifications.length = 0;
+			await init('--goal --todo TODO.ralph Build a lamp that dims.');
+			expect(await readFile(join(dir, 'TODO.ralph'), 'utf8')).toBe(first);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('already has the goal');
+			expect(fake.userMessages).toHaveLength(0);
+		});
+
+		test('adds the goal to an existing ralph backlog that has none', async () => {
+			await rm(join(dir, 'SPEC.md'));
+			await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+			await init('--goal Build a lamp that dims.');
+
+			const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+			expect(backlog.goal()?.title).toBe('Build a lamp that dims.');
+			// The existing tasks are untouched.
+			expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
+		});
+
+		test('--goal --todo creates only the goal backlog without an LLM prompt', async () => {
+			await init('--goal --todo TODO.ralph Build a lamp that dims.');
+			const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+			expect(backlog.goal()?.title).toBe('Build a lamp that dims.');
+			expect(backlog.counts()).toEqual({ open: 0, total: 0, completed: 0 });
+			expect(fake.userMessages).toHaveLength(0);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Created Ralph backlog with goal');
+		});
+	});
+});
+
+const GOAL_H1 = `# Port the complete app
+
+Port the app from the source to the target.
+
+- Criterion one holds.
+- Criterion two holds.
+`;
+
+const GOAL_PLAIN = `Ship the thing
+Criterion one holds.
+Criterion two holds.
+`;
+
+describe('ralph-loop extension (set-goal command)', () => {
+	beforeEach(async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		await writeFile(join(dir, 'GOAL.md'), GOAL_H1);
+	});
+
+	async function setGoal(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx, args: string) {
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(args, fakeCtx.ctx);
+	}
+
+	test('sets the goal from a file with an H1 title into TODO.ralph', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.goal()?.title).toBe('Port the complete app');
+		expect(backlog.goal()?.status).toBe('open');
+		expect(backlog.goal()?.body).toBe('Port the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
+		// The existing tasks are untouched.
+		expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
+		const notification = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(notification).toContain('Set goal "Port the complete app" in TODO.ralph');
+		expect(notification).toContain('Start the goal loop with: /ralph start --goal');
+	});
+
+	test('uses the first line as the title without an H1; the body excludes the title', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'PLAIN.md'), GOAL_PLAIN);
+
+		await setGoal(fake, fakeCtx, 'set-goal PLAIN.md');
+
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.goal()?.title).toBe('Ship the thing');
+		expect(backlog.goal()?.body).toBe('Criterion one holds.\nCriterion two holds.');
+	});
+
+	test('replaces an existing open goal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+		await writeFile(join(dir, 'SECOND.md'), '# Second goal\nSecond body.\n');
+		fakeCtx.notifications.length = 0;
+		await fake.commands.get('ralph')!.handler('set-goal SECOND.md', fakeCtx.ctx);
+
+		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
+		expect(backlog.goal()?.title).toBe('Second goal');
+		expect(backlog.goal()?.body).toBe('Second body.');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Replaced the goal in TODO.ralph: "Port the complete app" → "Second goal"');
+	});
+
+	test('refuses a claimed goal and leaves the file untouched', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		const claimed = `# ralph v2
+
+G "Old goal" claimed
+GE "evidence"
+
+T 1 - "Task one"
+`;
+		await writeFile(join(dir, 'TODO.ralph'), claimed);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('is claimed — resolve it first');
+		expect(await readFile(join(dir, 'TODO.ralph'), 'utf8')).toBe(claimed);
+	});
+
+	test('refuses a done goal and leaves the file untouched', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		const done = `# ralph v2
+
+G "Old goal" done
+GE "evidence"
+
+T 1 - "Task one"
+D 1
+`;
+		await writeFile(join(dir, 'TODO.ralph'), done);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('is done — resolve it first');
+		expect(await readFile(join(dir, 'TODO.ralph'), 'utf8')).toBe(done);
+	});
+
+	test('targets the active loop’s backlog when --todo is omitted', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'OTHER.ralph'), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo OTHER.ralph', fakeCtx.ctx);
+
+		await fake.commands.get('ralph')!.handler('set-goal GOAL.md', fakeCtx.ctx);
+
+		const other = Backlog.parse(await readFile(join(dir, 'OTHER.ralph'), 'utf8'));
+		expect(other.goal()?.title).toBe('Port the complete app');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('The active task loop is unaffected.');
+	});
+
+	test('--todo overrides the target backlog', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'OTHER.ralph'), RALPH_V1);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md --todo OTHER.ralph');
+
+		expect(Backlog.parse(await readFile(join(dir, 'OTHER.ralph'), 'utf8')).goal()?.title).toBe('Port the complete app');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Start the goal loop with: /ralph start --goal --todo OTHER.ralph');
+	});
+
+	test('refuses a missing goal file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal MISSING.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Could not read MISSING.md');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+	});
+
+	test('refuses a goal file without a title line', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'EMPTY.md'), '\n   \n');
+
+		await setGoal(fake, fakeCtx, 'set-goal EMPTY.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('No goal in EMPTY.md');
+	});
+
+	test('refuses a non-ralph backlog target', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'NOTRALPH.ralph'), '# not ralph\n');
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md --todo NOTRALPH.ralph');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('NOTRALPH.ralph is not a ralph-format backlog');
+	});
+
+	test('refuses a missing backlog target', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md --todo MISSING.ralph');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('No backlog at MISSING.ralph');
+	});
+
+	test('refuses the backlog itself as the goal file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal TODO.ralph');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('must be different files');
+	});
+
+	test('refuses paths outside the project', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, `set-goal ${join(dir, 'GOAL.md')}`);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('relative file inside the project');
+
+		fakeCtx.notifications.length = 0;
+		await fake.commands.get('ralph')!.handler('set-goal GOAL.md --todo /etc/passwd', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('relative file inside the project');
+	});
+
+	test('shows usage without a goal file', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await setGoal(fake, fakeCtx, 'set-goal');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Usage: /ralph set-goal <goal-file> [--todo <backlog-file>]');
+	});
+
+	test('waits for the agent to be idle', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.idle.value = false;
+
+		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
+
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Wait for the current agent run to finish before setting the goal');
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
 	});
 });

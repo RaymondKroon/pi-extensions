@@ -21,9 +21,19 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
-import { Backlog, formatBacklog, formatNextTask, formatSearchResults, formatTaskDetail, isRalphBacklog } from './backlog.ts';
+import {
+	Backlog,
+	formatBacklog,
+	formatGoal,
+	formatNextTask,
+	formatSearchResults,
+	formatTaskDetail,
+	isRalphBacklog,
+	type Goal,
+	type GoalStatus
+} from './backlog.ts';
 import { createTodosView, type TodosView } from './todos-view.ts';
-import { createListPicker, type ListPicker } from './list-picker.ts';
+import { createRalphHome, type RalphHome } from './ralph-home.ts';
 
 const STATE_TYPE = 'ralph-loop-state';
 const CONFIG_TYPE = 'ralph-loop-config';
@@ -39,7 +49,7 @@ const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 
-type RotationReason = 'completed-task' | 'context-limit';
+type RotationReason = 'completed-task' | 'plan-updated' | 'context-limit';
 
 interface RalphConfig {
 	/**
@@ -62,6 +72,8 @@ interface RalphState {
 	contextThreshold: number;
 	autoApproveDecisions: boolean;
 	enabled: boolean;
+	/** Loop policy: the finite task backlog or the single goal. */
+	mode: 'tasks' | 'goal';
 	todoPath: string;
 	specPath: string;
 	baselineTodo: string;
@@ -96,6 +108,7 @@ function isRalphState(value: unknown): value is RalphState {
 	const state = value as Partial<RalphState>;
 	return (
 		typeof state.enabled === 'boolean' &&
+		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal') &&
 		typeof state.todoPath === 'string' &&
 		typeof state.specPath === 'string' &&
 		typeof state.baselineTodo === 'string' &&
@@ -106,7 +119,10 @@ function isRalphState(value: unknown): value is RalphState {
 		typeof state.contextThreshold === 'number' &&
 		(state.autoApproveDecisions === undefined || typeof state.autoApproveDecisions === 'boolean') &&
 		typeof state.rotationQueued === 'boolean' &&
-		(state.rotationReason === undefined || state.rotationReason === 'completed-task' || state.rotationReason === 'context-limit') &&
+		(state.rotationReason === undefined ||
+			state.rotationReason === 'completed-task' ||
+			state.rotationReason === 'plan-updated' ||
+			state.rotationReason === 'context-limit') &&
 		(state.rotationCheckpointing === undefined || typeof state.rotationCheckpointing === 'boolean') &&
 		(state.stopRequested === undefined || typeof state.stopRequested === 'boolean') &&
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
@@ -122,6 +138,7 @@ function isRalphState(value: unknown): value is RalphState {
 function normalizeState(state: RalphState): RalphState {
 	return {
 		...state,
+		mode: state.mode ?? 'tasks',
 		autoApproveDecisions: state.autoApproveDecisions ?? DEFAULT_AUTO_APPROVE_DECISIONS,
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
@@ -288,6 +305,14 @@ function countTodoTasks(todo: string, category?: string): { current: number; tot
 	return { current: open > 0 ? total - open + 1 : total, total };
 }
 
+/**
+ * The current task number for RalphState, or undefined when no task is
+ * current (goal mode with an exhausted plan): task numbers are 1-based.
+ */
+function currentTaskNumber(current: number): number | undefined {
+	return current > 0 ? current : undefined;
+}
+
 function hasCompletedTodoItem(previousTodo: string, currentTodo: string, category?: string): boolean {
 	return todoCounts(currentTodo, category).completed > todoCounts(previousTodo, category).completed;
 }
@@ -318,6 +343,76 @@ function completedTaskNumbers(previousTodo: string, currentTodo: string, categor
 /** A Ralph backlog is finished when it has no open tasks (Markdown: no unchecked boxes). */
 function isBacklogFinished(todo: string, category?: string): boolean {
 	return todoCounts(todo, category).open === 0;
+}
+
+type GoalPhase = 'planning' | 'execution' | 're-evaluation';
+
+/**
+ * The goal-loop phase for the state's baseline backlog: planning (goal open,
+ * zero tasks), execution (open tasks), or re-evaluation (goal open, tasks
+ * exist, none open). Undefined outside a goal loop on a ralph backlog with a
+ * goal, so callers fall back to the task-loop prompts.
+ */
+function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefined {
+	if (state.mode !== 'goal' || !isRalphBacklog(state.baselineTodo)) return undefined;
+	try {
+		const backlog = Backlog.parse(state.baselineTodo);
+		const goal = backlog.goal();
+		if (!goal) return undefined;
+		const counts = backlog.counts(state.category);
+		if (counts.total === 0) return { phase: 'planning', goal };
+		if (counts.open === 0) return { phase: 're-evaluation', goal };
+		return { phase: 'execution', goal };
+	} catch {
+		return undefined;
+	}
+}
+
+/** The goal contract shown to the model in every goal-loop prompt. */
+function goalBlock(goal: Goal): string {
+	const lines = [`The goal is "${goal.title}" (status: ${goal.status}).`];
+	if (goal.body) lines.push(goal.body.trim());
+	if (goal.checkpoint) {
+		lines.push(`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${goal.checkpoint}`);
+	}
+	return lines.join('\n');
+}
+
+/**
+ * The goal's status in a backlog snapshot, or undefined when the file is not a
+ * ralph backlog, has no goal, or fails to parse. Used by the goal loop to
+ * detect goal completion (done) and the stall state (open) from the file.
+ */
+function goalStatus(todo: string): GoalStatus | undefined {
+	if (!isRalphBacklog(todo)) return undefined;
+	try {
+		return Backlog.parse(todo).goal()?.status;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether the plan grew between two snapshots: a task that is open in the newer
+ * snapshot but was not open in the older one (a new task, or a previously
+ * completed task re-opened). The goal loop uses this to tell a progress turn
+ * (the plan grew) from a stalled one, and to trigger a plan-updated rotation.
+ */
+function planGrew(previousTodo: string, currentTodo: string, category?: string): boolean {
+	if (!isRalphBacklog(previousTodo) || !isRalphBacklog(currentTodo)) return false;
+	try {
+		const previousOpen = new Set(
+			Backlog.parse(previousTodo)
+				.listTasks(category)
+				.filter((task) => !task.done)
+				.map((task) => task.id)
+		);
+		return Backlog.parse(currentTodo)
+			.listTasks(category)
+			.some((task) => !task.done && !previousOpen.has(task.id));
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -373,11 +468,70 @@ function iterationPrompt(state: RalphState, reason?: RotationReason): string {
 			? 'The previous iteration reached its context budget and recorded a durable TODO checkpoint. Re-establish facts from the repository and TODO before continuing; do not rely on the old conversation.'
 			: reason === 'completed-task'
 				? 'A previous TODO item was completed. Start the next independent iteration with a clean review of the repository.'
-				: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
+				: reason === 'plan-updated'
+					? 'The plan was just updated with new tasks. Start the next independent iteration with a clean review of the repository and the updated plan.'
+					: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
 
 	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
 
 	if (isRalphBacklog(state.baselineTodo)) {
+		const goalInfo = goalPhase(state);
+		if (goalInfo) {
+			const { phase, goal } = goalInfo;
+			const backlogNote = `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`;
+			const categoryScope = state.category ? ` in category "${state.category}"` : '';
+			const categoryGuard = state.category ? ' or on a task in another category' : '';
+
+			if (phase === 'planning') {
+				return `Run the Ralph goal loop for this repository. ${contextNote}
+
+${backlogNote}
+
+${goalBlock(goal)}
+
+This is a planning iteration: the goal is open and the backlog has no tasks yet.
+
+1. Read ${state.specPath} in full.
+2. Decompose the goal into small, ordered tasks that together cover every acceptance criterion.
+3. Add the whole plan to the backlog with ralph_todo (action "add-many" for the plan, or "add" per task).
+4. Do not implement the goal in this iteration: the plan is the deliverable. Do not edit ${state.todoPath} directly.
+
+${decisionNote}`;
+			}
+			if (phase === 're-evaluation') {
+				return `Run the Ralph goal loop for this repository. ${contextNote}
+
+${backlogNote}
+
+${goalBlock(goal)}
+
+This is a re-evaluation iteration: the goal is open and every planned task is complete.
+
+1. Read ${state.specPath} in full.
+2. Re-check every acceptance criterion of the goal against the repository and run every verification command required by SPEC.md.
+3. If any criterion is not met, add tasks for the missing work with ralph_todo and stop after recording them.
+4. If every criterion is met and verified, call ralph_goal with action "complete" and the evidence. Do not edit ${state.todoPath} directly.
+
+${decisionNote}`;
+			}
+			return `Run the Ralph goal loop for this repository. ${contextNote}
+
+${backlogNote}
+
+${goalBlock(goal)}
+
+You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks with ralph_todo so the backlog always reflects the remaining work.
+
+1. Read ${state.specPath} in full, then call ralph_todo with action "next" to get the next open task${categoryScope}: its number, body, and checkpoint. Use action "list" only when that task is blocked and you need the wider backlog to find an unblocked one.
+2. Do not work on a later task${categoryGuard}.
+3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
+4. Add focused tests and run every quality command required by SPEC.md and the backlog.
+5. Only after all acceptance criteria pass, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly.
+6. Finally, commit the completed iteration locally in a single commit that also includes the ${state.todoPath} update. Do not push. This is the last step of the iteration: stop working when the commit is made.
+
+${decisionNote}`;
+		}
+
 		const categoryScope = state.category ? ` in category "${state.category}"` : '';
 		return `Run the Ralph loop for this repository. ${contextNote}
 
@@ -415,6 +569,18 @@ function resumePrompt(state: RalphState): string {
 
 function contextCheckpointPrompt(state: RalphState): string {
 	if (isRalphBacklog(state.baselineTodo)) {
+		// Task-less goal iterations (planning/re-evaluation) have no task to
+		// checkpoint: the goal carries the durable state instead.
+		const goalInfo = goalPhase(state);
+		if (goalInfo && goalInfo.phase !== 'execution') {
+			return `The current Ralph goal iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations}.
+
+1. Call ralph_goal with action "checkpoint" and a concise note: planning or re-evaluation evidence so far, relevant changed paths, known failures or risks, and the exact next step. The tool replaces any older checkpoint: keep only the single most recent one, because an older checkpoint's state and next step are stale.
+2. Keep a single exact next step in the checkpoint note.
+3. Do not change the goal's state, do not claim unverified work, do not modify product code, and do not commit. Do not continue work after recording the checkpoint.
+
+Report the checkpoint and the next step succinctly.`;
+		}
 		return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
 
 1. Call ralph_todo with action "list" and identify the currently selected open task.
@@ -471,6 +637,22 @@ Report the completion log entry (existing or newly recorded) and the commit (if 
 Report the recorded entry and the commit (if any) succinctly.`;
 }
 
+/**
+ * Sent as the dedicated recording turn before a fresh iteration after the goal
+ * plan grew: the plan update must be committed locally before the next
+ * iteration starts, but no completion log entry is written because no task
+ * was completed in the turn.
+ */
+function planRecordingPrompt(state: RalphState): string {
+	return `The Ralph plan was just updated: new tasks were added to the backlog. Commit the updated plan now, then stop working; a fresh Ralph iteration will start after this turn.
+
+1. Check git status. If the updated plan (or any other uncommitted work from this iteration) is not committed locally, commit it with a concise message. Do not push.
+2. Do not add a completion log entry: no task was completed in this iteration.
+3. Do not start work on the new tasks and do not modify product code beyond the commit.
+
+Report the commit (if any) succinctly.`;
+}
+
 /** Extract the readable text from a tool result payload (for abort detection). */
 function toolResultText(result: unknown): string {
 	if (!result || typeof result !== 'object') return '';
@@ -524,6 +706,8 @@ interface RalphStartFiles {
 	specFile: string;
 	todoFile: string;
 	category?: string;
+	/** Start the goal loop instead of the task loop. */
+	goal: boolean;
 }
 
 interface RalphInitFiles {
@@ -531,6 +715,8 @@ interface RalphInitFiles {
 	todoFile?: string;
 	force: boolean;
 	prompt: string;
+	/** Initialize for the goal loop: the backlog gets the goal from the brief. */
+	goal: boolean;
 }
 
 /** Parse explicit file options so either default may be overridden independently. */
@@ -538,9 +724,15 @@ function parseStartFiles(args: string[]): RalphStartFiles | undefined {
 	let specFile = DEFAULT_SPEC;
 	let todoFile = DEFAULT_TODO;
 	let category: string | undefined;
+	let goal = false;
 
 	for (let index = 0; index < args.length; index += 1) {
 		const option = args[index];
+		if (option === '--goal') {
+			if (goal) return undefined;
+			goal = true;
+			continue;
+		}
 		if (option !== '--spec' && option !== '--todo' && option !== '--category') return undefined;
 		const path = args[index + 1];
 		if (!path || path.startsWith('--')) return undefined;
@@ -550,7 +742,7 @@ function parseStartFiles(args: string[]): RalphStartFiles | undefined {
 		index += 1;
 	}
 
-	return { specFile, todoFile, category };
+	return { specFile, todoFile, category, goal };
 }
 
 /**
@@ -558,13 +750,15 @@ function parseStartFiles(args: string[]): RalphStartFiles | undefined {
  * conventional files; when one or both are supplied, use exactly those named
  * files. The specification is generated by the LLM from the project brief (a
  * brief is required whenever a spec is requested); the ralph-format backlog is
- * created directly as an empty backlog. `--` permits a brief that starts with
- * an option-looking word.
+ * created directly as an empty backlog, or — with --goal — as a backlog whose
+ * single goal is derived from the brief (so a brief is always required with
+ * --goal). `--` permits a brief that starts with an option-looking word.
  */
 function parseInitFiles(args: string[]): RalphInitFiles | undefined {
 	let specFile: string | undefined;
 	let todoFile: string | undefined;
 	let force = false;
+	let goal = false;
 	let index = 0;
 
 	for (; index < args.length; index += 1) {
@@ -577,6 +771,11 @@ function parseInitFiles(args: string[]): RalphInitFiles | undefined {
 		if (option === '--force') {
 			if (force) return undefined;
 			force = true;
+			continue;
+		}
+		if (option === '--goal') {
+			if (goal) return undefined;
+			goal = true;
 			continue;
 		}
 		if (option !== '--spec' && option !== '--todo') return undefined;
@@ -595,13 +794,167 @@ function parseInitFiles(args: string[]): RalphInitFiles | undefined {
 	const resolvedSpec = specFile ?? (todoFile ? undefined : DEFAULT_SPEC);
 	const resolvedTodo = todoFile ?? (specFile ? undefined : DEFAULT_TODO);
 	const prompt = args.slice(index).join(' ').trim();
-	if (resolvedSpec && !prompt) return undefined;
+	if ((resolvedSpec || goal) && !prompt) return undefined;
 	return {
 		specFile: resolvedSpec,
 		todoFile: resolvedTodo,
 		force,
-		prompt
+		prompt,
+		goal
 	};
+}
+
+/**
+ * Derive the goal record of a --goal init from the project brief: the first
+ * line is the title, the full brief is the body (omitted when it adds nothing
+ * beyond the title). The user reviews and edits the goal before starting the
+ * goal loop; this is only the initial contract.
+ */
+function goalFromBrief(brief: string): { title: string; body?: string } {
+	const trimmed = brief.trim();
+	const firstLine = trimmed.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? trimmed;
+	const body = trimmed === firstLine ? undefined : trimmed;
+	return { title: firstLine, body };
+}
+
+interface RalphSetGoalArgs {
+	goalFile: string;
+	todoFile?: string;
+}
+
+/** Parse `set-goal <goal-file> [--todo <backlog-file>]`. */
+function parseSetGoalArgs(args: string[]): RalphSetGoalArgs | undefined {
+	let goalFile: string | undefined;
+	let todoFile: string | undefined;
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === '--todo') {
+			const path = args[index + 1];
+			if (!path || path.startsWith('--')) return undefined;
+			if (todoFile) return undefined;
+			todoFile = path;
+			index += 1;
+			continue;
+		}
+		if (arg.startsWith('--')) return undefined;
+		if (goalFile) return undefined;
+		goalFile = arg;
+	}
+	if (!goalFile) return undefined;
+	return { goalFile, todoFile };
+}
+
+/**
+ * Derive the goal record of a set-goal file: the first non-empty line is the
+ * title (a leading `# ` H1 marker is stripped), the remaining lines are the
+ * body (omitted when empty). Unlike goalFromBrief the body does not repeat
+ * the title line, which the G record already stores.
+ */
+function goalFromFile(text: string): { title: string; body?: string } | undefined {
+	const trimmed = text.trim();
+	const lines = trimmed.split(/\r?\n/);
+	const firstIndex = lines.findIndex((line) => line.trim() !== '');
+	if (firstIndex === -1) return undefined;
+	const firstLine = lines[firstIndex]!.trim();
+	const h1 = firstLine.match(/^#\s+(.*)$/);
+	const title = (h1?.[1] ?? firstLine).trim();
+	if (!title) return undefined;
+	const body = lines.slice(firstIndex + 1).join('\n').trim();
+	return { title, body: body || undefined };
+}
+
+interface SetGoalOutcome {
+	ok: boolean;
+	level: 'info' | 'warning' | 'error';
+	message: string;
+}
+
+/**
+ * Set the single goal of a ralph-format backlog from a goal file. The target
+ * backlog is the explicit --todo file, else the active loop's backlog, else
+ * the conventional TODO.ralph. An existing goal must be open (a claimed or
+ * done goal must be resolved first); setting replaces the title and body.
+ */
+async function setGoalFromFile(cwd: string, loopState: RalphState | undefined, args: RalphSetGoalArgs): Promise<SetGoalOutcome> {
+	const goalPath = resolveProjectFile(cwd, args.goalFile);
+	if (!goalPath) {
+		return { ok: false, level: 'warning', message: 'The goal file must be a relative file inside the project' };
+	}
+	const todoPath = args.todoFile
+		? resolveProjectFile(cwd, args.todoFile)
+		: loopState?.enabled
+			? loopState.todoPath
+			: resolve(cwd, DEFAULT_TODO);
+	if (!todoPath) {
+		return { ok: false, level: 'warning', message: 'The backlog file must be a relative file inside the project' };
+	}
+	if (goalPath === todoPath) {
+		return { ok: false, level: 'warning', message: 'The goal file and the backlog must be different files' };
+	}
+	const outName = relative(cwd, todoPath) || todoPath;
+	let text: string;
+	try {
+		text = await readFile(goalPath, 'utf8');
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not read ${args.goalFile}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const goal = goalFromFile(text);
+	if (!goal) {
+		return {
+			ok: false,
+			level: 'error',
+			message: `No goal in ${args.goalFile}: the first non-empty line must be a title (optionally an H1 heading)`
+		};
+	}
+	let todo: string;
+	try {
+		todo = await readFile(todoPath, 'utf8');
+	} catch {
+		return {
+			ok: false,
+			level: 'error',
+			message: `No backlog at ${outName} — create it first (e.g. /ralph-init --todo ${outName}) or pass --todo <file>`
+		};
+	}
+	if (!isRalphBacklog(todo)) {
+		return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
+	}
+	let backlog: Backlog;
+	try {
+		backlog = Backlog.parse(todo);
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not parse ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const existing = backlog.goal();
+	if (existing && existing.status !== 'open') {
+		return {
+			ok: false,
+			level: 'warning',
+			message: `The goal "${existing.title}" is ${existing.status} — resolve it first (confirm or withdraw a claimed goal, delete a done goal), then set the new goal`
+		};
+	}
+	backlog.setGoal(goal);
+	try {
+		await writeFile(todoPath, backlog.render());
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not write ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	const set = existing
+		? `Replaced the goal in ${outName}: "${existing.title}" → "${goal.title}"`
+		: `Set goal "${goal.title}" in ${outName}`;
+	if (loopState?.enabled && loopState.todoPath === todoPath) {
+		return {
+			ok: true,
+			level: 'info',
+			message: `${set}. ${
+				loopState.mode === 'goal'
+					? 'The active goal loop picks it up from the next iteration.'
+					: 'The active task loop is unaffected.'
+			}`
+		};
+	}
+	const todoFlag = todoPath === resolve(cwd, DEFAULT_TODO) ? '' : ` --todo ${outName}`;
+	return { ok: true, level: 'info', message: `${set}. Start the goal loop with: /ralph start --goal${todoFlag}` };
 }
 
 /** Restrict generated Ralph documents to files below the project root. */
@@ -726,7 +1079,7 @@ async function importMarkdownBacklog(
 		return { ok: false, level: 'warning', message: `Ralph import only accepts Markdown TODO files (.md); ${input} is not one.` };
 	}
 	// Imports always stamp a category: uncategorized tasks are invisible in the
-	// todos view's list picker. An omitted or empty category falls back to a
+	// home view's list rows. An omitted or empty category falls back to a
 	// name derived from the file name (TODO_EMAIL.md → Email).
 	const category = options.category?.trim() || suggestCategory(input);
 	let markdown: string;
@@ -791,9 +1144,19 @@ async function importMarkdownBacklog(
 	return { ok: true, outName, category, merged, counts: target.counts() };
 }
 
-function initPrompt(specFile: string, prompt: string, force: boolean): string {
+function initPrompt(specFile: string, prompt: string, force: boolean, goal?: { title: string; body?: string }): string {
 	const templateWarning =
 		specFile === DEFAULT_SPEC ? '; the target SPEC.md is intentionally allowed because it was explicitly selected' : '';
+	const goalNote = goal
+		? `
+
+This project runs the Ralph goal loop: the ralph-format backlog already contains the goal below (and no tasks yet). The specification must state this goal and its acceptance criteria.
+
+Goal: ${goal.title}
+${goal.body ? `${goal.body}\n` : ''}
+Keep the goal text exactly as given — it is the user's contract and is already recorded in the ralph-format backlog; do not reword it. Derive explicit, verifiable acceptance criteria for the goal from the project brief and put them with the goal in the specification. The goal loop plans from the goal, executes the planned tasks, and only stops when the goal is verified complete and approved.
+`
+		: '';
 	return `Create the Ralph specification now. This is planning work only; do not implement the product brief.
 
 Project brief:
@@ -806,7 +1169,7 @@ First read the bundled generic planning template in full:
 
 It is the authoritative example for the level of product/engineering detail, durable-spec content, acceptance criteria, decision handling, and source-evidence conventions. Adapt its structure and rigor to this project brief; do not copy its placeholder text or assume the project has an existing ${DEFAULT_SPEC} or ${DEFAULT_TODO}.
 
-Create exactly the target file above${force ? ', replacing the named existing file because --force was explicitly supplied,' : ''}. Do not modify any other file${templateWarning}. Use the write tool to produce a complete Markdown document, not a prose preview. Make it self-contained while linking to the corresponding backlog (${DEFAULT_TODO}) where useful.
+Create exactly the target file above${force ? ', replacing the named existing file because --force was explicitly supplied,' : ''}. Do not modify any other file${templateWarning}. Use the write tool to produce a complete Markdown document, not a prose preview. Make it self-contained while linking to the corresponding ralph-format backlog (${DEFAULT_TODO}) where useful.${goalNote}
 
 The specification must be a durable, implementation-ready product and engineering contract: purpose, scope, non-goals, source/evidence rules where applicable, architecture, domain/lifecycle and authorization constraints, user journeys and acceptance criteria, quality/security requirements, definition of done, and release gates. Derive scope, architecture, risks, quality checks, and decisions from the project brief; identify unknowns explicitly rather than inventing them. After writing, read the generated file and verify that it is complete, internally consistent, and contains no unrelated implementation changes. Then report the generated path succinctly.`;
 }
@@ -819,6 +1182,10 @@ export default function (pi: ExtensionAPI) {
 	// the status widget can show the current task number without reading the file
 	// on every streamed message update.
 	let taskCount: { current: number; total: number } | undefined;
+	// Cached from the TODO file at each refresh point (start, settle, rotation) so
+	// the status widget can show the current goal state without reading the file
+	// on every streamed message update.
+	let goalState: GoalStatus | undefined;
 	// Display-only: set when a fresh iteration prompt is sent and cleared when the
 	// new turn starts streaming or settles, so the status bar visibly stays in the
 	// "starting" phase instead of flipping back to "on" within milliseconds.
@@ -832,6 +1199,11 @@ export default function (pi: ExtensionAPI) {
 	// aborted recording turn must not count as recorded progress.
 	let lastAssistantStopReason: string | undefined;
 
+	/** Refresh the cached task counter and goal state from a backlog snapshot. */
+	const refreshCounts = (todo: string, category?: string) => {
+		taskCount = countTodoTasks(todo, category);
+		goalState = goalStatus(todo);
+	};
 
 	const persistConfig = (ctx: ExtensionContext, next: RalphConfig) => {
 		config = next;
@@ -862,7 +1234,7 @@ export default function (pi: ExtensionAPI) {
 			: state?.paused
 				? 'paused'
 				: state?.rotationCheckpointing
-					? state?.rotationReason === 'completed-task'
+					? state?.rotationReason === 'completed-task' || state?.rotationReason === 'plan-updated'
 						? 'recording'
 						: 'checkpointing'
 					: state?.stopRequested
@@ -870,9 +1242,10 @@ export default function (pi: ExtensionAPI) {
 						: state?.rotationQueued || freshIterationPending
 							? 'starting'
 							: 'on';
+		const label = state?.mode === 'goal' ? 'Ralph (goal)' : 'Ralph';
 		const status = !state?.enabled
-			? `Ralph: off${autoApproveDecisions ? ' (auto)' : ''}`
-			: `Ralph: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: off${autoApproveDecisions ? ' (auto)' : ''}`
+			: `${label}: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -911,6 +1284,7 @@ export default function (pi: ExtensionAPI) {
 	const stopLoop = (ctx: ExtensionContext, message: string) => {
 		if (!state) return;
 		taskCount = undefined;
+		goalState = undefined;
 		freshIterationPending = false;
 		persistState({
 			...state,
@@ -1022,6 +1396,33 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Shared parse discipline for the backlog tools (ralph_todo, ralph_goal):
+	// load the target file, require the ralph format, and parse it.
+	const loadTargetBacklog = async (todoPath: string, toolName: string): Promise<Backlog> => {
+		let text: string;
+		try {
+			text = await readRequiredFile(todoPath);
+		} catch (error) {
+			const missing = error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
+			if (missing) {
+				throw new Error(
+					state?.enabled
+						? `${todoPath} is missing; bootstrap it with ralph_todo action "init" or restore the file.`
+						: `No Ralph backlog at ${todoPath}. Bootstrap it with ralph_todo action "init" or import a Markdown TODO with action "import".`
+				);
+			}
+			throw new Error(`could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (!isRalphBacklog(text)) {
+			throw new Error(`${todoPath} is not a ralph-format backlog; ${toolName} only works with ralph-format backlogs.`);
+		}
+		try {
+			return Backlog.parse(text);
+		} catch (error) {
+			throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+
 	// Read/update the SQLite-backed ralph-format backlog. The tool is the only
 	// writer of the backlog file, so the line-oriented format stays valid for
 	// git diffs and re-imports. With an active loop it targets the loop's
@@ -1132,31 +1533,7 @@ export default function (pi: ExtensionAPI) {
 					details: { action: 'init', task: null }
 				};
 			}
-			const loadTargetBacklog = async (): Promise<Backlog> => {
-				let text: string;
-				try {
-					text = await readRequiredFile(todoPath);
-				} catch (error) {
-					const missing = error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
-					if (missing) {
-						throw new Error(
-							state?.enabled
-								? `${todoPath} is missing; bootstrap it with ralph_todo action "init" or restore the file.`
-								: `No Ralph backlog at ${todoPath}. Bootstrap it with ralph_todo action "init" or import a Markdown TODO with action "import".`
-						);
-					}
-					throw new Error(`could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-				if (!isRalphBacklog(text)) {
-					throw new Error(`${todoPath} is not a ralph-format backlog; ralph_todo only works with ralph-format backlogs.`);
-				}
-				try {
-					return Backlog.parse(text);
-				} catch (error) {
-					throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			};
-			const backlog = await loadTargetBacklog();
+			const backlog = await loadTargetBacklog(todoPath, 'ralph_todo');
 
 			let mutated = false;
 			let output: string;
@@ -1323,24 +1700,183 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Read/update the single goal of the ralph-format backlog. The goal is the
+	// user's contract: the model is read-only on its title and body and may
+	// only change the goal's state through this tool. With an active loop it
+	// targets the loop's backlog; otherwise the project's main backlog
+	// (TODO.ralph), so the goal can be inspected from chat anytime.
+	pi.registerTool({
+		name: 'ralph_goal',
+		label: 'Ralph goal',
+		description:
+			'Read or update the single goal of the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. The goal is the user\'s contract: you are read-only on its title and body — only the user edits them, and you may only change the goal\'s state through this tool. Actions: show (works anywhere; prints the goal\'s title, status, body, evidence, and checkpoint), checkpoint (active goal loop only; replaces the single goal checkpoint — the durable state of task-less planning/re-evaluation iterations), complete (active goal loop only; requires the goal open and no open tasks; the completion bar is a full verification run — run every verification command required by SPEC.md first and pass the evidence; the goal becomes claimed and the loop pauses for the user\'s approval, or goes straight to done when auto-approve decisions is enabled), confirm (active goal loop only; claimed → done — call it only after the user approved the completion), withdraw (active goal loop only; claimed → open — call it when the user rejected the completion, with a note describing what is missing; the note becomes the goal checkpoint).',
+		promptSnippet: 'Read/update the Ralph goal',
+		promptGuidelines: [
+			'Use ralph_goal for the goal of the active goal loop; the goal text is the user\'s contract — you are read-only on it and may only change its state through this tool.',
+			'ralph_goal complete is the completion bar: run every verification command required by SPEC.md first and pass the evidence; never claim an unverified completion.',
+			'ralph_goal complete pauses the loop for the user\'s approval: after the answer, approved → record the decision, call ralph_resolve_decision, then ralph_goal confirm; rejected → ralph_goal withdraw with what is missing, then keep working.'
+		],
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal('show'),
+				Type.Literal('checkpoint'),
+				Type.Literal('complete'),
+				Type.Literal('confirm'),
+				Type.Literal('withdraw')
+			]),
+			note: Type.Optional(
+				Type.String({
+					description:
+						'Checkpoint note (checkpoint), completion evidence (complete), or withdrawal note describing what is missing (withdraw).'
+				})
+			)
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Target: the active loop's backlog, else the project's main backlog.
+			const todoPath = state?.enabled ? state.todoPath : resolve(ctx.cwd, 'TODO.ralph');
+			const backlog = await loadTargetBacklog(todoPath, 'ralph_goal');
+			const goal = backlog.goal();
+
+			let mutated = false;
+			let terminated = false;
+			let output: string;
+			// Keep the cached status-line state in sync with a goal mutation before
+			// the loop reacts to it (e.g. the blocked approval gate).
+			const syncGoalState = () => {
+				if (state?.enabled && state.todoPath === todoPath) goalState = backlog.goal()?.status;
+			};
+			switch (params.action) {
+				case 'show': {
+					if (!goal) {
+						output = `No goal in ${todoPath}.`;
+						break;
+					}
+					output = formatGoal(goal);
+					break;
+				}
+				case 'checkpoint': {
+					if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('checkpoint requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!params.note) throw new Error('checkpoint requires a note.');
+					const updated = backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
+					mutated = true;
+					output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+					break;
+				}
+				case 'complete': {
+					if (!state?.enabled) throw new Error('complete requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('complete requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!params.note) throw new Error('complete requires the verification evidence note.');
+					if (!goal) throw new Error(`no goal in ${todoPath}`);
+					if (goal.status !== 'open') {
+						throw new Error(`cannot complete the goal: it is ${goal.status} (complete requires open)`);
+					}
+					const open = backlog.counts().open;
+					if (open > 0) {
+						throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
+					}
+					const evidence = params.note.trim();
+					const claimed = backlog.claimGoal(evidence);
+					mutated = true;
+					syncGoalState();
+					if (state.autoApproveDecisions) {
+						// Delegated approval, consistent with the decision semantics:
+						// the claim is confirmed immediately.
+						const done = backlog.confirmGoal();
+						syncGoalState();
+						output = `Goal "${done.title}" is done (approver: auto-approved). Stop working now; the loop records the completion.`;
+						break;
+					}
+					// User approval gate: the goal stays claimed and the loop pauses
+					// until the user answers (the ralph_request_decision pattern).
+					const question = `Approve completion of the goal "${claimed.title}"?`;
+					blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
+					terminated = true;
+					output = `Goal "${claimed.title}" is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
+					break;
+				}
+				case 'confirm': {
+					if (!state?.enabled) throw new Error('confirm requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('confirm requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!goal) throw new Error(`no goal in ${todoPath}`);
+					const done = backlog.confirmGoal();
+					mutated = true;
+					syncGoalState();
+					output = `Goal "${done.title}" is done (approved). Stop working now; the loop records the completion.`;
+					break;
+				}
+				case 'withdraw': {
+					if (!state?.enabled) throw new Error('withdraw requires an active Ralph loop (start one with /ralph start).');
+					if (state.mode !== 'goal') {
+						throw new Error('withdraw requires an active goal loop (start one with /ralph start --goal).');
+					}
+					if (!params.note) throw new Error('withdraw requires a note describing what is missing.');
+					if (!goal) throw new Error(`no goal in ${todoPath}`);
+					const withdrawn = backlog.withdrawGoal(params.note.trim());
+					mutated = true;
+					syncGoalState();
+					output = `Goal "${withdrawn.title}" is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
+					break;
+				}
+			}
+
+			if (mutated) {
+				try {
+					await writeFile(todoPath, backlog.render());
+				} catch (error) {
+					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				// The status widget captures its label when updateStatus runs; refresh
+				// it so the new goal state is visible without waiting for the settle.
+				if (state?.enabled) updateStatus(ctx);
+			}
+			return {
+				content: [{ type: 'text', text: output }],
+				details: { action: params.action },
+				...(terminated ? { terminate: true } : {})
+			};
+		},
+		renderResult(result, options) {
+			const text =
+				result.content
+					.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+					.map((part) => part.text)
+					.join('\n') || 'Ralph goal updated.';
+			return new Markdown(options.isPartial ? '> Ralph goal…' : text, 0, 0, getMarkdownTheme());
+		}
+	});
+
 	const startFreshIteration = (ctx: ExtensionContext) => {
 		void (async () => {
 			if (!state?.enabled) return;
 			const reason = state.rotationReason ?? 'completed-task';
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				if (isBacklogFinished(currentTodo, state?.category)) {
+				// Goal mode is done when the goal is done, not when the plan is
+				// exhausted: an empty plan is the planning state.
+				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				// Goal mode: never start a fresh iteration once the goal is done.
+				if (state.mode === 'goal' && goalStatus(currentTodo) === 'done') {
+					stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
+					return;
+				}
+				refreshCounts(currentTodo, state?.category);
 				const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
 				const next: RalphState = {
 					...state,
 					baselineTodo: currentTodo,
 					iteration: state.iteration + 1,
 					taskIteration: taskChanged ? 1 : state.taskIteration + 1,
-					taskNumber: taskCount.current,
+					taskNumber: currentTaskNumber(taskCount.current),
 					rotationQueued: false,
 					rotationReason: undefined,
 					rotationCheckpointing: false
@@ -1397,7 +1933,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const { specFile, todoFile, category } = files;
+		const { specFile, todoFile, category, goal } = files;
 		const todoPath = resolve(ctx.cwd, todoFile);
 		const specPath = resolve(ctx.cwd, specFile);
 		try {
@@ -1410,18 +1946,32 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			const backlog = Backlog.parse(baselineTodo);
+			if (goal) {
+				const goalRecord = backlog.goal();
+				if (!goalRecord) {
+					ctx.ui.notify(`Ralph goal loop will not start because ${todoFile} has no goal`, 'warning');
+					return;
+				}
+				if (goalRecord.status === 'done') {
+					ctx.ui.notify('Ralph goal loop will not start because the goal is already complete', 'info');
+					return;
+				}
+			}
 			if (category !== undefined) {
-				const known = Backlog.parse(baselineTodo).categories();
+				const known = backlog.categories();
 				if (!known.includes(category)) {
 					ctx.ui.notify(`Unknown category "${category}" (categories: ${known.join(', ') || 'none'})`, 'warning');
 					return;
 				}
 			}
-			if (isBacklogFinished(baselineTodo, category)) {
+			// Goal mode allows zero open tasks: an empty plan is the planning
+			// state, not a finished loop.
+			if (!goal && isBacklogFinished(baselineTodo, category)) {
 				ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
 				return;
 			}
-			taskCount = countTodoTasks(baselineTodo, category);
+			refreshCounts(baselineTodo, category);
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
@@ -1429,7 +1979,7 @@ export default function (pi: ExtensionAPI) {
 				baselineTodo,
 				iteration: 1,
 				taskIteration: 1,
-				taskNumber: taskCount.current,
+				taskNumber: currentTaskNumber(taskCount.current),
 				maxIterations: config.maxIterations,
 				contextThreshold: contextThresholdFor(config, ctx),
 				autoApproveDecisions: config.autoApproveDecisions,
@@ -1440,6 +1990,7 @@ export default function (pi: ExtensionAPI) {
 				paused: false,
 				blocked: false,
 				blockedItem: undefined,
+				mode: goal ? 'goal' : 'tasks',
 				category
 			};
 			persistState(next);
@@ -1457,7 +2008,11 @@ export default function (pi: ExtensionAPI) {
 	const sendRecordingPrompt = (ctx: ExtensionContext, options?: { midTurn?: boolean }) => {
 		if (!state) return;
 		const prompt =
-			state.rotationReason === 'completed-task' ? completionRecordingPrompt(state) : contextCheckpointPrompt(state);
+			state.rotationReason === 'completed-task'
+				? completionRecordingPrompt(state)
+				: state.rotationReason === 'plan-updated'
+					? planRecordingPrompt(state)
+					: contextCheckpointPrompt(state);
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
 	};
 
@@ -1515,6 +2070,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on('session_start', async (_event, ctx) => {
 		state = undefined;
 		taskCount = undefined;
+		goalState = undefined;
 		freshIterationPending = false;
 		turnStartedOverBudget = false;
 		lastAssistantStopReason = undefined;
@@ -1567,16 +2123,18 @@ export default function (pi: ExtensionAPI) {
 		if (state?.enabled) {
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				if (isBacklogFinished(currentTodo, state?.category)) {
+				// Goal mode is done when the goal is done, not when the plan is
+				// exhausted: an empty plan is the planning state.
+				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				refreshCounts(currentTodo, state?.category);
 				// Re-sync the per-task counter after a reload in case the TODO moved on.
 				if (state.taskNumber !== undefined && state.taskNumber !== taskCount.current) {
-					state = { ...state, taskNumber: taskCount.current, taskIteration: 1 };
+					state = { ...state, taskNumber: currentTaskNumber(taskCount.current), taskIteration: 1 };
 				} else if (state.taskNumber === undefined) {
-					state = { ...state, taskNumber: taskCount.current };
+					state = { ...state, taskNumber: currentTaskNumber(taskCount.current) };
 				}
 			} catch {
 				// The normal iteration path will surface a readable TODO error.
@@ -1740,13 +2298,21 @@ export default function (pi: ExtensionAPI) {
 			// ends. Otherwise progress would be lost with the old conversation.
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
-				taskCount = countTodoTasks(currentTodo, state?.category);
-				if (isBacklogFinished(currentTodo, state?.category)) {
+				refreshCounts(currentTodo, state?.category);
+				// Goal mode is done when the goal is done, not when the plan is
+				// exhausted: an empty plan is the planning state.
+				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
 				if (hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
 					queueRotation(ctx, 'completed-task', { currentTodo });
+					return;
+				}
+				// Goal mode: a grown plan is a progress boundary too — the plan
+				// update gets its commit before the loop ends.
+				if (state.mode === 'goal' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+					queueRotation(ctx, 'plan-updated');
 					return;
 				}
 			} catch (error) {
@@ -1765,9 +2331,16 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const currentTodo = await readRequiredFile(state.todoPath);
-			taskCount = countTodoTasks(currentTodo, state?.category);
-			if (isBacklogFinished(currentTodo, state?.category)) {
+			refreshCounts(currentTodo, state?.category);
+			// Goal mode is done when the goal is done, not when the plan is
+			// exhausted: an empty plan is the planning state.
+			if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
+				return;
+			}
+			// Goal mode: the loop ends when the goal is done in the file.
+			if (state.mode === 'goal' && goalStatus(currentTodo) === 'done') {
+				stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
 				return;
 			}
 
@@ -1783,18 +2356,48 @@ export default function (pi: ExtensionAPI) {
 				queueRotation(ctx, 'completed-task', { currentTodo });
 				return;
 			}
+
+			// Goal mode: the plan grew (new open tasks, no completions) — a
+			// progress boundary that rotates with a commit-only recording turn,
+			// winning over the proactive threshold check below like completions do.
+			if (state.mode === 'goal' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+				if (state.iteration >= state.maxIterations) {
+					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
+					return;
+				}
+				queueRotation(ctx, 'plan-updated');
+				return;
+			}
+
+			// Start the checkpoint only after the current run has settled. Completed
+			// items take the clean cutoff above; unfinished work gets a durable TODO
+			// checkpoint followed by a fresh model context.
+			const contextFraction = contextUsageFraction(ctx);
+			if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
+				queueRotation(ctx, 'context-limit');
+				return;
+			}
+
+			// Goal mode: a turn that made no progress — the goal is still open, no
+			// task is open, nothing was completed, and the plan did not grow — and
+			// did not rotate (under budget) is a stall. Stop with a clear notice
+			// instead of looping on an empty plan.
+			if (
+				state.mode === 'goal' &&
+				goalStatus(currentTodo) === 'open' &&
+				isBacklogFinished(currentTodo, state.category) &&
+				!planGrew(state.baselineTodo, currentTodo, state.category)
+			) {
+				stopLoop(
+					ctx,
+					'Ralph goal loop stopped: the goal is still open but this iteration made no progress (no task completed and no new tasks added). Add tasks to the plan or complete the goal to continue.'
+				);
+				return;
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(`Ralph loop could not read ${state.todoPath}: ${message}`, 'error');
 			return;
-		}
-
-		// Start the checkpoint only after the current run has settled. Completed
-		// items take the clean cutoff above; unfinished work gets a durable TODO
-		// checkpoint followed by a fresh model context.
-		const contextFraction = contextUsageFraction(ctx);
-		if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
-			queueRotation(ctx, 'context-limit');
 		}
 	});
 
@@ -1910,11 +2513,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand('ralph-init', {
 		description:
-			'Create the Ralph spec (generated) and an empty ralph-format backlog: [--spec file] [--todo file] [--force] <project brief>',
+			'Create the Ralph spec (generated) and a ralph-format backlog: [--goal] [--spec file] [--todo file] [--force] <project brief>',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
+				{ value: '--goal', label: '--goal', description: 'Initialize for the goal loop: the backlog gets the goal (derived from the brief) and the spec must state it with acceptance criteria.' },
 				{ value: '--spec', label: '--spec', description: 'Generate only this specification file (or pair with --todo).' },
-				{ value: '--todo', label: '--todo', description: 'Create only this empty ralph-format backlog file (or pair with --spec).' },
+				{ value: '--todo', label: '--todo', description: 'Create only this ralph-format backlog file (or pair with --spec).' },
 				{ value: '--force', label: '--force', description: 'Allow replacing a named existing output file.' }
 			];
 			const matches = options.filter((option) => option.value.startsWith(prefix.toLowerCase()));
@@ -1925,7 +2529,7 @@ export default function (pi: ExtensionAPI) {
 			const initFiles = commandArgs ? parseInitFiles(commandArgs) : undefined;
 			if (!initFiles) {
 				ctx.ui.notify(
-					'Usage: /ralph-init [--spec file] [--todo file] [--force] <project brief> (quote paths or briefs containing spaces)',
+					'Usage: /ralph-init [--goal] [--spec file] [--todo file] [--force] <project brief> (quote paths or briefs containing spaces)',
 					'warning'
 				);
 				return;
@@ -1982,42 +2586,222 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if (todoPath && todoStatus && (todoStatus.kind === 'missing' || !todoStatus.ralph)) {
-				try {
-					await mkdir(dirname(todoPath), { recursive: true });
-					await writeFile(todoPath, Backlog.empty().render());
-				} catch (error) {
-					ctx.ui.notify(
-						`could not write ${initFiles.todoFile}: ${error instanceof Error ? error.message : String(error)}`,
-						'error'
-					);
-					return;
+			let todoWritten = false;
+			let goalAlready = false;
+			if (todoPath && todoStatus) {
+				let backlog: Backlog | undefined;
+				if (todoStatus.kind === 'missing' || !todoStatus.ralph) {
+					backlog = Backlog.empty();
+				} else if (initFiles.goal) {
+					// Existing ralph backlog: add the goal only when it has none yet,
+					// so re-running --goal init is idempotent.
+					try {
+						const existing = Backlog.parse(await readFile(todoPath, 'utf8'));
+						if (existing.goal()) goalAlready = true;
+						else backlog = existing;
+					} catch (error) {
+						ctx.ui.notify(
+							`could not parse ${initFiles.todoFile}: ${error instanceof Error ? error.message : String(error)}`,
+							'error'
+						);
+						return;
+					}
+				}
+				if (backlog) {
+					if (initFiles.goal) backlog.setGoal(goalFromBrief(initFiles.prompt));
+					try {
+						await mkdir(dirname(todoPath), { recursive: true });
+						await writeFile(todoPath, backlog.render());
+						todoWritten = true;
+					} catch (error) {
+						ctx.ui.notify(
+							`could not write ${initFiles.todoFile}: ${error instanceof Error ? error.message : String(error)}`,
+							'error'
+						);
+						return;
+					}
 				}
 			}
 
 			if (specPath) {
 				ctx.ui.notify('Preparing Ralph specification…', 'info');
-				pi.sendUserMessage(initPrompt(initFiles.specFile!, initFiles.prompt, initFiles.force));
+				pi.sendUserMessage(
+					initPrompt(initFiles.specFile!, initFiles.prompt, initFiles.force, initFiles.goal ? goalFromBrief(initFiles.prompt) : undefined)
+				);
 				return;
 			}
 			ctx.ui.notify(
-				`Created empty Ralph backlog at ${initFiles.todoFile}. Add tasks with the ralph_todo tool.`,
-				'info'
+				initFiles.goal
+					? goalAlready
+						? `Ralph backlog at ${initFiles.todoFile} already has the goal "${goalFromBrief(initFiles.prompt).title}"; nothing to do.`
+						: `Created Ralph backlog with goal "${goalFromBrief(initFiles.prompt).title}" at ${initFiles.todoFile}. Review the goal, then start the goal loop with /ralph start --goal.`
+					: todoWritten
+						? `Created empty Ralph backlog at ${initFiles.todoFile}. Add tasks with the ralph_todo tool.`
+						: `Ralph backlog at ${initFiles.todoFile} already exists; nothing to do.`,
+					'info'
 			);
 		}
 	});
 
+	/**
+	 * Open the Ralph home view (bare /ralph or /ralph <file>): a pinned goal
+	 * row above the list rows; enter on a list opens the task view for it.
+	 * Source: an explicit file, else the active loop's backlog, else the
+	 * conventional names in the project root.
+	 */
+	const openHome = async (ctx: ExtensionCommandContext, fileArg?: string): Promise<void> => {
+		const candidates = fileArg
+			? [resolveProjectFile(ctx.cwd, fileArg)].filter((p): p is string => p !== undefined)
+			: state?.enabled
+				? [state.todoPath]
+				: [resolve(ctx.cwd, DEFAULT_TODO), resolve(ctx.cwd, 'TODO.md')];
+		let todoPath: string | undefined;
+		for (const candidate of candidates) {
+			if (candidate && (await pathExists(candidate))) {
+				todoPath = candidate;
+				break;
+			}
+		}
+		if (!todoPath) {
+			ctx.ui.notify(
+				fileArg
+					? `Could not read ${fileArg}`
+					: 'No backlog found: start a loop or pass a file (e.g. /ralph TODO.ralph)',
+				'error'
+			);
+			return;
+		}
+		const title = relative(ctx.cwd, todoPath) || todoPath;
+		const loadBacklog = (): Backlog | undefined => {
+			try {
+				const text = readFileSync(todoPath!, 'utf8');
+				// The view only renders ralph-format backlogs; Markdown
+				// backlogs must be imported first (see below).
+				return isRalphBacklog(text) ? Backlog.parse(text) : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+		let initial: Backlog | undefined;
+		try {
+			const text = readFileSync(todoPath, 'utf8');
+			if (!isRalphBacklog(text)) {
+				ctx.ui.notify('Todo entries empty. Import data with /ralph import', 'info');
+				return;
+			}
+			initial = Backlog.parse(text);
+		} catch {
+			initial = undefined;
+		}
+		if (!initial) {
+			ctx.ui.notify(`Could not parse ${todoPath} as a Ralph backlog`, 'error');
+			return;
+		}
+		// Persist a backlog mutation: run fn on the given backlog instance and
+		// write the result to disk. Return false when the change was not saved
+		// (the view keeps showing the previous data).
+		const persist = async (backlog: Backlog, fn: (b: Backlog) => void): Promise<boolean> => {
+			try {
+				fn(backlog);
+			} catch (error) {
+				ctx.ui.notify(`Could not update ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+				return false;
+			}
+			try {
+				await writeFile(todoPath, backlog.render());
+				return true;
+			} catch (error) {
+				ctx.ui.notify(`Could not save ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+				return false;
+			}
+		};
+		// The views render as overlays on top of the chat, so the chat layout
+		// and its scroll position are untouched while they are open (closing a
+		// view no longer disturbs where the chat was scrolled). One overlay
+		// hosts both stages (home view, task view) and swaps between them
+		// without closing: closing between stages would let the chat behind
+		// flash for a frame. Both stages use the todos view's layout: the
+		// list is pinned to the top, the key hints sit on the bottom line,
+		// and the lines in between are blank so the chat behind is blacked
+		// out; both size to 90% of terminal height so the status footer
+		// stays visible.
+		const OVERLAY_MAX_HEIGHT = '90%';
+		const viewHeight = () => Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9));
+		// The backlog instance the view currently renders; refreshed from
+		// disk on every home round (a task-view round may have renamed or
+		// added lists).
+		let source: Backlog = initial;
+		await ctx.ui.custom((tui, theme, _keybindings, done) => {
+			// The stage currently rendered. Swapping stages does not close
+			// the overlay, so the chat behind never flashes through.
+			let stage: RalphHome | TodosView | undefined;
+			const showStage = (next: RalphHome | TodosView) => {
+				stage?.dispose();
+				stage = next;
+				tui.requestRender();
+			};
+			const showView = (category?: string) => {
+				showStage(
+					createTodosView({
+						backlog: source,
+						tui,
+						title,
+						category,
+						theme,
+						height: viewHeight,
+						requestRender: () => tui.requestRender(),
+						onClose: () => done('quit'),
+						onBack: () => showHome(),
+						reload: loadBacklog,
+						mutate: persist,
+						onStartLoop: (loopCategory) => {
+							void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory, goal: false });
+						}
+					})
+				);
+			};
+			const showHome = () => {
+				const fresh = loadBacklog();
+				if (fresh) source = fresh;
+				showStage(
+					createRalphHome({
+						backlog: source,
+						tui,
+						title,
+						theme,
+						height: viewHeight,
+						requestRender: () => tui.requestRender(),
+						onClose: () => done(undefined),
+						reload: loadBacklog,
+						mutate: persist,
+						onOpenList: (category) => showView(category),
+						onStartGoalLoop: () => {
+							void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, goal: true });
+						}
+					})
+				);
+			};
+			showHome();
+			return {
+				render: (width: number) => stage?.render(width) ?? [],
+				handleInput: (data: string) => stage?.handleInput(data),
+				invalidate: () => stage?.invalidate(),
+				dispose: () => stage?.dispose()
+			};
+		}, { overlay: true, overlayOptions: { width: '100%', maxHeight: OVERLAY_MAX_HEIGHT } });
+	};
+
 	pi.registerCommand('ralph', {
-		description: 'Start or manage the Ralph loop: [start|import|todos|stop|resume|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|resume|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
 					value: 'start',
 					label: 'start',
-					description: 'Defaults: SPEC.md and TODO.ralph. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>. Markdown TODOs must be imported first: /ralph import TODO.md.'
+					description: 'Defaults: SPEC.md and TODO.ralph. Override either with --spec <file> or --todo <file>; scope a ralph-format backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into TODO.ralph, merging into an existing backlog. Each source file is only imported once.' },
-				{ value: 'todos', label: 'todos', description: 'Show the backlog in an interactive list: /ralph todos [file] (defaults to the active loop’s backlog). In the list picker: enter: open, R: rename, q: quit. In the view: a/A add and e edit open a popup form (jk/↑↓ or tab: field, enter: edit/confirm field, ctrl+s: save, esc: cancel), x delete, R rename list, s start a loop on the list, q quit.' },
+				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md> [--todo <backlog>]. The first non-empty line (optionally an H1 heading) is the title, the rest is the body. Targets the active loop’s backlog or TODO.ralph. Replaces an open goal; a claimed or done goal must be resolved first.' },
 				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration.' },
 				{ value: 'resume', label: 'resume', description: 'Resume a paused loop (Escape pauses it).' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
@@ -2073,190 +2857,60 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (command === 'status') {
+				const loopName = state?.mode === 'goal' ? 'Ralph goal loop' : 'Ralph loop';
 				ctx.ui.notify(
 					!state?.enabled
-						? 'Ralph loop is stopped'
+						? `${loopName} is stopped`
 						: state.blocked
-							? `Ralph loop is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
+							? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
 							: state.paused
-								? 'Ralph loop is paused — /ralph resume to continue'
+								? `${loopName} is paused — /ralph resume to continue`
 								: state.rotationCheckpointing
 									? state.rotationReason === 'completed-task'
-										? 'Ralph loop is recording the completed task’s progress'
-										: 'Ralph loop is recording a durable context checkpoint'
+										? `${loopName} is recording the completed task’s progress`
+										: `${loopName} is recording a durable context checkpoint`
 									: state.stopRequested
-										? 'Ralph loop will stop after the current iteration'
+										? `${loopName} will stop after the current iteration`
 										: state.rotationQueued
-											? 'Ralph loop is starting a fresh iteration'
-											: `Ralph loop is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}`,
+											? `${loopName} is starting a fresh iteration`
+											: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}`,
 					'info'
 				);
 				return;
 			}
-			if (command && command !== 'start' && command !== 'import' && command !== 'todos') {
-				ctx.ui.notify('Usage: /ralph [start|import|todos|stop|resume|status|config]', 'warning');
-				return;
-			}
-			if (command === 'todos') {
-				const fileArg = commandArgs.slice(1)[0];
+			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'resume', 'status', 'config'];
+			if (command !== '' && !knownCommands.includes(command)) {
+				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('/ralph todos requires TUI mode', 'error');
-					return;
-				}
-				// Source: the active loop's backlog, else an explicit file, else the
-				// conventional names in the project root.
-				const candidates = state?.enabled
-					? [state.todoPath]
-					: fileArg
-						? [resolveProjectFile(ctx.cwd, fileArg)].filter((p): p is string => p !== undefined)
-						: [resolve(ctx.cwd, DEFAULT_TODO), resolve(ctx.cwd, 'TODO.md')];
-				let todoPath: string | undefined;
-				for (const candidate of candidates) {
-					if (candidate && (await pathExists(candidate))) {
-						todoPath = candidate;
-						break;
-					}
-				}
-				if (!todoPath) {
 					ctx.ui.notify(
-						fileArg
-							? `Could not read ${fileArg}`
-							: 'No backlog found: start a loop or pass a file (e.g. /ralph todos TODO.ralph)',
+						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|resume|status|config]`,
 						'error'
 					);
 					return;
 				}
-				const title = relative(ctx.cwd, todoPath) || todoPath;
-				const loadBacklog = (): Backlog | undefined => {
-					try {
-						const text = readFileSync(todoPath!, 'utf8');
-						// The view only renders ralph-format backlogs; Markdown
-						// backlogs must be imported first (see below).
-						return isRalphBacklog(text) ? Backlog.parse(text) : undefined;
-					} catch {
-						return undefined;
-					}
-				};
-				let initial: Backlog | undefined;
-				try {
-					const text = readFileSync(todoPath, 'utf8');
-					if (!isRalphBacklog(text)) {
-						ctx.ui.notify('Todo entries empty. Import data with /ralph import', 'info');
-						return;
-					}
-					initial = Backlog.parse(text);
-				} catch {
-					initial = undefined;
-				}
-				if (!initial) {
-					ctx.ui.notify(`Could not parse ${todoPath} as a Ralph backlog`, 'error');
+				await openHome(ctx, commandArgs[0]);
+				return;
+			}
+			if (command === '') {
+				if (ctx.mode !== 'tui') {
+					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|resume|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
 					return;
 				}
-				// An active loop already scopes the view to its category; otherwise
-				// let the user choose a list (category) when the backlog has any.
-				// Escape from a list goes back to this overview.
-				const hasPicker = initial.categories().length > 0;
-				// The views render as overlays on top of the chat, so the chat layout
-				// and its scroll position are untouched while they are open (closing a
-				// view no longer disturbs where the chat was scrolled). One overlay
-				// hosts both stages (list picker, task view) and swaps between them
-				// without closing: closing between stages would let the chat behind
-				// flash for a frame. Both stages use the todos view's layout: the
-				// list is pinned to the top, the key hints sit on the bottom line,
-				// and the lines in between are blank so the chat behind is blacked
-				// out; both size to 90% of terminal height so the status footer
-				// stays visible.
-				const OVERLAY_MAX_HEIGHT = '90%';
-				const viewHeight = () => Math.max(10, Math.floor((process.stdout.rows ?? 40) * 0.9));
-				let viewCategory = state?.enabled ? state.category : undefined;
-				// The backlog instance the view currently renders; refreshed from
-				// disk on every picker round (a view round may have renamed or
-				// added lists).
-				let source: Backlog = initial;
-				await ctx.ui.custom((tui, theme, _keybindings, done) => {
-					// The stage currently rendered. Swapping stages does not close
-					// the overlay, so the chat behind never flashes through.
-					let stage: ListPicker | TodosView | undefined;
-					const showStage = (next: ListPicker | TodosView) => {
-						stage?.dispose();
-						stage = next;
-						tui.requestRender();
-					};
-					const showView = () => {
-						showStage(
-							createTodosView({
-								backlog: source,
-								tui,
-								title,
-								category: viewCategory,
-								theme,
-								height: viewHeight,
-								requestRender: () => tui.requestRender(),
-								onClose: () => done('quit'),
-								onBack: hasPicker ? () => showPicker() : undefined,
-								reload: loadBacklog,
-								mutate: async (backlog, fn) => {
-									try {
-										fn(backlog);
-									} catch (error) {
-										ctx.ui.notify(`Could not update ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
-										return false;
-									}
-									try {
-										await writeFile(todoPath, backlog.render());
-										return true;
-									} catch (error) {
-										ctx.ui.notify(`Could not save ${title}: ${error instanceof Error ? error.message : String(error)}`, 'error');
-										return false;
-									}
-								},
-								onStartLoop: (loopCategory) => {
-									void startLoop(ctx, { specFile: DEFAULT_SPEC, todoFile: title, category: loopCategory });
-								}
-							})
-						);
-					};
-					const showPicker = () => {
-						const fresh = loadBacklog();
-						if (fresh) source = fresh;
-						const lists = source.categories().map((name) => {
-							const counts = source.counts(name);
-							return { name, open: counts.open, total: counts.total };
-						});
-						showStage(
-							createListPicker({
-								title,
-								lists,
-								theme,
-								height: viewHeight,
-								requestRender: () => tui.requestRender(),
-								onOpen: (name) => {
-									viewCategory = name;
-									showView();
-								},
-								onClose: () => done(undefined),
-								onRename: async (oldName, newName) => {
-									try {
-										const target = loadBacklog() ?? source;
-										target.renameCategory(oldName, newName);
-										await writeFile(todoPath, target.render());
-										return true;
-									} catch {
-										return false;
-									}
-								}
-							})
-						);
-					};
-					if (viewCategory === undefined && hasPicker) showPicker();
-					else showView();
-					return {
-						render: (width: number) => stage?.render(width) ?? [],
-						handleInput: (data: string) => stage?.handleInput(data),
-						invalidate: () => stage?.invalidate(),
-						dispose: () => stage?.dispose()
-					};
-				}, { overlay: true, overlayOptions: { width: '100%', maxHeight: OVERLAY_MAX_HEIGHT } });
+				await openHome(ctx);
+				return;
+			}
+			if (command === 'set-goal') {
+				const setGoalArgs = parseSetGoalArgs(commandArgs.slice(1));
+				if (!setGoalArgs) {
+					ctx.ui.notify('Usage: /ralph set-goal <goal-file> [--todo <backlog-file>]', 'warning');
+					return;
+				}
+				if (!ctx.isIdle()) {
+					ctx.ui.notify('Wait for the current agent run to finish before setting the goal', 'warning');
+					return;
+				}
+				const outcome = await setGoalFromFile(ctx.cwd, state, setGoalArgs);
+				ctx.ui.notify(outcome.message, outcome.level);
 				return;
 			}
 			if (command === 'import') {
@@ -2300,7 +2954,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const startFiles = parseStartFiles(commandArgs.slice(1));
 			if (!startFiles) {
-				ctx.ui.notify('Usage: /ralph start [--spec file] [--todo file] [--category name]', 'warning');
+				ctx.ui.notify('Usage: /ralph start [--spec file] [--todo file] [--category name] [--goal]', 'warning');
 				return;
 			}
 			await startLoop(ctx, startFiles);
@@ -2328,7 +2982,7 @@ export default function (pi: ExtensionAPI) {
 			let currentTodo: string;
 			try {
 				currentTodo = await readRequiredFile(state.todoPath);
-				taskCount = countTodoTasks(currentTodo, state?.category);
+				refreshCounts(currentTodo, state?.category);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Ralph loop could not create a fresh session: ${message}`, 'error');
@@ -2342,7 +2996,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (isBacklogFinished(currentTodo, state?.category)) {
+			// Goal mode is done when the goal is done, not when the plan is
+			// exhausted: an empty plan is the planning state.
+			if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}

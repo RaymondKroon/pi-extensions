@@ -15,23 +15,31 @@
 // shares one floating popup: a full-width bordered box, centered over the
 // cleared body area, with its key hint attached below the box. The body
 // editor floats the same way but keeps the dimmed list visible behind it.
-// The add/edit form's fields (title, done, body) are edited in
-// place: jk/arrows or tab navigate the fields, enter edits the focused
-// field (it toggles Done), enter confirms a field, and Ctrl+S saves (Esc
-// cancels). The body field is edited in place in the same popup with the
-// built-in multi-line Editor (word wrap, undo, kill ring): enter inserts a
-// newline, Ctrl+S saves the body back into the form, Esc returns to the
-// read-only preview. Title entry is inline — the host's dialog components
-// would replace the container that hosts this view.
+// The popup machinery (the box, the form/confirm/input/reason/editor
+// modes, and the footer layout) lives in view-kit.ts, shared with the
+// home view; this view owns the browse rendering, scrolling, and the
+// task mutations the popups trigger.
 
-import { Editor, Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
 import { Backlog, type Task } from './backlog.ts';
+import {
+	ARROW_DOWN,
+	ARROW_UP,
+	createModeController,
+	dimmedTheme,
+	ESCAPE,
+	layoutFooter,
+	PAGE_DOWN,
+	PAGE_UP,
+	renderModeBody,
+	type FormMode,
+	type RalphViewTheme
+} from './view-kit.ts';
 
 /** The subset of the pi theme the view needs (fg/bold are stable API). */
-export interface TodosViewTheme {
-	fg: (color: 'dim' | 'accent', text: string) => string;
-	bold: (text: string) => string;
-}
+export type TodosViewTheme = RalphViewTheme;
+
+export { layoutFooter } from './view-kit.ts';
 
 interface TaskRow {
 	kind: 'task';
@@ -49,67 +57,6 @@ interface DetailRow {
 
 type Row = TaskRow | DetailRow;
 
-/** Single-line text entry (list rename). */
-interface InputMode {
-	kind: 'input';
-	label: string;
-	input: Input;
-	onValue: (value: string) => void;
-}
-
-/** A single-line reason prompt (done/reopen), shown as a bordered popup. */
-interface ReasonMode {
-	kind: 'reason';
-	label: string;
-	input: Input;
-	onValue: (value: string) => void;
-}
-
-/** A single-line form field backed by an Input component. */
-interface FormField {
-	label: string;
-	input: Input;
-}
-
-/**
- * The add/edit task form, shown as a bordered popup dialog. It opens in a
- * read-only state; enter starts editing. title is a single-line field and
- * body a multi-line buffer. focus indexes the fields in the order
- * [Title, Body]. Done is not edited here: space toggles it (with a reason).
- * The task's list (category) is fixed and never editable.
- */
-interface FormMode {
-	kind: 'form';
-	title: string;
-	fields: FormField[];
-	body: string[];
-	focus: number;
-	/** True while the focused single-line field (title) is being edited. */
-	editing: boolean;
-	/** Set when editing an existing task. */
-	taskId?: number;
-	/** Fixed list the new task is added to (never editable in the form). */
-	category?: string;
-}
-
-/** A yes/no confirmation (delete, start loop). */
-interface ConfirmMode {
-	kind: 'confirm';
-	message: string;
-	onYes: () => void;
-	onNo: () => void;
-}
-
-/** Body editing inside the form popup with the built-in Editor component. */
-interface EditorMode {
-	kind: 'editor';
-	/** The form to return to when the body is saved or cancelled. */
-	form: FormMode;
-	editor: Editor;
-}
-
-type Mode = { kind: 'browse' } | InputMode | ReasonMode | FormMode | ConfirmMode | EditorMode;
-
 export interface TodosViewOptions {
 	backlog: Backlog;
 	/** The host TUI (used to construct the built-in Editor for body editing). */
@@ -122,7 +69,7 @@ export interface TodosViewOptions {
 	/**
 	 * Total view height in lines (header + body + footer). When provided the
 	 * body is a scroll window padded with blank lines up to the full height (so
-	 * the overlay blacks out the chat behind it, like the list picker); when
+	 * the overlay blacks out the chat behind it, like the home view); when
 	 * omitted every row is rendered (tests).
 	 * A function so the host can track terminal resizes.
 	 */
@@ -145,39 +92,12 @@ export interface TodosViewOptions {
 	onStartLoop?: (category?: string) => void | Promise<void>;
 }
 
-const ARROW_UP = '\x1b[A';
-const ARROW_DOWN = '\x1b[B';
-const PAGE_UP = '\x1b[5~';
-const PAGE_DOWN = '\x1b[6~';
-const ESCAPE = '\x1b';
-const ENTER_KEYS = ['\r', '\n'];
-
-
 /** Today's date as YYYY-MM-DD (local time), for completion log entries. */
 const todayDate = (): string => {
 	const now = new Date();
 	const month = String(now.getMonth() + 1).padStart(2, '0');
 	const day = String(now.getDate()).padStart(2, '0');
 	return `${now.getFullYear()}-${month}-${day}`;
-}
-/**
- * Lay out footer key-hint segments: one line when they fit, otherwise split
- * as evenly as possible onto two lines so neither line overflows.
- */
-export function layoutFooter(segments: string[], width: number, dim: (text: string) => string): string[] {
-	const joined = segments.join(' · ');
-	if (visibleWidth(joined) <= width) return [dim(joined)];
-	const first: string[] = [];
-	const second: string[] = [];
-	const half = Math.floor(visibleWidth(joined) / 2);
-	for (const segment of segments) {
-		if (first.length === 0 || visibleWidth([...first, segment].join(' · ')) <= half) first.push(segment);
-		else second.push(segment);
-	}
-	return [
-		truncateToWidth(dim(first.join(' · ')), width),
-		truncateToWidth(dim(second.join(' · ')), width)
-	];
 }
 
 export interface TodosView {
@@ -207,29 +127,12 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 	let category: string | undefined = options.category;
 	// Transient feedback for the last mutation, cleared on the next key.
 	let notice: string | undefined;
-	let mode: Mode = { kind: 'browse' };
-	// The host theme, swapped for a dimmed variant while the reason popup is
-	// open so the list behind it recedes.
+	// The host theme, swapped for a dimmed variant while a popup is open so
+	// the list behind it recedes.
 	let theme = options.theme;
-	// True while the reason popup is open: every list line is dimmed, not
-	// just the segments the theme colors.
+	// True while a popup is open: every list line is dimmed, not just the
+	// segments the theme colors.
 	let dimmed = false;
-	const dimTheme: TodosViewTheme = {
-		fg: (_color, text) => options.theme.fg('dim', text),
-		bold: (text) => options.theme.fg('dim', text)
-	};
-	// Theme for the built-in Editor used by the body editor. Autocomplete is
-	// never enabled, so the select-list functions are never called.
-	const editorTheme = {
-		borderColor: (text: string) => options.theme.fg('dim', text),
-		selectList: {
-			selectedPrefix: (text: string) => text,
-			selectedText: (text: string) => text,
-			description: (text: string) => text,
-			scrollInfo: (text: string) => text,
-			noMatch: (text: string) => text
-		}
-	};
 	const expanded = new Set<number>();
 
 	// Scroll layout of the current rows: the start line of every row plus the
@@ -369,58 +272,6 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 		}
 	};
 
-	const beginInput = (label: string, initial: string, onValue: (value: string) => void) => {
-		const input = new Input();
-		// Feed the initial value through Input so its edit cursor starts at the end.
-		if (initial !== '') input.handleInput(initial);
-		// The view (not the Input) holds TUI focus; keep the edit cursor visible.
-		input.focused = true;
-		mode = { kind: 'input', label, input, onValue };
-		options.requestRender();
-	};
-
-	/** Open the bordered reason popup (done/reopen) with an empty single-line input. */
-	const beginReason = (label: string, onValue: (value: string) => void) => {
-		const input = new Input();
-		// The view (not the Input) holds TUI focus; keep the edit cursor visible.
-		input.focused = true;
-		mode = { kind: 'reason', label, input, onValue };
-		options.requestRender();
-	};
-
-	const makeFormField = (label: string, initial: string): FormField => {
-		const input = new Input();
-		if (initial !== '') input.handleInput(initial);
-		input.focused = true;
-		return { label, input };
-	};
-
-	/** Open the add/edit form, prefilled from the task (edit) or ambient scope (add). */
-	const beginForm = (init: { title: string; task?: Task; category?: string }) => {
-		const task = init.task;
-		mode = {
-			kind: 'form',
-			title: init.title,
-			fields: [makeFormField('Title', task?.title ?? '')],
-			body: (task?.body ?? '').split('\n'),
-			focus: 0,
-			editing: false,
-			taskId: task?.id,
-			category: init.category
-		};
-		options.requestRender();
-	};
-
-	/** Open the body editor (built-in Editor) for the form's body. */
-	const openBodyEditor = (form: FormMode) => {
-		const editor = new Editor(options.tui, editorTheme);
-		editor.disableSubmit = true; // enter inserts a newline; ctrl+s saves
-		editor.focused = true; // emit the hardware-cursor marker for IME
-		editor.setText(form.body.join('\n'));
-		mode = { kind: 'editor', form, editor };
-		options.requestRender();
-	};
-
 	/** Save the form: apply the fields to the backlog, staying open on failure. */
 	const saveForm = (form: FormMode) => {
 		const values = {
@@ -443,23 +294,18 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 							body: values.body
 						});
 					} else {
-						newId = b
-							.addTask(
-								{
-									title: values.title,
-									body: values.body === '' ? undefined : values.body,
-									category: form.category
-								},
-								category
-							)
-							.id;
+						newId = b.addTask({
+							title: values.title,
+							body: values.body === '' ? undefined : values.body,
+							category: form.category
+						}).id;
 					}
 				});
 			} catch {
 				ok = false;
 			}
 			if (ok) {
-				mode = { kind: 'browse' };
+				modes.setMode({ kind: 'browse' });
 				notice = 'saved';
 				state = rebuild();
 				if (form.taskId !== undefined) focusTaskId(form.taskId);
@@ -472,6 +318,15 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 			options.requestRender();
 		})();
 	};
+
+	// The popup modes (input, reason, form, confirm, editor) are owned by the
+	// shared view kit; the view persists form saves through saveForm.
+	const modes = createModeController({
+		tui: options.tui,
+		theme: options.theme,
+		requestRender: options.requestRender,
+		onSaveForm: saveForm
+	});
 
 	// --- rendering -------------------------------------------------------------
 
@@ -551,124 +406,6 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 		}
 	};
 
-	// --- popups ------------------------------------------------------------------
-
-	/** Content width of a popup box: as wide as the list. */
-	const popupInnerWidth = (width: number): number => Math.max(20, width - 6);
-
-	/**
-	 * The shared popup box: bordered, left-aligned with the list entries
-	 * (2-space indent), with the key hint attached below the bottom border.
-	 * Every floating mode (reason, form, confirm, input) renders through this.
-	 */
-	const popupBox = (width: number, title: string, content: string[], hint: string): string[] => {
-		const innerWidth = popupInnerWidth(width);
-		const padTo = (text: string, w: number): string => {
-			const vw = visibleWidth(text);
-			return vw >= w ? truncateToWidth(text, w, '…') : text + ' '.repeat(w - vw);
-		};
-		const borderLine = (fill: string): string => '  ' + fill;
-		const contentLine = (text: string): string =>
-			borderLine('│ ' + padTo(text, innerWidth - 2) + ' │');
-		// The title sits in the top border; the rest of the line stays a
-		// solid border line (at least one cell before the corner).
-		const titlePart = truncateToWidth(` ${title}`, innerWidth - 1, '…');
-		return [
-			borderLine('┌' + titlePart + '─'.repeat(innerWidth - visibleWidth(titlePart)) + '┐'),
-			...content.map(contentLine),
-			borderLine('└' + '─'.repeat(innerWidth) + '┘'),
-			// Key hint attached to the popup, not in the view footer.
-			borderLine(options.theme.fg('dim', hint))
-		];
-	};
-
-	/** The focused Input's line, without its "> " prompt, sized for the box. */
-	const inputPromptLine = (input: Input, width: number): string =>
-		(input.render(Math.max(1, popupInnerWidth(width) - 2))[0] ?? '').slice(2);
-
-	/**
-	 * The popup content for the current mode: every mode returns a popupBox
-	 * (the editor mode embeds the body editor in the form box). maxHeight
-	 * windows the form's body preview so the box fits the body area.
-	 */
-	const modeBodyLines = (width: number, maxHeight?: number): string[] => {
-		if (mode.kind === 'input') {
-			return popupBox(width, options.theme.bold(mode.label), [inputPromptLine(mode.input, width)], 'enter: save · esc: cancel');
-		}
-		if (mode.kind === 'reason') {
-			return popupBox(width, options.theme.bold(mode.label), [inputPromptLine(mode.input, width)], 'enter: save · esc: cancel');
-		}
-		if (mode.kind === 'form') {
-			const form = mode;
-			const labelWidth = 10;
-			const innerWidth = popupInnerWidth(width);
-			const content: string[] = [];
-			form.fields.forEach((field, index) => {
-				const focused = form.focus === index;
-				const editingField = focused && form.editing;
-				const label = focused ? options.theme.bold(`${field.label}:`) : options.theme.fg('dim', `${field.label}:`);
-				const value = editingField
-					? (field.input.render(Math.max(1, innerWidth - 2 - labelWidth))[0] ?? '').slice(2) // drop Input's "> " prompt
-					: field.input.getValue();
-				content.push(label.padEnd(labelWidth) + value);
-			});
-			const bodyIndex = form.fields.length;
-			const bodyFocused = form.focus === bodyIndex;
-			const bodyLabel = bodyFocused ? options.theme.bold('Body:') : options.theme.fg('dim', 'Body:');
-			content.push(bodyLabel.padEnd(labelWidth));
-			// Word-wrap the body preview (read-only — enter opens the
-			// body editor) so long lines are readable; the box height
-			// budgets the wrapped lines so the whole box (title,
-			// fields, border, hint) fits the available height.
-			const bodyIndent = '   ';
-			const wrappedBody = form.body.map((line) =>
-				wrapTextWithAnsi(line, Math.max(1, innerWidth - 2 - bodyIndent.length))
-			);
-			const fixedLines = form.fields.length + 3; // title, body label, bottom border
-			const budget = maxHeight === undefined ? undefined : Math.max(1, maxHeight - fixedLines - 1);
-			let used = 0;
-			for (const wrapped of wrappedBody) {
-				for (const line of wrapped) {
-					if (budget !== undefined && used >= budget) break;
-					const bodyLine = bodyIndent + line;
-					content.push(bodyFocused ? bodyLine : options.theme.fg('dim', bodyLine));
-					used += 1;
-				}
-				if (budget !== undefined && used >= budget) break;
-			}
-			const hint = !form.editing
-				? form.focus === form.fields.length
-					? 'enter: edit body · tab/↑↓: field · ctrl+s: save · esc: cancel'
-					: 'jk/↑↓: field · enter: edit · ctrl+s: save · esc: cancel'
-				: 'enter: confirm · tab/↑↓: field · ctrl+s: save · esc: cancel';
-			return popupBox(width, options.theme.bold(form.title), content, hint);
-		}
-		if (mode.kind === 'confirm') {
-			return popupBox(width, options.theme.bold('Confirm'), [mode.message], 'y: yes · n/esc: no');
-		}
-		if (mode.kind === 'editor') {
-			// The body editor lives inside the form popup: the box stays, and
-			// the editor replaces the body preview. The editor keeps its own
-			// top/bottom borders (with scroll indicators) as the frame of the
-			// editable region, indented like the body preview.
-			const form = mode.form;
-			const labelWidth = 10;
-			const innerWidth = popupInnerWidth(width);
-			const content: string[] = [];
-			const titleField = form.fields[0]!;
-			content.push(options.theme.fg('dim', 'Title:').padEnd(labelWidth) + titleField.input.getValue());
-			content.push(options.theme.fg('dim', 'Body:').padEnd(labelWidth));
-			const bodyIndent = '   ';
-			const editorLines = mode.editor
-				.render(Math.max(1, innerWidth - 2 - bodyIndent.length))
-				.map((line) => bodyIndent + line);
-			content.push(...editorLines);
-			return popupBox(width, options.theme.bold(form.title), content, 'enter: newline · ctrl+s: save body · esc: back to form');
-		}
-		return [];
-	};
-
-
 	// The browse view: header + visible body window + footer. When a height is
 	// configured the body is a scroll window sized so the total never exceeds
 	// the popup height (the overlay would otherwise clip the footer).
@@ -707,7 +444,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 				body.push(...lines.slice(0, fit));
 			}
 			// Pad the remainder with blank lines so the overlay blacks out the
-			// chat behind it even for short lists (the list picker does the same).
+			// chat behind it even for short lists (the home view does the same).
 			const total = options.height?.();
 			if (total !== undefined) {
 				const target = total - 1 - footer.length;
@@ -730,7 +467,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 	 */
 	const compositePopup = (width: number, makePopup: (maxHeight: number) => string[], blankBody: boolean): string[] => {
 		dimmed = true;
-		theme = dimTheme;
+		theme = dimmedTheme(options.theme);
 		const lines = browseLines(width);
 		dimmed = false;
 		theme = options.theme;
@@ -772,18 +509,15 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 		cursor: () => cursor,
 		scrollTop: () => scrollTop,
 		expandedIds: () => [...expanded],
-		mode: () => mode.kind,
+		mode: () => modes.mode().kind,
 		render(width: number): string[] {
-			if (mode.kind === 'browse') return browseLines(width);
+			if (modes.mode().kind === 'browse') return browseLines(width);
 			// reason / form / confirm / input / editor: the popup floats centered
 			// over a cleared body so the box and its key hint stand out.
-			return compositePopup(width, (maxHeight) => modeBodyLines(width, maxHeight), true);
+			return compositePopup(width, (maxHeight) => renderModeBody(width, modes.mode(), options.theme, maxHeight), true);
 		},
 		handleInput(data: string): void {
-			if (mode.kind !== 'browse') {
-				handleModeInput(data);
-				return;
-			}
+			if (modes.handleInput(data)) return;
 			notice = undefined;
 			if (data === 'q') {
 				options.onClose();
@@ -846,7 +580,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 				const done = !task.done;
 				// Check when completing, cross when reopening (opening).
 				const marker = done ? '✓' : '✗';
-				beginReason(
+				modes.beginReason(
 					`${marker} ${done ? 'Complete' : 'Reopen'} task ${number} — reason:`,
 					(value) => {
 						const reason = value.trim();
@@ -905,25 +639,24 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 				}
 			} else if (data === 'a') {
 				if (!options.mutate) return;
-				beginForm({ title: 'New task', category: category ?? undefined });
+				modes.beginForm({ title: 'New task', category: category ?? undefined });
 			} else if (data === 'e') {
 				if (!options.mutate) return;
 				const task = state.tasks[cursor];
 				if (!task) return;
-				beginForm({ title: `Edit ${state.numbers.get(task.id) ?? task.id} ${task.title}`, task });
+				modes.beginForm({ title: `Edit ${state.numbers.get(task.id) ?? task.id} ${task.title}`, task });
 			} else if (data === 'x') {
 				if (!options.mutate) return;
 				const task = state.tasks[cursor];
 				if (!task) return;
-				mode = {
+				modes.setMode({
 					kind: 'confirm',
 					message: `Delete task ${state.numbers.get(task.id) ?? task.id} "${task.title}"?`,
 					onYes: () => {
 						void applyMutation((b) => b.deleteTaskById(task.id));
 					},
 					onNo: () => {}
-				};
-				options.requestRender();
+				});
 			} else if (data === 'J' || data === 'K') {
 				if (!options.mutate) return;
 				const task = state.tasks[cursor];
@@ -946,7 +679,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 			} else if (data === 'R') {
 				if (!options.mutate || category === undefined) return;
 				const oldName = category;
-				beginInput('Rename list', oldName, (value) => {
+				modes.beginInput('Rename list', oldName, (value) => {
 					const name = value.trim();
 					if (!name) return;
 					void (async () => {
@@ -971,7 +704,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 			} else if (data === 's') {
 				if (!options.onStartLoop) return;
 				const scope = category ? `list "${category}"` : 'the whole backlog';
-				mode = {
+				modes.setMode({
 					kind: 'confirm',
 					message: `Start a Ralph loop on ${scope}?`,
 					onYes: () => {
@@ -979,8 +712,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 						void options.onStartLoop?.(category);
 					},
 					onNo: () => {}
-				};
-				options.requestRender();
+				});
 			} else {
 				return;
 			}
@@ -993,140 +725,6 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 			// Rows are derived on demand; reloading from disk is explicit (r).
 		},
 		dispose(): void {}
-	};
-
-	// --- inline input modes ------------------------------------------------------
-
-	/**
-	 * Body editor input: esc returns to the form without saving, ctrl+s saves
-	 * the body back into the form, enter inserts a newline (the built-in
-	 * Editor treats enter as submit, which is disabled); everything else is
-	 * delegated to the Editor (cursor, wrapping, undo, kill ring, paste).
-	 */
-	const handleEditorInput = (data: string): void => {
-		if (mode.kind !== 'editor') return;
-		const { form, editor } = mode;
-		if (data === ESCAPE) {
-			mode = form;
-			options.requestRender();
-			return;
-		}
-		if (matchesKey(data, Key.ctrl('s'))) {
-			// matchesKey covers legacy and Kitty-protocol encodings.
-			form.body = editor.getExpandedText().split('\n');
-			form.editing = false;
-			mode = form;
-			options.requestRender();
-			return;
-		}
-		if (ENTER_KEYS.includes(data)) {
-			editor.insertTextAtCursor('\n');
-			options.requestRender();
-			return;
-		}
-		editor.handleInput(data);
-		options.requestRender();
-	};
-
-	const handleModeInput = (data: string): void => {
-		if (mode.kind === 'input' || mode.kind === 'reason') {
-			if (data === ESCAPE) {
-				mode = { kind: 'browse' };
-				options.requestRender();
-				return;
-			}
-			if (ENTER_KEYS.includes(data)) {
-				const current = mode;
-				const value = current.input.getValue();
-				mode = { kind: 'browse' };
-				options.requestRender();
-				current.onValue(value);
-				return;
-			}
-			mode.input.handleInput(data);
-			options.requestRender();
-			return;
-		}
-		if (mode.kind === 'form') {
-			const form = mode;
-			if (data === ESCAPE || data === 'q') {
-				mode = { kind: 'browse' };
-				options.requestRender();
-				return;
-			}
-			if (matchesKey(data, Key.ctrl('s'))) {
-				saveForm(form);
-				return;
-			}
-			const fieldCount = form.fields.length + 1; // + Body
-			const onBody = form.focus === fieldCount - 1;
-			// Moving between fields always confirms any in-progress field edit.
-			const move = (delta: number) => {
-				form.editing = false;
-				form.focus = Math.max(0, Math.min(fieldCount - 1, form.focus + delta));
-				form.fields.forEach((field, index) => {
-					field.input.focused = form.focus === index;
-				});
-				options.requestRender();
-			};
-			if (!form.editing) {
-				// Read-only: navigate the fields; enter edits the focused one
-				// (opens the body editor or edits the title).
-				if (data === 'j' || data === ARROW_DOWN || data === '\t') {
-					move(1);
-					return;
-				}
-				if (data === 'k' || data === ARROW_UP || data === '\x1b[Z') {
-					move(-1);
-					return;
-				}
-				if (ENTER_KEYS.includes(data)) {
-					if (onBody) openBodyEditor(form);
-					else form.editing = true;
-					options.requestRender();
-				}
-				return;
-			}
-			// Editing the focused single-line field (Body opens the editor from
-			// the read-only state, so only the title reaches the editing state).
-			const field = form.fields[form.focus];
-			if (!field) return;
-			if (ENTER_KEYS.includes(data)) {
-				form.editing = false; // confirm the field, stay on it
-				options.requestRender();
-				return;
-			}
-			if (data === '\t' || data === ARROW_DOWN) {
-				move(1);
-				return;
-			}
-			if (data === '\x1b[Z' || data === ARROW_UP) {
-				move(-1);
-				return;
-			}
-			field.input.handleInput(data);
-			options.requestRender();
-			return;
-		}
-		if (mode.kind === 'confirm') {
-			const current = mode;
-			if (data === 'y' || ENTER_KEYS.includes(data)) {
-				mode = { kind: 'browse' };
-				options.requestRender();
-				current.onYes();
-				return;
-			}
-			if (data === 'n' || data === ESCAPE) {
-				mode = { kind: 'browse' };
-				options.requestRender();
-				current.onNo();
-				return;
-			}
-			return;
-		}
-		if (mode.kind === 'editor') {
-			handleEditorInput(data);
-		}
 	};
 
 	return view;
