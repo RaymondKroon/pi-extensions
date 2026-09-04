@@ -491,7 +491,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(compaction).toBeDefined();
 			expect((compaction as { fromHook?: boolean }).fromHook).toBe(true);
 			expect((compaction as { details?: { source?: string } }).details?.source).toBe('ralph-loop');
-			expect(compaction!.summary).toContain('completed tasks so far');
+			expect(compaction!.summary).toContain('progress in this loop');
 			expect(compaction!.summary).toContain('Implemented task one; changed a.ts; bun test passed.');
 			// The recording prompt, identified by its unique text (the iteration
 			// prompts mention the completion log too, and the fresh iteration
@@ -517,7 +517,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// context (the model checks its own progress with ralph_todo).
 			const freshRequest = requestText(endpoint!.requests[3]!);
 			expect(freshRequest).toContain('Start the next independent iteration');
-			expect(freshRequest).not.toContain('completed tasks so far');
+			expect(freshRequest).not.toContain('progress in this loop');
 			expect(freshRequest).not.toContain('Task one complete.');
 			expect(freshRequest).not.toContain('Progress recorded.');
 		}

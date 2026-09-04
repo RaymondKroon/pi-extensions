@@ -192,7 +192,7 @@ in one deterministic step — when **compaction mode** is enabled (config
   `[compaction]` box (tab to expand).
 - **Fresh iteration.** Only after the compaction settles (or fails) does the
   loop send, in order: the completion-summary custom message (`display: true`,
-  when there are completed tasks), the context-boundary marker
+  when the loop has completions or checkpoints yet), the context-boundary marker
   (`display: false`), and the iteration prompt. The summary deliberately lands
   **before** the boundary: the context-boundary slice (below) drops it from
   the model context, so the model checks its own progress with the
@@ -200,12 +200,17 @@ in one deterministic step — when **compaction mode** is enabled (config
   compaction (user Escape) starts no new turn; expected gate failures (below)
   proceed without the TUI clear — the boundary marker still keeps the model
   context clean.
-- **Completion summary.** Re-derived from the backlog's completion log (the
-  durable record): task number, title, date, and the log note(s); completed
-  tasks without a log entry are listed as such. It is the compaction summary
-  text and the visible custom message at the start of every iteration (first
-  iteration and each fresh iteration, before the boundary marker). No summary
-  is sent when nothing is completed yet.
+- **Completion summary.** Scoped to the current loop: re-derived by diffing
+  the backlog against the snapshot taken when the loop started (retained in
+  the loop state as `loopStartTodo`, never rotated like `baselineTodo`). It
+  lists the tasks completed in this loop (task number, title, and the
+  completion log entries added in this loop; completions without a new log
+  entry are listed as such) and the task and goal checkpoints made or changed
+  in this loop. Tasks completed before the loop started stay out. It is the
+  compaction summary text and the visible custom message at the start of each
+  fresh iteration (before the boundary marker); the first iteration sends no
+  summary. No summary is sent when the loop has no completions or checkpoints
+  yet.
 - **Model context.** After the rotation the model context is
   `[compactionSummary, retained tail, summary, boundary, prompt, …]`; the
   existing context-boundary slice drops everything before the boundary —
@@ -213,11 +218,12 @@ in one deterministic step — when **compaction mode** is enabled (config
   iteration.
 - **The keepRecentTokens gate.** pi refuses to prepare a compaction when less
   than `compaction.keepRecentTokens` (settings.json, default 20000) of content
-  would be discarded. At loop start (compaction mode on) the extension reads
-  the effective value (project overrides global) and warns when it is above
-  5000, because most iterations are then too small to hide. A gated rotation
-  degrades gracefully: the finished iteration stays visible in the TUI, the
-  model context is still clean, and the next rotation's window includes it.
+  would be discarded. A gated rotation degrades gracefully: the finished
+  iteration stays visible in the TUI, the model context is still clean, and
+  the next rotation's window includes it. The extension notifies **once per
+  loop** when a rotation compaction is actually refused ("Nothing to
+  compact"), suggesting `"compaction": { "keepRecentTokens": 1000 }` to hide
+  every rotation — there is no speculative warning at loop start.
 - **Config migration.** Saved configs without `compactionMode` (session
   entries and `.pi/ralph-loop.json` from older versions) normalize to the
   default (`true`); legacy single-threshold configs migrate the same way.

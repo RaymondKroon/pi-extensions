@@ -1,6 +1,5 @@
 import {
 	CONFIG_DIR_NAME,
-	getAgentDir,
 	getMarkdownTheme,
 	getSettingsListTheme,
 	type ExtensionAPI,
@@ -30,6 +29,7 @@ import {
 	formatSearchResults,
 	formatTaskDetail,
 	isRalphBacklog,
+	type CompletionEntry,
 	type Goal,
 	type GoalStatus
 } from './backlog.ts';
@@ -41,17 +41,10 @@ const CONFIG_TYPE = 'ralph-loop-config';
 const CONFIG_FILE_NAME = 'ralph-loop.json';
 /** Marks the beginning of an independent Ralph iteration in the same session. */
 const CONTEXT_BOUNDARY_TYPE = 'ralph-loop-context-boundary';
-/** Completion-summary message injected at the start of every Ralph iteration. */
+/** Completion-summary message injected at the start of each fresh Ralph iteration. */
 const COMPLETION_SUMMARY_TYPE = 'ralph-loop-completion-summary';
 /** Marker in a ralph-provided compaction entry's details (distinguishes it from pi's LLM compactions). */
 const COMPACTION_SOURCE = 'ralph-loop';
-/**
- * pi only prepares a compaction when at least compaction.keepRecentTokens of
- * content would be discarded (settings.json, default 20000). Above this value
- * most Ralph iterations are too small to compact, so finished iterations would
- * stay visible in the TUI; warn at loop start when the effective value is high.
- */
-const KEEP_RECENT_TOKENS_WARN_ABOVE = 5000;
 const DEFAULT_TODO = 'TODO.ralph';
 const DEFAULT_SPEC = 'SPEC.md';
 /** Generic planning document bundled with this extension for /ralph-init to adapt. */
@@ -94,6 +87,8 @@ interface RalphState {
 	mode: 'tasks' | 'goal';
 	todoPath: string;
 	specPath: string;
+	/** Backlog snapshot at the start of the current loop (never rotated). */
+	loopStartTodo: string;
 	baselineTodo: string;
 	/** 1-based count of Ralph iterations started in this session. */
 	iteration: number;
@@ -129,6 +124,7 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal') &&
 		typeof state.todoPath === 'string' &&
 		typeof state.specPath === 'string' &&
+		(state.loopStartTodo === undefined || typeof state.loopStartTodo === 'string') &&
 		typeof state.baselineTodo === 'string' &&
 		(state.iteration === undefined || (typeof state.iteration === 'number' && state.iteration >= 1)) &&
 		(state.taskIteration === undefined || (typeof state.taskIteration === 'number' && state.taskIteration >= 1)) &&
@@ -161,6 +157,7 @@ function normalizeState(state: RalphState): RalphState {
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+		loopStartTodo: state.loopStartTodo ?? state.baselineTodo,
 		rotationCheckpointing: state.rotationCheckpointing ?? false,
 		stopRequested: state.stopRequested ?? false,
 		paused: state.paused ?? false,
@@ -600,63 +597,76 @@ ${decisionNote}`;
 }
 
 /**
- * Compact summary of the completed tasks, re-derived from the backlog's
- * completion log (the durable record). Used as the text of the ralph-provided
- * compaction at each rotation and as the visible custom message injected at
- * the start of every Ralph iteration. At rotations it is sent before the
- * context boundary, so it stays in the session (audit trail, TUI) but is
- * dropped from the model context — the model checks its own progress with the
- * ralph_todo/ralph_goal tools.
+ * Compact summary of the progress made in the current loop, re-derived by
+ * diffing the backlog against the snapshot taken when the loop started:
+ * tasks completed in this loop (with the completion log entries added in this
+ * loop), tasks checkpointed in this loop, and the goal checkpoint when it
+ * changed. Tasks completed before the loop started stay out. Used as the text
+ * of the ralph-provided compaction at each rotation and as the visible custom
+ * message injected at the start of each fresh Ralph iteration. At rotations it
+ * is sent before the context boundary, so it stays in the session (audit
+ * trail, TUI) but is dropped from the model context — the model checks its own
+ * progress with the ralph_todo/ralph_goal tools.
  */
-function completionSummary(todo: string, category?: string): string | undefined {
+function completionSummary(todo: string, loopStartTodo: string, category?: string): string | undefined {
 	if (!isRalphBacklog(todo)) return undefined;
 	const backlog = Backlog.parse(todo);
-	const tasks = backlog.listTasks(category);
-	const numbers = backlog.taskNumbers(category);
-	const entriesByTask = new Map<number, Array<{ date: string | null; note: string; kind: 'done' | 'reopen' }>>();
-	for (const entry of backlog.listLogEntries()) {
-		const list = entriesByTask.get(entry.taskId) ?? [];
-		list.push(entry);
-		entriesByTask.set(entry.taskId, list);
+	const baseline = isRalphBacklog(loopStartTodo) ? Backlog.parse(loopStartTodo) : undefined;
+	const baselineDone = new Map<number, boolean>();
+	const baselineCheckpoints = new Map<number, string | null>();
+	const baselineEntryIds = new Set<number>();
+	const baselineGoalCheckpoint = baseline?.goal()?.checkpoint ?? null;
+	if (baseline) {
+		for (const task of baseline.listTasks(category)) {
+			baselineDone.set(task.id, task.done);
+			baselineCheckpoints.set(task.id, task.checkpoint);
+		}
+		for (const entry of baseline.listLogEntries()) baselineEntryIds.add(entry.id);
 	}
-	const lines: string[] = [];
-	tasks.forEach((task, index) => {
-		if (!task.done) return;
+	const newEntriesByTask = new Map<number, CompletionEntry[]>();
+	for (const entry of backlog.listLogEntries()) {
+		if (baselineEntryIds.has(entry.id)) continue;
+		const list = newEntriesByTask.get(entry.taskId) ?? [];
+		list.push(entry);
+		newEntriesByTask.set(entry.taskId, list);
+	}
+	const numbers = backlog.taskNumbers(category);
+	const completionLines: string[] = [];
+	const checkpointLines: string[] = [];
+	backlog.listTasks(category).forEach((task, index) => {
 		const number = numbers.get(task.id) ?? String(index + 1);
-		const entries = entriesByTask.get(task.id) ?? [];
-		if (entries.length === 0) {
-			lines.push(`${number}. ${task.title}: completed (no completion log entry)`);
-			return;
+		const newEntries = newEntriesByTask.get(task.id) ?? [];
+		const wasDone = baseline ? (baselineDone.get(task.id) ?? false) : false;
+		if (task.done && (!wasDone || newEntries.some((entry) => entry.kind === 'done'))) {
+			if (newEntries.length === 0) {
+				completionLines.push(`${number}. ${task.title}: completed (no completion log entry)`);
+				return;
+			}
+			const notes = newEntries
+				.map((entry) => `${entry.date ? `(${entry.date}) ` : ''}${entry.kind === 'reopen' ? 'reopened: ' : ''}${entry.note}`)
+				.join('; ');
+			completionLines.push(`${number}. ${task.title}: ${notes}`);
 		}
-		const notes = entries
-			.map((entry) => `${entry.date ? `(${entry.date}) ` : ''}${entry.kind === 'reopen' ? 'reopened: ' : ''}${entry.note}`)
-			.join('; ');
-		lines.push(`${number}. ${task.title}: ${notes}`);
+		const previousCheckpoint = baseline ? (baselineCheckpoints.get(task.id) ?? null) : null;
+		if (task.checkpoint !== null && task.checkpoint !== previousCheckpoint) {
+			checkpointLines.push(
+				`${number}. ${task.title}: checkpoint${task.checkpointIteration ? ` (iteration ${task.checkpointIteration})` : ''}: ${task.checkpoint}`
+			);
+		}
 	});
-	if (lines.length === 0) return undefined;
-	return `Ralph loop: completed tasks so far, from the completion log of the backlog (the durable record):\n\n${lines.join('\n')}`;
-}
-
-/**
- * Effective compaction.keepRecentTokens from the pi settings files (project
- * overrides global; pi's default when unset). Read from disk: the extension
- * context exposes no settings API.
- */
-function effectiveKeepRecentTokens(cwd: string): number {
-	let value = 20000;
-	const read = (path: string): number | undefined => {
-		try {
-			const parsed = JSON.parse(readFileSync(path, 'utf8')) as { compaction?: { keepRecentTokens?: unknown } };
-			return typeof parsed?.compaction?.keepRecentTokens === 'number' ? parsed.compaction.keepRecentTokens : undefined;
-		} catch {
-			return undefined;
-		}
-	};
-	const global = read(join(getAgentDir(), 'settings.json'));
-	if (global !== undefined) value = global;
-	const project = read(join(cwd, CONFIG_DIR_NAME, 'settings.json'));
-	if (project !== undefined) value = project;
-	return value;
+	const goal = backlog.goal();
+	const goalCheckpoint = goal?.checkpoint ?? null;
+	if (goalCheckpoint !== null && goalCheckpoint !== baselineGoalCheckpoint) {
+		checkpointLines.push(
+			`Goal "${goal?.title ?? ''}": checkpoint${goal?.checkpointIteration ? ` (iteration ${goal.checkpointIteration})` : ''}: ${goalCheckpoint}`
+		);
+	}
+	if (completionLines.length === 0 && checkpointLines.length === 0) return undefined;
+	const parts = [
+		completionLines.length > 0 ? `Completed in this loop:\n${completionLines.join('\n')}` : undefined,
+		checkpointLines.length > 0 ? `Checkpoints in this loop:\n${checkpointLines.join('\n')}` : undefined
+	].filter((part): part is string => part !== undefined);
+	return `Ralph loop: progress in this loop, from the backlog's completion log and checkpoints:\n\n${parts.join('\n\n')}`;
 }
 
 /**
@@ -1287,6 +1297,9 @@ export default function (pi: ExtensionAPI) {
 	// The ralph-provided compaction pending for the in-flight rotation:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
+	// Once per loop: whether the keepRecentTokens gate notification was shown
+	// (a rotation compaction refused because the iteration is too small).
+	let compactionGateNotified = false;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -2000,7 +2013,7 @@ export default function (pi: ExtensionAPI) {
 				// progress with the ralph_todo/ralph_goal tools.
 				freshIterationPending = true;
 				updateStatus(ctx);
-				const completion = completionSummary(currentTodo, next.category);
+				const completion = completionSummary(currentTodo, state.loopStartTodo, next.category);
 				const finishRotation = () => {
 					// A pause/stop/blocked decision that landed while the compaction
 					// ran must not start a new turn; the resume/stop flow continues.
@@ -2034,7 +2047,7 @@ export default function (pi: ExtensionAPI) {
 				pendingRalphCompaction = {
 					summary:
 						completion ??
-						`Ralph loop: the previous iteration ended (${reason}). No tasks are completed yet; the durable state is in the backlog and the repository.`,
+						`Ralph loop: the previous iteration ended (${reason}). No tasks have been completed or checkpointed in this loop yet; the durable state is in the backlog and the repository.`,
 					anchorId: anchor?.id
 				};
 				ctx.compact({
@@ -2054,6 +2067,16 @@ export default function (pi: ExtensionAPI) {
 						if (/abort|cancel/i.test(error.message)) {
 							ctx.ui.notify('Ralph rotation compaction was aborted; the loop continues on the next settle.', 'warning');
 							return;
+						}
+						// The iteration was too small to compact and stays visible in
+						// the TUI: say so once per loop, where the user actually
+						// notices it, instead of speculating at loop start.
+						if (!compactionGateNotified && /nothing to compact/i.test(error.message)) {
+							compactionGateNotified = true;
+							ctx.ui.notify(
+								'Ralph rotation compaction was skipped: the finished iteration is smaller than pi\'s compaction.keepRecentTokens and stays visible in the TUI. Set "compaction": { "keepRecentTokens": 1000 } in settings.json to hide every rotation.',
+								'warning'
+							);
 						}
 						finishRotation();
 					}
@@ -2130,6 +2153,7 @@ export default function (pi: ExtensionAPI) {
 				enabled: true,
 				todoPath,
 				specPath,
+				loopStartTodo: baselineTodo,
 				baselineTodo,
 				iteration: 1,
 				taskIteration: 1,
@@ -2149,20 +2173,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			persistState(next);
 			updateStatus(ctx);
-			const keepRecentTokens = effectiveKeepRecentTokens(ctx.cwd);
-			if (config.compactionMode && keepRecentTokens > KEEP_RECENT_TOKENS_WARN_ABOVE) {
-				ctx.ui.notify(
-					`Ralph hides finished iterations from the TUI via a compaction per rotation, but pi's compaction.keepRecentTokens is ${keepRecentTokens}: iterations smaller than that are too small to compact and stay visible. Set "compaction": { "keepRecentTokens": 1000 } in settings.json to hide every rotation.`,
-					'warning'
-				);
-			}
-			const summary = completionSummary(baselineTodo, category);
-			if (summary) {
-				pi.sendMessage(
-					{ customType: COMPLETION_SUMMARY_TYPE, content: summary, display: true },
-					{ triggerTurn: false, deliverAs: 'followUp' }
-				);
-			}
+			compactionGateNotified = false;
 			pi.sendUserMessage(iterationPrompt(next));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

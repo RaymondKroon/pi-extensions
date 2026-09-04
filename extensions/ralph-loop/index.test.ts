@@ -3229,6 +3229,32 @@ T 2 - "Task two"
 T 3 - "Task three"
 `;
 
+const RALPH_V2_TASKS_ONE_TWO_DONE_LOGGED = `# ralph v2
+
+T 1 - "Task one"
+D 1
+L 1 1 2026-09-04
+  Implemented task one; changed a.ts; bun test passed.
+
+T 2 - "Task two"
+D 2
+L 2 2 2026-09-05
+  Implemented task two; changed b.ts; bun test passed.
+
+T 3 - "Task three"
+`;
+
+const RALPH_V2_TASK_TWO_CHECKPOINTED = `# ralph v2
+
+T 1 - "Task one"
+
+T 2 - "Task two"
+C 2 1
+  Half done; next step: finish the tests.
+
+T 3 - "Task three"
+`;
+
 describe('ralph-loop extension (rotation compaction and completion summaries)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
@@ -3248,19 +3274,16 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fakeCtx.compactCalls).toHaveLength(0);
 	});
 
-	test('start: injects a completion summary when the backlog has completed tasks', async () => {
+	test('start: no summary for tasks completed before the loop started', async () => {
 		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
-		expect(summary?.message.display).toBe(true);
-		expect(summary?.message.content).toContain('completed tasks so far');
-		expect(summary?.message.content).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
-		// The summary precedes the iteration prompt.
-		expect(fake.customMessages.length).toBe(1);
+		// The summary is scoped to the current loop: nothing has happened yet,
+		// so pre-existing completions stay out.
+		expect(fake.customMessages).toHaveLength(0);
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
@@ -3311,7 +3334,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(result.compaction.firstKeptEntryId).toBe('entry-recording-prompt');
 		expect(result.compaction.tokensBefore).toBe(123);
 		expect(result.compaction.details.source).toBe('ralph-loop');
-		expect(result.compaction.summary).toContain('completed tasks so far');
+		expect(result.compaction.summary).toContain('Completed in this loop:');
 		expect(result.compaction.summary).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
 
 		// After the compaction settles: summary → boundary → prompt, in order
@@ -3347,6 +3370,22 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-completion-summary')).toBe(true);
 		expect(fake.userMessages).toHaveLength(3);
+
+		// The gate is reported once, where the user actually notices it…
+		const gateNotes = () => fakeCtx.notifications.filter((n) => n.message.includes('keepRecentTokens'));
+		expect(gateNotes()).toHaveLength(1);
+		expect(gateNotes()[0]!.type).toBe('warning');
+
+		// …and not repeated by later gated rotations in the same loop.
+		fakeCtx.usagePercent.value = 90;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fakeCtx.compactCalls).toHaveLength(2);
+		settleCompaction(fakeCtx, 'Nothing to compact (session too small)');
+		await flush();
+		expect(gateNotes()).toHaveLength(1);
+		expect(fake.userMessages).toHaveLength(5);
 
 		// The failed compaction must not leave the pending ralph result set: a
 		// later, unrelated compaction (e.g. the user's /compact) gets pi's
@@ -3398,7 +3437,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		const result = (await fake.fire('session_before_compact', fakeCtx.ctx, {
 			preparation: { firstKeptEntryId: 'entry-fallback', tokensBefore: 1 }
 		})) as { compaction: { summary: string } };
-		expect(result.compaction.summary).toContain('No tasks are completed yet');
+		expect(result.compaction.summary).toContain('No tasks have been completed or checkpointed in this loop yet');
 
 		settleCompaction(fakeCtx);
 		await flush();
@@ -3438,19 +3477,11 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(context.messages[0].role).toBe('toolResult');
 	});
 
-	test('start: warns when compaction.keepRecentTokens is too high to hide small iterations', async () => {
-		// Project settings override the (developer's real) global settings, so
-		// this is hermetic.
+	test('start: no keepRecentTokens warning at loop start', async () => {
+		// The gate is reported where it actually bites (a refused rotation
+		// compaction), not speculatively at loop start — even with the
+		// (too high for small iterations) default value.
 		await writeFile(join(dir, '.pi', 'settings.json'), `${JSON.stringify({ compaction: { keepRecentTokens: 20000 } })}\n`);
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-		await startLoop(fake, fakeCtx);
-		expect(fakeCtx.notifications.some((n) => n.message.includes('keepRecentTokens') && n.type === 'warning')).toBe(true);
-	});
-
-	test('start: no warning when compaction.keepRecentTokens is low enough', async () => {
-		await writeFile(join(dir, '.pi', 'settings.json'), `${JSON.stringify({ compaction: { keepRecentTokens: 1000 } })}\n`);
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3533,5 +3564,69 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 
 		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
 		expect(summary?.message.content).toContain('1. Task one: completed (no completion log entry)');
+	});
+
+	test('rotation: completions from earlier iterations stay in later summaries', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// First rotation: task one completes.
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// Second rotation: task two completes on top of task one.
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASKS_ONE_TWO_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The summary is loop-scoped, not iteration-scoped: it still carries the
+		// earlier iteration's completion, not just the last one.
+		const summaries = fake.customMessages.filter((m) => m.message.customType === 'ralph-loop-completion-summary');
+		const summary = summaries.at(-1)?.message.content ?? '';
+		expect(summary).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
+		expect(summary).toContain('2. Task two: (2026-09-05) Implemented task two; changed b.ts; bun test passed.');
+	});
+
+	test('rotation: tasks completed before the loop started stay out of the summary', async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASKS_ONE_TWO_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(summary?.message.content).toContain('2. Task two: (2026-09-05) Implemented task two; changed b.ts; bun test passed.');
+		expect(summary?.message.content).not.toContain('Task one');
+	});
+
+	test('rotation: checkpoints made in this loop are listed in the summary', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// A context-limit rotation with no completion but a fresh checkpoint.
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_TWO_CHECKPOINTED);
+		fakeCtx.usagePercent.value = 90;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(summary?.message.content).toContain('Checkpoints in this loop:');
+		expect(summary?.message.content).toContain('2. Task two: checkpoint (iteration 1): Half done; next step: finish the tests.');
 	});
 });
