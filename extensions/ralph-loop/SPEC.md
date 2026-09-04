@@ -165,3 +165,73 @@ unrelated changes or secrets.
 - The existing task-loop e2e still passes (no regression).
 - The user has reviewed the home GUI and the approval flow in a real
   session before the work is considered releasable.
+
+## 11. Rotation compaction and completion summaries
+
+Long runs must not accumulate finished iterations in the TUI or the model
+context. The current iteration stays fully visible and intact everywhere
+(the user watches the agent work). When an iteration finishes and the loop
+rotates, the finished iteration is hidden from the TUI and the model context
+in one deterministic step — when **compaction mode** is enabled (config
+`compactionMode`, default `true`, toggleable in `/ralph config`).
+
+- **Rotation compaction.** With compaction mode on, when a fresh iteration
+  starts (`startFreshIteration`), the loop calls `ctx.compact()` and supplies
+  the compaction result itself via the `session_before_compact` hook
+  (`details.source === 'ralph-loop'`, `fromHook: true`). Pi records the
+  compaction entry, re-renders the TUI from the cut point, and makes **no LLM
+  call** — there is no "compact action". The cut point (`firstKeptEntryId`)
+  is the recording prompt's entry (the last user message in the branch at
+  rotation time), so the retained tail is the small, informative recording
+  turn; the fallback is pi's prepared cut point. With compaction mode off,
+  no compaction is attempted: the finished iteration stays visible in the TUI
+  and the summary/boundary/prompt messages are sent directly.
+- **Compaction summary text.** The compaction entry's summary is the
+  completion summary (below); when nothing is completed yet it is a fallback
+  note naming the rotation reason. The TUI shows it as the collapsed
+  `[compaction]` box (tab to expand).
+- **Fresh iteration.** Only after the compaction settles (or fails) does the
+  loop send, in order: the completion-summary custom message (`display: true`,
+  when there are completed tasks), the context-boundary marker
+  (`display: false`), and the iteration prompt. The summary deliberately lands
+  **before** the boundary: the context-boundary slice (below) drops it from
+  the model context, so the model checks its own progress with the
+  ralph_todo/ralph_goal tools instead of being fed a summary. An aborted
+  compaction (user Escape) starts no new turn; expected gate failures (below)
+  proceed without the TUI clear — the boundary marker still keeps the model
+  context clean.
+- **Completion summary.** Re-derived from the backlog's completion log (the
+  durable record): task number, title, date, and the log note(s); completed
+  tasks without a log entry are listed as such. It is the compaction summary
+  text and the visible custom message at the start of every iteration (first
+  iteration and each fresh iteration, before the boundary marker). No summary
+  is sent when nothing is completed yet.
+- **Model context.** After the rotation the model context is
+  `[compactionSummary, retained tail, summary, boundary, prompt, …]`; the
+  existing context-boundary slice drops everything before the boundary —
+  including the completion summary — so the model sees only the current
+  iteration.
+- **The keepRecentTokens gate.** pi refuses to prepare a compaction when less
+  than `compaction.keepRecentTokens` (settings.json, default 20000) of content
+  would be discarded. At loop start (compaction mode on) the extension reads
+  the effective value (project overrides global) and warns when it is above
+  5000, because most iterations are then too small to hide. A gated rotation
+  degrades gracefully: the finished iteration stays visible in the TUI, the
+  model context is still clean, and the next rotation's window includes it.
+- **Config migration.** Saved configs without `compactionMode` (session
+  entries and `.pi/ralph-loop.json` from older versions) normalize to the
+  default (`true`); legacy single-threshold configs migrate the same way.
+- **Audit trail.** The session file stays append-only: finished iterations
+  remain in `getBranch()` (and in `/tree`), only the compaction-aware context
+  (`buildContextEntries`, what the TUI renders) drops them.
+- **No interference.** User-initiated (`/compact`) and automatic pi
+  compactions run their default LLM path: the `session_before_compact` handler
+  only acts while a rotation compaction is pending, and clears the pending
+  state on failure so it cannot leak into an unrelated compaction.
+- Acceptance: within an iteration the TUI and the model receive full content;
+  with compaction mode on, after a rotation the TUI context and the fresh
+  iteration's model request contain the completion summary and none of the
+  previous iteration's content, and the compaction entry is extension-provided
+  (`fromHook`, `details.source`); with compaction mode off, no compaction is
+  attempted and the finished iteration stays visible; the first iteration is
+  never compacted; a gated or aborted compaction never stalls the loop.

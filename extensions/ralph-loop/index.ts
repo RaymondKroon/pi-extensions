@@ -1,5 +1,6 @@
 import {
 	CONFIG_DIR_NAME,
+	getAgentDir,
 	getMarkdownTheme,
 	getSettingsListTheme,
 	type ExtensionAPI,
@@ -40,6 +41,17 @@ const CONFIG_TYPE = 'ralph-loop-config';
 const CONFIG_FILE_NAME = 'ralph-loop.json';
 /** Marks the beginning of an independent Ralph iteration in the same session. */
 const CONTEXT_BOUNDARY_TYPE = 'ralph-loop-context-boundary';
+/** Completion-summary message injected at the start of every Ralph iteration. */
+const COMPLETION_SUMMARY_TYPE = 'ralph-loop-completion-summary';
+/** Marker in a ralph-provided compaction entry's details (distinguishes it from pi's LLM compactions). */
+const COMPACTION_SOURCE = 'ralph-loop';
+/**
+ * pi only prepares a compaction when at least compaction.keepRecentTokens of
+ * content would be discarded (settings.json, default 20000). Above this value
+ * most Ralph iterations are too small to compact, so finished iterations would
+ * stay visible in the TUI; warn at loop start when the effective value is high.
+ */
+const KEEP_RECENT_TOKENS_WARN_ABOVE = 5000;
 const DEFAULT_TODO = 'TODO.ralph';
 const DEFAULT_SPEC = 'SPEC.md';
 /** Generic planning document bundled with this extension for /ralph-init to adapt. */
@@ -47,6 +59,7 @@ const INIT_TEMPLATE_SPEC = join(import.meta.dirname, 'SPEC.template.md');
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
 const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
+const DEFAULT_COMPACTION_MODE = true;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 
 type RotationReason = 'completed-task' | 'plan-updated' | 'context-limit';
@@ -59,6 +72,11 @@ interface RalphConfig {
 	contextThresholds: Record<string, number>;
 	autoApproveDecisions: boolean;
 	maxIterations: number;
+	/**
+	 * Hide each finished iteration from the TUI at every rotation via an
+	 * extension-provided compaction (no LLM call).
+	 */
+	compactionMode: boolean;
 }
 
 interface LegacyRalphConfig {
@@ -166,20 +184,25 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		typeof config.contextThresholds === 'object' &&
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
 		typeof config.autoApproveDecisions === 'boolean' &&
-		isMaxIterations(config.maxIterations)
+		isMaxIterations(config.maxIterations) &&
+		typeof config.compactionMode === 'boolean'
 	);
 }
 
-function isRalphConfigWithoutMaxIterations(
+/** A saved config missing newer optional fields; normalizeConfig fills the defaults. */
+function isRalphConfigPartial(
 	value: unknown
-): value is Omit<RalphConfig, 'maxIterations'> {
+): value is Omit<RalphConfig, 'maxIterations' | 'compactionMode'> &
+	Partial<Pick<RalphConfig, 'maxIterations' | 'compactionMode'>> {
 	if (!value || typeof value !== 'object') return false;
 	const config = value as Partial<RalphConfig>;
 	return (
 		!!config.contextThresholds &&
 		typeof config.contextThresholds === 'object' &&
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
-		typeof config.autoApproveDecisions === 'boolean'
+		typeof config.autoApproveDecisions === 'boolean' &&
+		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
+		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean')
 	);
 }
 
@@ -195,14 +218,19 @@ function isLegacyRalphConfig(value: unknown): value is LegacyRalphConfig {
 
 function normalizeConfig(value: unknown): RalphConfig | undefined {
 	if (isRalphConfig(value)) return value;
-	if (isRalphConfigWithoutMaxIterations(value)) {
-		return { ...value, maxIterations: DEFAULT_MAX_ITERATIONS };
+	if (isRalphConfigPartial(value)) {
+		return {
+			...value,
+			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE
+		};
 	}
 	if (isLegacyRalphConfig(value)) {
 		return {
 			contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: value.contextThreshold },
 			autoApproveDecisions: value.autoApproveDecisions,
-			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS
+			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+			compactionMode: DEFAULT_COMPACTION_MODE
 		};
 	}
 }
@@ -211,7 +239,8 @@ function defaultConfig(): RalphConfig {
 	return {
 		contextThresholds: {},
 		autoApproveDecisions: DEFAULT_AUTO_APPROVE_DECISIONS,
-		maxIterations: DEFAULT_MAX_ITERATIONS
+		maxIterations: DEFAULT_MAX_ITERATIONS,
+		compactionMode: DEFAULT_COMPACTION_MODE
 	};
 }
 
@@ -568,6 +597,66 @@ ${decisionNote}`;
 6. Finally, commit the completed iteration locally in a single commit that also includes the ${state.todoPath} update. Do not push. This is the last step of the iteration: stop working when the commit is made.
 
 ${decisionNote}`;
+}
+
+/**
+ * Compact summary of the completed tasks, re-derived from the backlog's
+ * completion log (the durable record). Used as the text of the ralph-provided
+ * compaction at each rotation and as the visible custom message injected at
+ * the start of every Ralph iteration. At rotations it is sent before the
+ * context boundary, so it stays in the session (audit trail, TUI) but is
+ * dropped from the model context — the model checks its own progress with the
+ * ralph_todo/ralph_goal tools.
+ */
+function completionSummary(todo: string, category?: string): string | undefined {
+	if (!isRalphBacklog(todo)) return undefined;
+	const backlog = Backlog.parse(todo);
+	const tasks = backlog.listTasks(category);
+	const numbers = backlog.taskNumbers(category);
+	const entriesByTask = new Map<number, Array<{ date: string | null; note: string; kind: 'done' | 'reopen' }>>();
+	for (const entry of backlog.listLogEntries()) {
+		const list = entriesByTask.get(entry.taskId) ?? [];
+		list.push(entry);
+		entriesByTask.set(entry.taskId, list);
+	}
+	const lines: string[] = [];
+	tasks.forEach((task, index) => {
+		if (!task.done) return;
+		const number = numbers.get(task.id) ?? String(index + 1);
+		const entries = entriesByTask.get(task.id) ?? [];
+		if (entries.length === 0) {
+			lines.push(`${number}. ${task.title}: completed (no completion log entry)`);
+			return;
+		}
+		const notes = entries
+			.map((entry) => `${entry.date ? `(${entry.date}) ` : ''}${entry.kind === 'reopen' ? 'reopened: ' : ''}${entry.note}`)
+			.join('; ');
+		lines.push(`${number}. ${task.title}: ${notes}`);
+	});
+	if (lines.length === 0) return undefined;
+	return `Ralph loop: completed tasks so far, from the completion log of the backlog (the durable record):\n\n${lines.join('\n')}`;
+}
+
+/**
+ * Effective compaction.keepRecentTokens from the pi settings files (project
+ * overrides global; pi's default when unset). Read from disk: the extension
+ * context exposes no settings API.
+ */
+function effectiveKeepRecentTokens(cwd: string): number {
+	let value = 20000;
+	const read = (path: string): number | undefined => {
+		try {
+			const parsed = JSON.parse(readFileSync(path, 'utf8')) as { compaction?: { keepRecentTokens?: unknown } };
+			return typeof parsed?.compaction?.keepRecentTokens === 'number' ? parsed.compaction.keepRecentTokens : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	const global = read(join(getAgentDir(), 'settings.json'));
+	if (global !== undefined) value = global;
+	const project = read(join(cwd, CONFIG_DIR_NAME, 'settings.json'));
+	if (project !== undefined) value = project;
+	return value;
 }
 
 /**
@@ -1209,6 +1298,9 @@ export default function (pi: ExtensionAPI) {
 	// a recording turn that finished from one the user aborted (Escape) — an
 	// aborted recording turn must not count as recorded progress.
 	let lastAssistantStopReason: string | undefined;
+	// The ralph-provided compaction pending for the in-flight rotation:
+	// consumed by the session_before_compact handler when pi's compact() runs.
+	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -1254,9 +1346,14 @@ export default function (pi: ExtensionAPI) {
 							? 'starting'
 							: 'on';
 		const label = state?.mode === 'goal' ? 'Ralph (goal)' : 'Ralph';
+		// Non-default modifiers, compact: (auto) and/or (compaction).
+		const modifiers = [autoApproveDecisions ? 'auto' : undefined, config.compactionMode ? 'compaction' : undefined]
+			.filter((part): part is string => part !== undefined)
+			.join(', ');
+		const modifierSuffix = modifiers ? ` (${modifiers})` : '';
 		const status = !state?.enabled
-			? `${label}: off${autoApproveDecisions ? ' (auto)' : ''}`
-			: `${label}: ${mode}${autoApproveDecisions ? ' (auto)' : ''} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: off${modifierSuffix}`
+			: `${label}: ${mode}${modifierSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -1899,22 +1996,79 @@ export default function (pi: ExtensionAPI) {
 				persistState(next);
 				updateStatus(ctx);
 
-				// Keep the audit trail in this session, but ensure the next model can
-				// only use the durable repository/TODO checkpoint rather than old turns.
+				// Keep the audit trail in this session. With compaction mode on,
+				// hide the finished iteration: an extension-provided compaction
+				// (no LLM call) cuts the TUI and the model context at the
+				// recording prompt, and the summary, boundary marker, and prompt
+				// are sent only after the compaction settles (or fails) so they
+				// land after the cut. With compaction mode off, the finished
+				// iteration stays visible in the TUI and the three messages are
+				// sent directly — the boundary marker alone keeps the model
+				// context clean. The summary is sent BEFORE the boundary: the
+				// context handler slices the model context at the last boundary,
+				// so the summary stays in the session (audit trail, TUI) but is
+				// dropped from the model context — the model checks its own
+				// progress with the ralph_todo/ralph_goal tools.
 				freshIterationPending = true;
 				updateStatus(ctx);
-				pi.sendMessage(
-					{
-						customType: CONTEXT_BOUNDARY_TYPE,
-						content:
-							reason === 'context-limit'
-								? 'Start of a fresh Ralph iteration after a durable context checkpoint.'
-								: 'Start of a new independent Ralph iteration.',
-						display: false
-					},
-					{ triggerTurn: false, deliverAs: 'followUp' }
-				);
-				pi.sendUserMessage(iterationPrompt(next, reason), { deliverAs: 'followUp' });
+				const completion = completionSummary(currentTodo, next.category);
+				const finishRotation = () => {
+					// A pause/stop/blocked decision that landed while the compaction
+					// ran must not start a new turn; the resume/stop flow continues.
+					if (!state?.enabled || state.paused || state.blocked) return;
+					if (completion) {
+						pi.sendMessage(
+							{ customType: COMPLETION_SUMMARY_TYPE, content: completion, display: true },
+							{ triggerTurn: false, deliverAs: 'followUp' }
+						);
+					}
+					pi.sendMessage(
+						{
+							customType: CONTEXT_BOUNDARY_TYPE,
+							content:
+								reason === 'context-limit'
+									? 'Start of a fresh Ralph iteration after a durable context checkpoint.'
+									: 'Start of a new independent Ralph iteration.',
+							display: false
+						},
+						{ triggerTurn: false, deliverAs: 'followUp' }
+					);
+					pi.sendUserMessage(iterationPrompt(next, reason), { deliverAs: 'followUp' });
+				};
+				if (!config.compactionMode) {
+					finishRotation();
+					return;
+				}
+				const anchor = ctx.sessionManager
+					.getBranch()
+					.findLast((entry) => entry.type === 'message' && entry.message.role === 'user');
+				pendingRalphCompaction = {
+					summary:
+						completion ??
+						`Ralph loop: the previous iteration ended (${reason}). No tasks are completed yet; the durable state is in the backlog and the repository.`,
+					anchorId: anchor?.id
+				};
+				ctx.compact({
+					onComplete: finishRotation,
+					onError: (error) => {
+						// Clear the pending compaction: the hook only consumes it when
+						// pi actually runs the compaction, so a gate failure ("Nothing
+						// to compact") must not leave it set for a later, unrelated
+						// compaction (e.g. the user's /compact).
+						pendingRalphCompaction = undefined;
+						// An aborted compaction (user Escape) must not start a new
+						// turn. Expected gate failures ("Nothing to compact" when the
+						// iteration is smaller than compaction.keepRecentTokens,
+						// "Already compacted" when a concurrent compaction won)
+						// proceed without the TUI clear: the boundary marker still
+						// keeps the model context clean.
+						if (/abort|cancel/i.test(error.message)) {
+							ctx.ui.notify('Ralph rotation compaction was aborted; the loop continues on the next settle.', 'warning');
+							return;
+						}
+						finishRotation();
+					}
+				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				if (state) {
@@ -2006,6 +2160,20 @@ export default function (pi: ExtensionAPI) {
 			};
 			persistState(next);
 			updateStatus(ctx);
+			const keepRecentTokens = effectiveKeepRecentTokens(ctx.cwd);
+			if (config.compactionMode && keepRecentTokens > KEEP_RECENT_TOKENS_WARN_ABOVE) {
+				ctx.ui.notify(
+					`Ralph hides finished iterations from the TUI via a compaction per rotation, but pi's compaction.keepRecentTokens is ${keepRecentTokens}: iterations smaller than that are too small to compact and stay visible. Set "compaction": { "keepRecentTokens": 1000 } in settings.json to hide every rotation.`,
+					'warning'
+				);
+			}
+			const summary = completionSummary(baselineTodo, category);
+			if (summary) {
+				pi.sendMessage(
+					{ customType: COMPLETION_SUMMARY_TYPE, content: summary, display: true },
+					{ triggerTurn: false, deliverAs: 'followUp' }
+				);
+			}
 			pi.sendUserMessage(iterationPrompt(next));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -2235,6 +2403,24 @@ export default function (pi: ExtensionAPI) {
 		if (boundaryIndex >= 0) return { messages: event.messages.slice(boundaryIndex + 1) };
 	});
 
+	// Ralph-provided compaction: when a rotation is in flight, supply the
+	// compaction result ourselves — pi records the entry, re-renders the TUI
+	// from the cut point, and makes NO LLM call. User-initiated and automatic
+	// compactions (no pending rotation) fall through to pi's default behaviour.
+	pi.on('session_before_compact', (event) => {
+		if (!pendingRalphCompaction) return;
+		const { summary, anchorId } = pendingRalphCompaction;
+		pendingRalphCompaction = undefined;
+		return {
+			compaction: {
+				summary,
+				firstKeptEntryId: anchorId ?? event.preparation.firstKeptEntryId,
+				tokensBefore: event.preparation.tokensBefore,
+				details: { source: COMPACTION_SOURCE }
+			}
+		};
+	});
+
 	pi.on('input', (event) => {
 		if (!state?.enabled || event.source === 'extension') return;
 
@@ -2460,6 +2646,14 @@ export default function (pi: ExtensionAPI) {
 					)
 			},
 			{
+				id: 'compactionMode',
+				label: 'Compaction mode',
+				description:
+					'Hide each finished iteration from the TUI when the loop rotates: an extension-provided compaction (no LLM call) cuts the session at the recording prompt and shows the completion summary in the compaction box. Off: finished iterations stay visible.',
+				currentValue: config.compactionMode ? 'enabled' : 'disabled',
+				values: ['enabled', 'disabled']
+			},
+			{
 				id: 'autoApproveDecisions',
 				label: 'Auto-approve decisions',
 				description: 'Continue after a decision request without pausing for your reply; Ralph records the approver as auto-approved.',
@@ -2487,6 +2681,8 @@ export default function (pi: ExtensionAPI) {
 							}
 							: id === 'maxIterations'
 								? { ...config, maxIterations: Number.parseInt(value, 10) }
+								: id === 'compactionMode'
+									? { ...config, compactionMode: value === 'enabled' }
 								: { ...config, autoApproveDecisions: value === 'enabled' };
 					persistConfig(ctx, next);
 					if (state?.enabled) {
@@ -2505,6 +2701,8 @@ export default function (pi: ExtensionAPI) {
 							? contextThresholdLabel(contextThresholdFor(next, ctx))
 							: id === 'maxIterations'
 								? `maximum iterations ${next.maxIterations}`
+								: id === 'compactionMode'
+									? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
 								: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
 					ctx.ui.notify(`Ralph configuration saved: ${savedDescription}`, 'info');
 				},

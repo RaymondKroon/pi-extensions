@@ -49,6 +49,18 @@ T 2 - "Task two"
 T 3 - "Task three"
 `;
 
+const RALPH_V2_TASK_ONE_DONE_LOGGED = `# ralph v2
+
+T 1 - "Task one"
+D 1
+L 1 1 2026-09-04
+  Implemented task one; changed a.ts; bun test passed.
+
+T 2 - "Task two"
+
+T 3 - "Task three"
+`;
+
 // A goal-only backlog: the planning state of the goal loop (goal open, no tasks).
 const RALPH_GOAL_ONLY = `# ralph v2
 
@@ -291,7 +303,10 @@ async function createRalphSession(port: number, config: Record<string, unknown>)
 		modelRuntime,
 		resourceLoader: loader,
 		sessionManager: SessionManager.inMemory(),
-		cwd: projectDir
+		cwd: projectDir,
+		// Hermetic settings: without this the session would read the developer's
+		// real ~/.pi/agent/settings.json (e.g. compaction.keepRecentTokens).
+		agentDir
 	});
 	// Pi's interactive/rpc modes call this during startup; a bare SDK session must
 	// bind extensions itself or they never receive session_start (and the ralph
@@ -430,6 +445,81 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			const freshRequest = endpoint!.requests[3]!;
 			expect(requestText(freshRequest)).toContain('Start the next independent iteration');
 			expect(requestText(freshRequest)).not.toContain('Task one complete.');
+		}
+	);
+
+	test(
+		'rotation: the finished iteration is compacted out of the TUI context; the fresh iteration\'s model context drops the completion summary',
+		{ timeout: 60000 },
+		async () => {
+			const todoPath = join(projectDir, 'TODO.ralph');
+			// Lower the compaction gate so a small test iteration is compactable
+			// (pi refuses to compact when less than keepRecentTokens would be
+			// discarded; the default is 20000).
+			await writeFile(join(agentDir, 'settings.json'), `${JSON.stringify({ compaction: { enabled: true, keepRecentTokens: 100 } }, null, '\t')}\n`);
+			endpoint = startMockEndpoint([
+				writeToolCallResponder(todoPath, RALPH_V2_TASK_ONE_DONE_LOGGED),
+				textResponder('Task one complete.'),
+				// The dedicated progress-recording turn.
+				textResponder('Progress recorded.'),
+				// The fresh iteration.
+				textResponder('Working on task two.')
+			]);
+			const sess = await createRalphSession(endpoint.port, {
+				contextThresholds: { __default__: 0.9 },
+				autoApproveDecisions: false,
+				maxIterations: 10,
+				compactionMode: true
+			});
+
+			await sess.prompt('/ralph start');
+
+			// Iteration 1: the mock model calls the real write tool, which really
+			// updates TODO.ralph on disk.
+			await waitFor(() => endpoint!.requests.length >= 2, 30000);
+			const todoOnDisk = await readFile(todoPath, 'utf8');
+			expect(todoOnDisk).toContain('D 1');
+
+			// The recording turn runs, then the rotation compacts the finished
+			// iteration (extension-provided: no LLM call) and starts the fresh one.
+			await waitFor(() => endpoint!.requests.length >= 4, 30000);
+
+			// (a) A ralph-provided compaction entry exists, cut at the recording
+			// prompt, with the completion summary as its text.
+			const branch = sess.sessionManager.getBranch();
+			const compaction = branch.find((entry) => entry.type === 'compaction');
+			expect(compaction).toBeDefined();
+			expect((compaction as { fromHook?: boolean }).fromHook).toBe(true);
+			expect((compaction as { details?: { source?: string } }).details?.source).toBe('ralph-loop');
+			expect(compaction!.summary).toContain('completed tasks so far');
+			expect(compaction!.summary).toContain('Implemented task one; changed a.ts; bun test passed.');
+			// The recording prompt, identified by its unique text (the iteration
+			// prompts mention the completion log too, and the fresh iteration
+			// prompt is already in the branch by now).
+			const recordingPrompt = branch.find(
+				(entry) =>
+					entry.type === 'message' &&
+					entry.message.role === 'user' &&
+					JSON.stringify(entry.message.content).includes('A Ralph TODO task was just completed')
+			);
+			expect(recordingPrompt).toBeDefined();
+			expect(compaction!.firstKeptEntryId).toBe(recordingPrompt!.id);
+
+			// (b) The audit trail is intact in the session file…
+			expect(branch.some((entry) => JSON.stringify(entry).includes('Task one complete.'))).toBe(true);
+			// …but the compaction-aware context (what the TUI renders) drops it.
+			const contextEntries = sess.sessionManager.buildContextEntries();
+			expect(contextEntries.some((entry) => JSON.stringify(entry).includes('Task one complete.'))).toBe(false);
+
+			// (c) The fresh iteration's model request carries none of the previous
+			// iteration's content and no completion summary either: the summary
+			// lands before the context boundary and is sliced out of the model
+			// context (the model checks its own progress with ralph_todo).
+			const freshRequest = requestText(endpoint!.requests[3]!);
+			expect(freshRequest).toContain('Start the next independent iteration');
+			expect(freshRequest).not.toContain('completed tasks so far');
+			expect(freshRequest).not.toContain('Task one complete.');
+			expect(freshRequest).not.toContain('Progress recorded.');
 		}
 	);
 

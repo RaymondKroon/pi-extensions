@@ -102,6 +102,7 @@ interface FakeCtx {
 		mode: string;
 		isIdle: () => boolean;
 		getContextUsage: () => { percent: number; tokens: number };
+		compact: (options?: FakeCompactCall) => void;
 		sessionManager: {
 			getBranch: () => unknown[];
 			getSessionFile: () => string;
@@ -137,6 +138,18 @@ interface FakeCtx {
 	selectQueue: Array<string | undefined>;
 	/** ui.custom control: delay before resolving, and a hook for the created component. */
 	customControl: { delayMs: number; factoryHook?: (component: unknown) => void };
+	/** Session branch entries visible to the extension (sessionManager.getBranch). */
+	branchEntries: unknown[];
+	/** ctx.compact() calls, in order. */
+	compactCalls: FakeCompactCall[];
+	/** When true (default) each ctx.compact() settles itself asynchronously, like pi. */
+	compactAutoSettle: { value: boolean };
+}
+
+interface FakeCompactCall {
+	customInstructions?: string;
+	onComplete?: (result: unknown) => void;
+	onError?: (error: Error) => void;
 }
 
 function createFakeCtx(cwd: string): FakeCtx {
@@ -152,6 +165,9 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const selectPrompts: FakeCtx['selectPrompts'] = [];
 	const selectQueue: FakeCtx['selectQueue'] = [];
 	const customControl: FakeCtx['customControl'] = { delayMs: 0 };
+	const branchEntries: unknown[] = [];
+	const compactCalls: FakeCompactCall[] = [];
+	const compactAutoSettle = { value: true };
 
 	const ctx = {
 		cwd,
@@ -162,8 +178,16 @@ function createFakeCtx(cwd: string): FakeCtx {
 			percent: usagePercent.value,
 			tokens: Math.round((200_000 * usagePercent.value) / 100)
 		}),
+		compact: (options?: FakeCompactCall) => {
+			const call: FakeCompactCall = options ?? {};
+			compactCalls.push(call);
+			if (compactAutoSettle.value) {
+				// Like pi: the compaction settles asynchronously after the call.
+				setTimeout(() => call.onComplete?.({ summary: 'compacted', firstKeptEntryId: 'kept', tokensBefore: 1 }), 0);
+			}
+		},
 		sessionManager: {
-			getBranch: () => [],
+			getBranch: () => branchEntries,
 			getSessionFile: () => join(cwd, 'session.jsonl')
 		},
 		ui: {
@@ -212,8 +236,19 @@ function createFakeCtx(cwd: string): FakeCtx {
 		inputQueue,
 		selectPrompts,
 		selectQueue,
-		customControl
+		customControl,
+		branchEntries,
+		compactCalls,
+		compactAutoSettle
 	};
+}
+
+/** Settle the most recent pending (non-auto) ctx.compact() call, like pi would. */
+function settleCompaction(fakeCtx: FakeCtx, errorMessage?: string) {
+	const call = fakeCtx.compactCalls.at(-1);
+	expect(call).toBeDefined();
+	if (errorMessage) call!.onError?.(new Error(errorMessage));
+	else call!.onComplete?.({ summary: 'compacted', firstKeptEntryId: 'kept', tokensBefore: 1 });
 }
 
 const fakeTheme = {
@@ -272,9 +307,11 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.length).toBe(1);
 		expect(fake.userMessages[0].text).toContain('Run the Ralph loop');
 		const status = statusLine(fakeCtx.widgets);
-		expect(status).toContain('Ralph: on');
+		expect(status).toContain('Ralph: on (compaction)');
 		expect(status).toContain('iteration 1/10');
 		expect(status).toContain('task: 1/3 (iteration 1)');
+		// Compaction mode defaults to on: the modifier is in the status bar.
+		expect(status).toContain('compaction');
 	});
 
 	test('start is refused while a loop is already active', async () => {
@@ -3123,5 +3160,328 @@ D 1
 
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Wait for the current agent run to finish before setting the goal');
 		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).goal()).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Rotation compaction and completion summaries
+// ---------------------------------------------------------------------------
+
+const RALPH_V2_TASK_ONE_DONE_LOGGED = `# ralph v2
+
+T 1 - "Task one"
+D 1
+L 1 1 2026-09-04
+  Implemented task one; changed a.ts; bun test passed.
+
+T 2 - "Task two"
+
+T 3 - "Task three"
+`;
+
+describe('ralph-loop extension (rotation compaction and completion summaries)', () => {
+	beforeEach(async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+		// Compaction mode defaults to on; state it explicitly for clarity.
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true }, null, '\t')}\n`
+		);
+	});
+
+	test('start: does not compact the first iteration', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		await flush();
+		expect(fakeCtx.compactCalls).toHaveLength(0);
+	});
+
+	test('start: injects a completion summary when the backlog has completed tasks', async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(summary?.message.display).toBe(true);
+		expect(summary?.message.content).toContain('completed tasks so far');
+		expect(summary?.message.content).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
+		// The summary precedes the iteration prompt.
+		expect(fake.customMessages.length).toBe(1);
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('start: no summary when nothing is completed yet', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		expect(fake.customMessages).toHaveLength(0);
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('rotation: compacts the finished iteration and starts the fresh iteration only after compaction', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		// Hold the compaction pending so the deferral is observable.
+		fakeCtx.compactAutoSettle.value = false;
+		// The session branch ends with the recording prompt (the last user
+		// message) — the anchor the retained tail should start at.
+		fakeCtx.branchEntries.push(
+			{ type: 'message', id: 'entry-work', message: { role: 'assistant', content: [{ type: 'text', text: 'work' }] } },
+			{ type: 'message', id: 'entry-recording-prompt', message: { role: 'user', content: 'record progress' } }
+		);
+		await startLoop(fake, fakeCtx);
+
+		// The model completes task one (with a completion log entry) and settles.
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		// The recording turn settles: the fresh iteration is prepared.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The rotation requested exactly one compaction…
+		expect(fakeCtx.compactCalls).toHaveLength(1);
+		// …and the fresh iteration has NOT started yet (nothing was sent).
+		expect(fake.customMessages).toHaveLength(0);
+		expect(fake.userMessages).toHaveLength(2); // start prompt + recording prompt
+
+		// pi runs the compaction: the extension supplies the result (no LLM call),
+		// anchored at the recording prompt.
+		const result = (await fake.fire('session_before_compact', fakeCtx.ctx, {
+			preparation: { firstKeptEntryId: 'entry-fallback', tokensBefore: 123 }
+		})) as {
+			compaction: { summary: string; firstKeptEntryId: string; tokensBefore: number; details: { source: string } };
+		};
+		expect(result.compaction.firstKeptEntryId).toBe('entry-recording-prompt');
+		expect(result.compaction.tokensBefore).toBe(123);
+		expect(result.compaction.details.source).toBe('ralph-loop');
+		expect(result.compaction.summary).toContain('completed tasks so far');
+		expect(result.compaction.summary).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
+
+		// After the compaction settles: summary → boundary → prompt, in order
+		// (the summary lands before the cut, so the model context drops it).
+		settleCompaction(fakeCtx);
+		await flush();
+		const boundary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-context-boundary');
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(boundary).toBeDefined();
+		expect(summary).toBeDefined();
+		expect(fake.customMessages.indexOf(summary!)).toBeLessThan(fake.customMessages.indexOf(boundary!));
+		expect(fake.userMessages).toHaveLength(3);
+	});
+
+	test('rotation: a compaction gate failure still starts the fresh iteration', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.compactAutoSettle.value = false;
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fakeCtx.compactCalls).toHaveLength(1);
+
+		// The iteration is smaller than compaction.keepRecentTokens: pi refuses
+		// to prepare a compaction. The rotation must not stall.
+		settleCompaction(fakeCtx, 'Nothing to compact (session too small)');
+		await flush();
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-completion-summary')).toBe(true);
+		expect(fake.userMessages).toHaveLength(3);
+
+		// The failed compaction must not leave the pending ralph result set: a
+		// later, unrelated compaction (e.g. the user's /compact) gets pi's
+		// default behaviour.
+		expect(
+			await fake.fire('session_before_compact', fakeCtx.ctx, {
+				preparation: { firstKeptEntryId: 'entry-fallback', tokensBefore: 1 }
+			})
+		).toBeUndefined();
+	});
+
+	test('rotation: an aborted compaction does not start a new turn', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.compactAutoSettle.value = false;
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fakeCtx.compactCalls).toHaveLength(1);
+
+		settleCompaction(fakeCtx, 'Compaction cancelled');
+		await flush();
+		// No fresh iteration was started…
+		expect(fake.customMessages).toHaveLength(0);
+		expect(fake.userMessages).toHaveLength(2);
+		// …and the user was told why.
+		expect(fakeCtx.notifications.some((n) => n.message.includes('aborted'))).toBe(true);
+	});
+
+	test('rotation: no completed tasks yet → the compaction carries a fallback summary', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.compactAutoSettle.value = false;
+		await startLoop(fake, fakeCtx);
+
+		// A context-limit rotation with nothing completed yet.
+		fakeCtx.usagePercent.value = 90;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fakeCtx.compactCalls).toHaveLength(1);
+
+		const result = (await fake.fire('session_before_compact', fakeCtx.ctx, {
+			preparation: { firstKeptEntryId: 'entry-fallback', tokensBefore: 1 }
+		})) as { compaction: { summary: string } };
+		expect(result.compaction.summary).toContain('No tasks are completed yet');
+
+		settleCompaction(fakeCtx);
+		await flush();
+		// No completion summary message (nothing completed), but the boundary
+		// and the fresh iteration prompt were sent.
+		expect(fake.customMessages).toHaveLength(1);
+		expect(fake.customMessages[0]!.message.customType).toBe('ralph-loop-context-boundary');
+		expect(fake.userMessages).toHaveLength(3);
+	});
+
+	test('session_before_compact: user-initiated compaction is untouched (no pending rotation)', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		expect(
+			await fake.fire('session_before_compact', fakeCtx.ctx, {
+				preparation: { firstKeptEntryId: 'entry-fallback', tokensBefore: 1 }
+			})
+		).toBeUndefined();
+	});
+
+	test('context: drops pre-boundary messages so the model sees only the current iteration', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const context = (await fake.fire('context', fakeCtx.ctx, {
+			messages: [
+				{ role: 'assistant', content: [{ type: 'text', text: 'old iteration work' }] },
+				{ role: 'custom', customType: 'ralph-loop-context-boundary', content: 'boundary', display: false },
+				{ role: 'toolResult', toolCallId: 'c1', content: [{ type: 'text', text: 'current iteration work' }] }
+			]
+		})) as { messages: Array<{ role: string }> };
+		expect(context.messages).toHaveLength(1);
+		expect(context.messages[0].role).toBe('toolResult');
+	});
+
+	test('start: warns when compaction.keepRecentTokens is too high to hide small iterations', async () => {
+		// Project settings override the (developer's real) global settings, so
+		// this is hermetic.
+		await writeFile(join(dir, '.pi', 'settings.json'), `${JSON.stringify({ compaction: { keepRecentTokens: 20000 } })}\n`);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		expect(fakeCtx.notifications.some((n) => n.message.includes('keepRecentTokens') && n.type === 'warning')).toBe(true);
+	});
+
+	test('start: no warning when compaction.keepRecentTokens is low enough', async () => {
+		await writeFile(join(dir, '.pi', 'settings.json'), `${JSON.stringify({ compaction: { keepRecentTokens: 1000 } })}\n`);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		expect(fakeCtx.notifications.some((n) => n.message.includes('keepRecentTokens'))).toBe(false);
+	});
+
+	test('rotation: compaction mode disabled skips the compaction and sends the fresh iteration directly', async () => {
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: false }, null, '\t')}\n`
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// No compaction was requested…
+		expect(fakeCtx.compactCalls).toHaveLength(0);
+		// …and the summary, boundary, and prompt were sent directly.
+		const boundary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-context-boundary');
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(boundary).toBeDefined();
+		expect(summary).toBeDefined();
+		expect(fake.userMessages).toHaveLength(3);
+		// The keepRecentTokens warning is only relevant with compaction mode on.
+		expect(fakeCtx.notifications.some((n) => n.message.includes('keepRecentTokens'))).toBe(false);
+	});
+
+	test('status bar: shows the compaction modifier while the mode is on', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off (compaction)');
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on (compaction)');
+	});
+
+	test('rotation: the completion summary lands before the boundary so the model context drops it', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// The model completes task one (with a completion log entry) and settles.
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE_LOGGED);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		// The recording turn settles: the compaction auto-settles and the fresh
+		// iteration starts.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const boundary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-context-boundary');
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(boundary).toBeDefined();
+		expect(summary).toBeDefined();
+		expect(fake.customMessages.indexOf(summary!)).toBeLessThan(fake.customMessages.indexOf(boundary!));
+		expect(summary?.message.content).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
+	});
+
+	test('rotation: completed tasks without a log entry are listed as such', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V2_TASK_ONE_DONE);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(summary?.message.content).toContain('1. Task one: completed (no completion log entry)');
 	});
 });
