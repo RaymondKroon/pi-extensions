@@ -1203,6 +1203,8 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(task?.category).toBe('Docs');
 		// Adding to a list that does not exist yet is refused.
 		await expect(run({ action: 'add', title: 'Nope.', category: 'Missing' })).rejects.toThrow(/no list named "Missing"/);
+		// Adding without a category is refused: tasks never land uncategorized.
+		await expect(run({ action: 'add', title: 'No list.' })).rejects.toThrow(/requires a category/);
 
 		// complete and log work without a loop too.
 		const done = await run({ action: 'complete', task: '1' });
@@ -1247,10 +1249,12 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		};
 		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
 
-		// A batch spanning the default list and an explicit list.
+		// A batch in one list, with one entry overriding to another list.
 		await run({ action: 'new-list', name: 'Docs' });
+		await run({ action: 'new-list', name: 'Infra' });
 		const batch = await run({
 			action: 'add-many',
+			category: 'Infra',
 			tasks: [
 				{ title: 'First batch task.' },
 				{ title: 'Second batch task.', body: '- detail' },
@@ -1258,6 +1262,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			]
 		});
 		expect(batch.content[0]!.text).toContain('Added 3 tasks:');
+		expect(batch.content[0]!.text).toContain('[Infra]');
 		expect(batch.content[0]!.text).toContain('[Docs]');
 		const backlog = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
 		expect(backlog.listTasks().slice(-3).map((t) => t.title)).toEqual([
@@ -1265,16 +1270,27 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			'Second batch task.',
 			'Doc task.'
 		]);
+		expect(backlog.listTasks().at(-3)?.category).toBe('Infra');
+		expect(backlog.listTasks().at(-2)?.category).toBe('Infra');
 		expect(backlog.listTasks().at(-1)?.category).toBe('Docs');
 		expect(backlog.listTasks().at(-2)?.body).toBe('- detail');
 
-		// An unknown category refuses the whole batch: nothing is added.
+		// A missing category is refused: nothing is added.
 		const before = backlog.listTasks().length;
+		await expect(run({ action: 'add-many', tasks: [{ title: 'X.' }] })).rejects.toThrow(/requires a category/);
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).listTasks().length).toBe(before);
+
+		// An unknown batch category refuses the whole batch: nothing is added.
 		await expect(
-			run({ action: 'add-many', tasks: [{ title: 'X.' }, { title: 'Y.', category: 'Nope' }] })
+			run({ action: 'add-many', category: 'Nope', tasks: [{ title: 'X.' }, { title: 'Y.', category: 'Docs' }] })
 		).rejects.toThrow(/no list named "Nope"/);
-		const after = Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8'));
-		expect(after.listTasks().length).toBe(before);
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).listTasks().length).toBe(before);
+
+		// An unknown per-entry override also refuses the whole batch.
+		await expect(
+			run({ action: 'add-many', category: 'Infra', tasks: [{ title: 'X.' }, { title: 'Y.', category: 'Nope' }] })
+		).rejects.toThrow(/no list named "Nope"/);
+		expect(Backlog.parse(await readFile(join(dir, 'TODO.ralph'), 'utf8')).listTasks().length).toBe(before);
 
 		// An empty batch is refused.
 		await expect(run({ action: 'add-many', tasks: [] })).rejects.toThrow(/non-empty/);

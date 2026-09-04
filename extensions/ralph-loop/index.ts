@@ -533,7 +533,7 @@ This is a planning iteration: the goal is open and the backlog has no tasks yet.
 
 1. Read ${state.specPath} in full.
 2. Decompose the goal into small, ordered tasks that together cover every acceptance criterion.
-3. Add the whole plan to the backlog with ralph_todo (action "add-many" for the plan, or "add" per task).
+3. Create a list for the plan with ralph_todo (action "new-list"), then add the whole plan to that list (action "add-many" with the list as category, or "add" per task).
 4. Do not implement the goal in this iteration: the plan is the deliverable. Do not edit ${state.todoPath} directly.
 
 ${decisionNote}`;
@@ -549,7 +549,7 @@ This is a re-evaluation iteration: the goal is open and every planned task is co
 
 1. Read ${state.specPath} in full.
 2. Re-check every acceptance criterion of the goal against the repository and run every verification command required by SPEC.md.
-3. If any criterion is not met, add tasks for the missing work with ralph_todo and stop after recording them.
+3. If any criterion is not met, add tasks for the missing work with ralph_todo (the plan's list as category) and stop after recording them.
 4. If every criterion is met and verified, call ralph_goal with action "complete" and the evidence. Do not edit ${state.todoPath} directly.
 
 ${decisionNote}`;
@@ -560,7 +560,7 @@ ${backlogNote}
 
 ${goalBlock(goal)}
 
-You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks with ralph_todo so the backlog always reflects the remaining work.
+You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks with ralph_todo (the plan's list as category) so the backlog always reflects the remaining work.
 
 1. Read ${state.specPath} in full, then call ralph_todo with action "next" to get the next open task${categoryScope}: its number, body, and checkpoint. Use action "list" only when that task is blocked and you need the wider backlog to find an unblocked one.
 2. Do not work on a later task${categoryGuard}.
@@ -1526,7 +1526,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph, which must exist first (create it with action "init" or "import"). Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, add-many, new-list, log, move, import, init. "add" adds to the current scope, or to an existing list via "category" (it never creates a list); use "new-list" with a name to create a new list explicitly. "add-many" adds several tasks at once via the "tasks" array (all-or-nothing; each entry may set its own category). "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "complete" marks the task done; with a note it also records the completion log entry in the same call. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email). "init" explicitly bootstraps an empty backlog at the target path when it does not exist yet (idempotent; refuses to overwrite a non-ralph file).',
+			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph, which must exist first (create it with action "init" or "import"). Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, add-many, new-list, log, move, import, init. "add" adds a task to an existing list given by "category" (required; it never creates a list); use "new-list" with a name to create a new list explicitly. "add-many" adds several tasks at once via the "tasks" array to the list given by "category" (required; all-or-nothing; an entry may override the batch category). "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "complete" marks the task done; with a note it also records the completion log entry in the same call. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email). "init" explicitly bootstraps an empty backlog at the target path when it does not exist yet (idempotent; refuses to overwrite a non-ralph file).',
 		promptSnippet: 'Read/update the Ralph backlog',
 		promptGuidelines: [
 			'Use ralph_todo to read or update the ralph-format backlog; never read or modify the backlog file by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use action "search" to find tasks by keyword.'
@@ -1557,13 +1557,13 @@ export default function (pi: ExtensionAPI) {
 					Type.Object({
 						title: Type.String({ description: 'Task title.' }),
 						body: Type.Optional(Type.String({ description: 'Task body, markdown bullets.' })),
-						category: Type.Optional(Type.String({ description: 'Existing list for this task; omit for the current scope.' }))
+						category: Type.Optional(Type.String({ description: 'Existing list for this task; overrides the batch category (add-many). Must already exist; use new-list to create one first.' }))
 					}),
 					{ description: 'Tasks to add in order (add-many). The batch is all-or-nothing: if any entry is invalid, nothing is added.' }
 				)
 			),
 			name: Type.Optional(Type.String({ description: 'New list name (new-list). Creating a list is explicit and separate from adding a task.' })),
-			category: Type.Optional(Type.String({ description: 'Existing list (list: filter the summary to it; add: target list for a new task; search: restrict the match to it). Must already exist; use new-list to create one first. Omit on add to use the current scope. For import: list stamped on the imported tasks; defaults to a name derived from the file name (TODO_EMAIL.md → Email).' })),
+			category: Type.Optional(Type.String({ description: 'Existing list (list: filter the summary to it; add and add-many: required target list; search: restrict the match to it). Must already exist; use new-list to create one first. For import: list stamped on the imported tasks; defaults to a name derived from the file name (TODO_EMAIL.md → Email).' })),
 			query: Type.Optional(Type.String({ description: 'Case-insensitive substring to search for (search) in task titles, bodies, checkpoints, and completion log notes.' })),
 			verbose: Type.Optional(Type.Boolean({ description: 'list: include completed tasks, checkpoints, and completion log entries (default: compact summary of open tasks).' })),
 			date: Type.Optional(Type.String({ description: 'YYYY-MM-DD for the log entry (log; defaults to today).' })),
@@ -1696,19 +1696,19 @@ export default function (pi: ExtensionAPI) {
 				}
 				case 'add': {
 					if (!params.title) throw new Error('add requires a title.');
+					if (!params.category) throw new Error('add requires a category (an existing list); create it first with action "new-list"');
 					const targetCategory = params.category;
-					if (targetCategory !== undefined && !backlog.categories().includes(targetCategory)) {
+					if (!backlog.categories().includes(targetCategory)) {
 						throw new Error(`no list named "${targetCategory}" (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`);
 					}
-					const addScope = targetCategory ?? scope;
 					const task = backlog.addTask({
 						title: params.title,
 						body: params.body,
 						category: targetCategory
 					});
 					mutated = true;
-					const number = backlog.taskNumbers(addScope).get(task.id) ?? task.id;
-					output = `Added task ${number} "${task.title}"${task.category ? ` in category "${task.category}"` : ''}.`;
+					const number = backlog.taskNumbers(targetCategory).get(task.id) ?? task.id;
+					output = `Added task ${number} "${task.title}" in category "${targetCategory}".`;
 					break;
 				}
 				case 'add-many': {
@@ -1716,11 +1716,14 @@ export default function (pi: ExtensionAPI) {
 					if (!Array.isArray(items) || items.length === 0) {
 						throw new Error('add-many requires a non-empty "tasks" array.');
 					}
+					if (!params.category) {
+						throw new Error('add-many requires a category (an existing list) for the batch; create it first with action "new-list"');
+					}
+					const batchCategory = params.category;
 					// Validate the whole batch first so an invalid entry adds nothing.
 					const missingLists = [
 						...new Set(
-							items
-								.map((item) => item.category)
+							[batchCategory, ...items.map((item) => item.category)]
 								.filter((category): category is string => category !== undefined && !backlog.categories().includes(category))
 						)
 					];
@@ -1730,7 +1733,7 @@ export default function (pi: ExtensionAPI) {
 						);
 					}
 					const added = items.map((item) =>
-						backlog.addTask({ title: item.title, body: item.body, category: item.category })
+						backlog.addTask({ title: item.title, body: item.body, category: item.category ?? batchCategory })
 					);
 					mutated = true;
 					const summary = added

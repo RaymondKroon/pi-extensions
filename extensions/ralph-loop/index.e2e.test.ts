@@ -626,8 +626,14 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			const todoPath = join(projectDir, 'TODO.ralph');
 			await writeFile(todoPath, RALPH_GOAL_ONLY);
 			endpoint = startMockEndpoint([
-				// Iteration 1 (planning): the model decomposes the goal into the plan.
-				toolCallResponder('ralph_todo', { action: 'add-many', tasks: [{ title: 'Task one.' }, { title: 'Task two.' }] }, 'call_plan'),
+				// Iteration 1 (planning): the model creates the plan's list, then
+				// decomposes the goal into the plan.
+				toolCallResponder('ralph_todo', { action: 'new-list', name: 'Plan' }, 'call_list'),
+				toolCallResponder(
+					'ralph_todo',
+					{ action: 'add-many', category: 'Plan', tasks: [{ title: 'Task one.' }, { title: 'Task two.' }] },
+					'call_plan'
+				),
 				textResponder('Plan recorded: two tasks added.'),
 				// Plan-updated recording turn (commit-only).
 				textResponder('Plan committed.'),
@@ -674,48 +680,49 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await waitFor(() => endpoint!.requests.length >= 1, 30000);
 			expect(requestText(endpoint!.requests[0]!)).toContain('This is a planning iteration');
 
-			// The planning turn adds the plan through the REAL ralph_todo tool
-			// (the tool call and its result are in the request log).
+			// The planning turn creates the list and adds the plan through the REAL
+				// ralph_todo tool (the tool calls and their results are in the log).
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
 			expect(requestText(endpoint!.requests[1]!)).toContain('"name":"ralph_todo"');
-			expect(requestText(endpoint!.requests[1]!)).toContain('add-many');
+			await waitFor(() => endpoint!.requests.length >= 3, 30000);
+			expect(requestText(endpoint!.requests[2]!)).toContain('add-many');
 
 			// The grown plan triggers a plan-updated rotation with a commit-only
 			// recording turn (no completion log: no task was completed).
-			await waitFor(() => endpoint!.requests.length >= 3, 30000);
-			expect(requestText(endpoint!.requests[2]!)).toContain('The Ralph plan was just updated');
+			await waitFor(() => endpoint!.requests.length >= 4, 30000);
+			expect(requestText(endpoint!.requests[3]!)).toContain('The Ralph plan was just updated');
 
 			// Fresh execution iteration with a clean context: the old planning and
 			// recording turns are filtered out by the context boundary.
-			await waitFor(() => endpoint!.requests.length >= 4, 30000);
-			let fresh = requestText(endpoint!.requests[3]!);
+			await waitFor(() => endpoint!.requests.length >= 5, 30000);
+			let fresh = requestText(endpoint!.requests[4]!);
 			expect(fresh).toContain('You are executing the goal');
 			expect(fresh).toContain('The plan was just updated with new tasks.');
 			expect(fresh).not.toContain('Plan committed.');
 
 			// Iteration 2 completes task 1 via the real tool.
-			await waitFor(() => endpoint!.requests.length >= 5, 30000);
-			expect(requestText(endpoint!.requests[4]!)).toContain('"name":"ralph_todo"');
+			await waitFor(() => endpoint!.requests.length >= 6, 30000);
+			expect(requestText(endpoint!.requests[5]!)).toContain('"name":"ralph_todo"');
 
 			// The completed-task recording turn names the completed task.
-			await waitFor(() => endpoint!.requests.length >= 6, 30000);
-			expect(requestText(endpoint!.requests[5]!)).toContain('A Ralph TODO task was just completed: task 1');
+			await waitFor(() => endpoint!.requests.length >= 7, 30000);
+			expect(requestText(endpoint!.requests[6]!)).toContain('A Ralph TODO task was just completed: task 1');
 
 			// Fresh execution iteration for task 2, again from a clean context.
-			await waitFor(() => endpoint!.requests.length >= 7, 30000);
-			fresh = requestText(endpoint!.requests[6]!);
+			await waitFor(() => endpoint!.requests.length >= 8, 30000);
+			fresh = requestText(endpoint!.requests[7]!);
 			expect(fresh).toContain('You are executing the goal');
 			expect(fresh).toContain('A previous TODO item was completed.');
 			expect(fresh).not.toContain('Task one complete.');
 
 			// Iteration 3 completes task 2; its recording turn follows.
-			await waitFor(() => endpoint!.requests.length >= 9, 30000);
-			expect(requestText(endpoint!.requests[8]!)).toContain('A Ralph TODO task was just completed: task 2');
+			await waitFor(() => endpoint!.requests.length >= 10, 30000);
+			expect(requestText(endpoint!.requests[9]!)).toContain('A Ralph TODO task was just completed: task 2');
 
 			// Plan exhausted: the fresh iteration is a re-evaluation, and the model
 			// claims the goal (ralph_goal complete terminates the turn at the gate).
-			await waitFor(() => endpoint!.requests.length >= 10, 30000);
-			expect(requestText(endpoint!.requests[9]!)).toContain('This is a re-evaluation iteration');
+			await waitFor(() => endpoint!.requests.length >= 11, 30000);
+			expect(requestText(endpoint!.requests[10]!)).toContain('This is a re-evaluation iteration');
 
 			// The loop is paused at the approval gate: the user's chat reply is
 			// transformed into the pending-decision context for the model. Wait for
@@ -730,7 +737,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// After the decision is resolved and the goal confirmed, the goal is
 			// done in the file and the loop stops: no further model request is
 			// triggered (no fresh iteration, no recording turn).
-			await waitFor(() => endpoint!.requests.length >= 13, 30000);
+			await waitFor(() => endpoint!.requests.length >= 14, 30000);
 			const countAtEnd = endpoint!.requests.length;
 			await new Promise((r) => setTimeout(r, 2000));
 			expect(endpoint!.requests.length).toBe(countAtEnd);
@@ -738,9 +745,9 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// The final file state proves the real tools did the work: both tasks
 			// completed, the goal claimed with evidence and then confirmed to done.
 			const todoOnDisk = await readFile(todoPath, 'utf8');
-			expect(todoOnDisk).toContain('T 1 - "Task one."');
+			expect(todoOnDisk).toContain('T 1 Plan "Task one."');
 			expect(todoOnDisk).toContain('D 1');
-			expect(todoOnDisk).toContain('T 2 - "Task two."');
+			expect(todoOnDisk).toContain('T 2 Plan "Task two."');
 			expect(todoOnDisk).toContain('D 2');
 			expect(todoOnDisk).toContain('G "Ship the thing" done');
 			expect(todoOnDisk).toContain('GE "All acceptance criteria verified: bun test passes (5 suites)."');
