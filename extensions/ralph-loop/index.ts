@@ -753,20 +753,6 @@ function planRecordingPrompt(state: RalphState): string {
 Report the commit (if any) succinctly.`;
 }
 
-/** Extract the readable text from a tool result payload (for abort detection). */
-function toolResultText(result: unknown): string {
-	if (!result || typeof result !== 'object') return '';
-	const content = (result as { content?: unknown }).content;
-	if (!Array.isArray(content)) return '';
-	return content
-		.map((part) =>
-			part && typeof part === 'object' && 'text' in part && typeof (part as { text: unknown }).text === 'string'
-				? (part as { text: string }).text
-				: ''
-		)
-		.join(' ');
-}
-
 async function readRequiredFile(path: string): Promise<string> {
 	return readFile(path, 'utf8');
 }
@@ -2354,9 +2340,11 @@ export default function (pi: ExtensionAPI) {
 	// Record the stop reason of assistant messages so the settle handler can tell
 	// a finished recording turn from one the user aborted.
 	let runSawAssistantMessage = true;
-	// Set when the user aborts the run while a tool call is executing: the tool
-	// ends as an error result and the run can finish without an 'aborted'
-	// assistant message, so the user abort must be remembered explicitly.
+	// Set when the run's abort signal fires while a tool call is executing: the
+	// tool ends as an error result and the run can finish without an 'aborted'
+	// assistant message, so the user abort must be remembered explicitly. Only
+	// the signal is trusted here — matching abort-like text in a failing tool's
+	// output (file names, log lines) false-positives on clean runs.
 	let runAbortedByUser = false;
 	// The current run's abort signal, captured at agent_start (after the run
 	// ends the session no longer exposes it). Stays aborted after Escape,
@@ -2384,11 +2372,12 @@ export default function (pi: ExtensionAPI) {
 
 	// Remember a user abort that lands while a tool call is running. The tool
 	// ends as an error result and the run can settle without an 'aborted'
-	// assistant message, which the settle-time check alone would miss.
-	pi.on('tool_execution_end', (event, ctx) => {
-		const toolEvent = event as { isError?: boolean; result?: unknown };
-		const resultText = toolResultText(toolEvent.result);
-		if ((ctx as { signal?: AbortSignal }).signal?.aborted || (toolEvent.isError === true && /abort/i.test(resultText))) {
+	// assistant message, which the settle-time check alone would miss. The run's
+	// abort signal is the only trustworthy indicator: a failing tool whose output
+	// merely *contains* "abort" (file names, test names, log lines) is not an
+	// Escape, so the result text is deliberately not inspected.
+	pi.on('tool_execution_end', (_event, ctx) => {
+		if ((ctx as { signal?: AbortSignal }).signal?.aborted) {
 			runAbortedByUser = true;
 		}
 	});

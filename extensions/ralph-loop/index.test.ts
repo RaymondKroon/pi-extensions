@@ -103,6 +103,7 @@ interface FakeCtx {
 		isIdle: () => boolean;
 		getContextUsage: () => { percent: number; tokens: number };
 		compact: (options?: FakeCompactCall) => void;
+		signal: AbortSignal;
 		sessionManager: {
 			getBranch: () => unknown[];
 			getSessionFile: () => string;
@@ -120,6 +121,8 @@ interface FakeCtx {
 	widgets: Map<string, unknown>;
 	notifications: FakeNotification[];
 	usagePercent: { value: number };
+	/** Abort the current run, like the user pressing Escape. */
+	abortRun: () => void;
 	/** Whether the fake session reports itself idle (for /ralph stop). */
 	idle: { value: boolean };
 	/** Factories passed to ui.custom (e.g. the backlog view). */
@@ -157,6 +160,7 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const notifications: FakeNotification[] = [];
 	const usagePercent = { value: 10 };
 	const idle = { value: true };
+	const runAbortController = new AbortController();
 	const customFactories: FakeCtx['customFactories'] = [];
 	const customOptions: FakeCtx['customOptions'] = [];
 	const customResultQueue: FakeCtx['customResultQueue'] = [];
@@ -174,6 +178,8 @@ function createFakeCtx(cwd: string): FakeCtx {
 		model: { provider: 'test', id: 'test-model', contextWindow: 200_000 },
 		mode: 'tui',
 		isIdle: () => idle.value,
+		// The run's abort signal, like pi's ExtensionContext.signal.
+		signal: runAbortController.signal,
 		getContextUsage: () => ({
 			percent: usagePercent.value,
 			tokens: Math.round((200_000 * usagePercent.value) / 100)
@@ -228,6 +234,7 @@ function createFakeCtx(cwd: string): FakeCtx {
 		widgets,
 		notifications,
 		usagePercent,
+		abortRun: () => runAbortController.abort(),
 		idle,
 		customFactories,
 		customOptions,
@@ -511,9 +518,10 @@ describe('ralph-loop extension', () => {
 		await startLoop(fake, fakeCtx);
 
 		// The assistant requests a tool call, then the user presses Escape while
-		// it runs: the tool ends as an error and the run settles without an
-		// 'aborted' assistant message.
+		// it runs: the run's abort signal fires, the tool ends as an error, and
+		// the run settles without an 'aborted' assistant message.
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'toolUse' } });
+		fakeCtx.abortRun();
 		await fake.fire('tool_execution_end', fakeCtx.ctx, {
 			isError: true,
 			result: { content: [{ type: 'text', text: 'Operation aborted' }] }
@@ -530,6 +538,32 @@ describe('ralph-loop extension', () => {
 		await ralph.handler('resume', fakeCtx.ctx);
 		expect(fake.userMessages.length).toBe(2);
 		expect(fake.userMessages.at(-1)?.text).toContain('was paused and is now resumed');
+	});
+
+	test('failing tool whose output mentions "abort" does not pause the loop on a clean finish', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// A tool fails (e.g. a grep with no match) and its output merely
+		// *contains* the word "abort" (file names). No Escape was pressed: the
+		// run signal stays un-aborted and the run finishes cleanly.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'toolUse' } });
+		await fake.fire('tool_execution_end', fakeCtx.ctx, {
+			isError: true,
+			result: {
+				content: [{ type: 'text', text: 'abort-signals.ts abort.ts\npackages/ai/package.json: no match' }]
+			}
+		});
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The clean finish wins: the loop keeps running, no pause notice.
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+		expect(fake.userMessages.length).toBe(1);
 	});
 
 	test('typing while paused stays paused: the message is an extra instruction', async () => {
