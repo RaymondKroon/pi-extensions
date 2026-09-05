@@ -1,0 +1,7 @@
+		description:
+			'Read/update the single goal of the Ralph backlog (active loop\'s backlog, else TODO.ralph). The goal is the user\'s contract: its title/body are read-only; change only its state via this tool. Actions: show (title, status, body, evidence, checkpoint), checkpoint (goal loop only; replaces the goal checkpoint), complete (goal loop only; goal open and no open tasks; note = verification evidence; claims the goal and pauses for the user\'s approval, or done when auto-approve is on), confirm (claimed → done; only after user approval), withdraw (claimed → open; note = what is missing, becomes the checkpoint).',
+			promptSnippet: 'Read/update the Ralph goal',
+			promptGuidelines: [
+				'ralph_goal complete requires a full verification run of every SPEC.md command with evidence; never claim an unverified completion.',
+				'After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then ralph_goal confirm; rejected → ralph_goal withdraw with what is missing, then keep working.'
+			],

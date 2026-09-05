@@ -1,0 +1,15 @@
+{
+	"name": "better-edit-extension",
+	"private": true,
+	"type": "module",
+	"keywords": ["pi-package"],
+	"scripts": {
+		"test": "bun test ."
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
