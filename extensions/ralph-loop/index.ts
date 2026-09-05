@@ -54,6 +54,10 @@ const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_COMPACTION_MODE = true;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
+/** Tools activated additively (defer_loading) by ralph_enable or /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
+const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision'];
+/** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
+const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
 type RotationReason = 'completed-task' | 'plan-updated' | 'context-limit';
 
@@ -1329,6 +1333,18 @@ export default function (pi: ExtensionAPI) {
 		pi.appendEntry(STATE_TYPE, next);
 	};
 
+	// The ralph tools cost zero context until activated (by ralph_enable or
+	// /ralph start). Activation is purely additive (defer_loading-friendly);
+	// deactivation only happens on session start with no active loop — once
+	// in context, the tools stay in context for the rest of the session
+	// (loop stop does not remove them, which would break the cached prefix).
+	const syncToolActivation = () => {
+		const active = pi.getActiveTools();
+		const next = active.filter((name) => !RALPH_TOOL_NAMES.includes(name));
+		if (state?.enabled) for (const name of RALPH_TOOL_NAMES) if (!next.includes(name)) next.push(name);
+		if (next.length !== active.length) pi.setActiveTools(next);
+	};
+
 	const updateStatus = (ctx: ExtensionContext) => {
 		const autoApproveDecisions = state?.enabled ? state.autoApproveDecisions : config.autoApproveDecisions;
 		const mode = state?.blocked
@@ -1404,6 +1420,8 @@ export default function (pi: ExtensionAPI) {
 			blocked: false,
 			blockedItem: undefined
 		});
+		// Note: no syncToolActivation here — the tools stay in context after a
+		// stop (removing them would invalidate the cached prompt prefix).
 		updateStatus(ctx);
 		ctx.ui.notify(message, 'info');
 	};
@@ -1422,17 +1440,33 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify('Ralph is paused — reply below and we’ll decide it together.', 'info');
 	};
 
+	// ralph_enable stays active at all times (it is the unlock for the lazy
+	// ralph tools); everything else in RALPH_TOOL_NAMES is loop-gated.
+	pi.registerTool({
+		name: 'ralph_enable',
+		label: 'Enable Ralph tools',
+		description: 'Enable the ralph_todo, ralph_goal, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable.',
+		promptSnippet: 'Enable the Ralph tools',
+		parameters: Type.Object({}),
+		async execute() {
+			const active = pi.getActiveTools();
+			const next = [...active];
+			for (const name of RALPH_TOOL_NAMES) if (!next.includes(name)) next.push(name);
+			if (next.length !== active.length) pi.setActiveTools(next);
+			return {
+				content: [{ type: 'text', text: 'Ralph tools enabled for this session.' }],
+				details: {}
+			};
+		}
+	});
+
 	pi.registerTool({
 		name: 'ralph_request_decision',
 		label: 'Request Ralph decision',
-		description: 'Pause the active Ralph loop and present a precise decision question to the user.',
-		promptSnippet: 'Pause Ralph for a user decision',
-		promptGuidelines: [
-			'Use ralph_request_decision instead of guessing whenever active Ralph work needs a user decision. Include one precise question and the evidence or options needed to answer it.'
-		],
+		description: 'Pause the active Ralph loop with a decision question for the user. Use it instead of guessing whenever active Ralph work needs a user decision; include one precise question and the evidence/options.',
 		parameters: Type.Object({
-			question: Type.String({ description: 'The exact decision the user must make.' }),
-			context: Type.Optional(Type.String({ description: 'Relevant evidence, constraints, and options.' }))
+			question: Type.String({ description: 'The decision the user must make.' }),
+			context: Type.Optional(Type.String({ description: 'Evidence, constraints, and options.' }))
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state?.enabled) throw new Error('Ralph is not active.');
@@ -1473,14 +1507,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'ralph_resolve_decision',
 		label: 'Resolve Ralph decision',
-		description: 'Unblock an active Ralph loop after the user decision has been documented.',
-		promptSnippet: 'Resume Ralph after documenting a user decision',
-		promptGuidelines: [
-			'Call ralph_resolve_decision only after the user has answered a pending Ralph decision and the decision, approver, rationale, and evidence are recorded in versioned documentation.'
-		],
+		description: 'Resume the blocked Ralph loop after the user decision is documented. Call it only after the user answered and the decision (approver, rationale, evidence) is recorded in versioned documentation.',
 		parameters: Type.Object({
-			recordPath: Type.String({ description: 'Repository-relative path of the decision record.' }),
-			resolution: Type.String({ description: 'Concise statement of the agreed decision.' })
+			recordPath: Type.String({ description: 'Path of the decision record.' }),
+			resolution: Type.String({ description: 'The agreed decision.' })
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state?.enabled) throw new Error('Ralph is not active.');
@@ -1539,11 +1569,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-			'Read or update the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph, which must exist first (create it with action "init" or "import"). Tasks are addressed by their position number in the list ("1", "2", …) as shown by list/next. Actions: next (compact view of the first open task — prefer it over list when you only need the next task), list (compact by default: counts, per-list counts, and open tasks; pass category to filter to one list, pass task for a single task detail view (body, checkpoint, and completion log), and verbose: true for completed tasks, checkpoints, and completion log entries), search (case-insensitive substring match over task titles, bodies, checkpoints, and completion log notes; requires query, optionally scoped with category — use it instead of grepping the backlog file), complete, checkpoint (loop only), add, add-many, new-list, log, move, import, init. "add" adds a task to an existing list given by "category" (required; it never creates a list); use "new-list" with a name to create a new list explicitly. "add-many" adds several tasks at once via the "tasks" array to the list given by "category" (required; all-or-nothing; an entry may override the batch category). "log" records a completion entry for a task (requires the task number); pass kind: "reopen" when re-opening a completed task so the entry is marked with a cross instead of a check. "complete" marks the task done; with a note it also records the completion log entry in the same call. "move" reorders a task with direction "up" or "down" (optionally "by" steps) within the list. "import" converts a Markdown TODO file (file) into the ralph format, always merging into the project\'s TODO.ralph; each source file is only imported once. Imported tasks are stamped with category, which defaults to a name derived from the file name (TODO_EMAIL.md → Email). "init" explicitly bootstraps an empty backlog at the target path when it does not exist yet (idempotent; refuses to overwrite a non-ralph file).',
-		promptSnippet: 'Read/update the Ralph backlog',
-		promptGuidelines: [
-			'Use ralph_todo to read or update the ralph-format backlog; never read or modify the backlog file by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use action "search" to find tasks by keyword.'
-		],
+			`Read/update the Ralph backlog (ralph-format TODO file). Targets the active loop\'s backlog, else the project\'s TODO.ralph (create with action "init"). Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (loop only), add (needs existing category), add-many, new-list, log, move, import, init. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('next'),
@@ -1560,39 +1586,35 @@ export default function (pi: ExtensionAPI) {
 				Type.Literal('init')
 			]),
 			task: Type.Optional(
-				Type.String({ description: 'Task number (as shown by list/next, e.g. "3"): the target of complete/checkpoint/log/move; with list: show that single task\'s detail view (body, checkpoint, completion log) instead of the whole backlog.' })
+				Type.String({ description: 'Task number as shown by list/next (e.g. "3"); with list: that task\'s detail.' })
 			),
-			note: Type.Optional(Type.String({ description: 'Checkpoint note (checkpoint), completion-log entry (log), or completion summary recorded with the task (complete).' })),
-			title: Type.Optional(Type.String({ description: 'New task title (add).' })),
-			body: Type.Optional(Type.String({ description: 'New task body, markdown bullets (add).' })),
+			note: Type.Optional(Type.String({ description: 'Checkpoint note, log entry, or completion summary (with complete).' })),
+			title: Type.Optional(Type.String()),
+			body: Type.Optional(Type.String()),
 			tasks: Type.Optional(
 				Type.Array(
 					Type.Object({
-						title: Type.String({ description: 'Task title.' }),
-						body: Type.Optional(Type.String({ description: 'Task body, markdown bullets.' })),
-						category: Type.Optional(Type.String({ description: 'Existing list for this task; overrides the batch category (add-many). Must already exist; use new-list to create one first.' }))
+						title: Type.String(),
+						body: Type.Optional(Type.String()),
+						category: Type.Optional(Type.String())
 					}),
-					{ description: 'Tasks to add in order (add-many). The batch is all-or-nothing: if any entry is invalid, nothing is added.' }
+					{ description: 'Tasks for add-many (all-or-nothing).' }
 				)
 			),
-			name: Type.Optional(Type.String({ description: 'New list name (new-list). Creating a list is explicit and separate from adding a task.' })),
-			category: Type.Optional(Type.String({ description: 'Existing list (list: filter the summary to it; add and add-many: required target list; search: restrict the match to it). Must already exist; use new-list to create one first. For import: list stamped on the imported tasks; defaults to a name derived from the file name (TODO_EMAIL.md → Email).' })),
-			query: Type.Optional(Type.String({ description: 'Case-insensitive substring to search for (search) in task titles, bodies, checkpoints, and completion log notes.' })),
-			verbose: Type.Optional(Type.Boolean({ description: 'list: include completed tasks, checkpoints, and completion log entries (default: compact summary of open tasks).' })),
-			date: Type.Optional(Type.String({ description: 'YYYY-MM-DD for the log entry (log; defaults to today).' })),
+			name: Type.Optional(Type.String()),
+			category: Type.Optional(Type.String({ description: 'Existing list (must exist; create with new-list).' })),
+			query: Type.Optional(Type.String()),
+			verbose: Type.Optional(Type.Boolean()),
+			date: Type.Optional(Type.String()),
 			kind: Type.Optional(
 				Type.Union([Type.Literal('done'), Type.Literal('reopen')], {
-					description: 'Log entry kind (log; defaults to done). Use reopen when re-opening a completed task.'
+					description: 'reopen re-opens a completed task (default done).'
 				})
 			),
-			direction: Type.Optional(
-				Type.Union([Type.Literal('up'), Type.Literal('down')], {
-					description: 'Move direction (move; required for move).'
-				})
-			),
-			by: Type.Optional(Type.Integer({ minimum: 1, description: 'How many positions to move (move; defaults to 1).' })),
-			file: Type.Optional(Type.String({ description: 'Markdown TODO file (.md) to import (import); relative path inside the project.' })),
-			force: Type.Optional(Type.Boolean({ description: 'Overwrite an existing non-ralph TODO.ralph (import; defaults to false).' }))
+			direction: Type.Optional(Type.Union([Type.Literal('up'), Type.Literal('down')])),
+			by: Type.Optional(Type.Integer({ minimum: 1 })),
+			file: Type.Optional(Type.String()),
+			force: Type.Optional(Type.Boolean()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			// Import always targets the project's main backlog (TODO.ralph), which
@@ -1819,13 +1841,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_goal',
 		label: 'Ralph goal',
 		description:
-			'Read or update the single goal of the SQLite-backed Ralph backlog (ralph-format TODO file). With an active loop it targets the loop\'s backlog; otherwise the project\'s TODO.ralph. The goal is the user\'s contract: you are read-only on its title and body — only the user edits them, and you may only change the goal\'s state through this tool. Actions: show (works anywhere; prints the goal\'s title, status, body, evidence, and checkpoint), checkpoint (active goal loop only; replaces the single goal checkpoint — the durable state of task-less planning/re-evaluation iterations), complete (active goal loop only; requires the goal open and no open tasks; the completion bar is a full verification run — run every verification command required by SPEC.md first and pass the evidence; the goal becomes claimed and the loop pauses for the user\'s approval, or goes straight to done when auto-approve decisions is enabled), confirm (active goal loop only; claimed → done — call it only after the user approved the completion), withdraw (active goal loop only; claimed → open — call it when the user rejected the completion, with a note describing what is missing; the note becomes the goal checkpoint).',
-		promptSnippet: 'Read/update the Ralph goal',
-		promptGuidelines: [
-			'Use ralph_goal for the goal of the active goal loop; the goal text is the user\'s contract — you are read-only on it and may only change its state through this tool.',
-			'ralph_goal complete is the completion bar: run every verification command required by SPEC.md first and pass the evidence; never claim an unverified completion.',
-			'ralph_goal complete pauses the loop for the user\'s approval: after the answer, approved → record the decision, call ralph_resolve_decision, then ralph_goal confirm; rejected → ralph_goal withdraw with what is missing, then keep working.'
-		],
+			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else TODO.ralph). The goal is the user\'s contract: its title/body are read-only; change only its state via this tool. Actions: show, checkpoint, complete, confirm, withdraw (all but show require the active goal loop). complete requires a full verification run of every SPEC.md command with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('show'),
@@ -2172,6 +2188,7 @@ export default function (pi: ExtensionAPI) {
 				category
 			};
 			persistState(next);
+			syncToolActivation();
 			updateStatus(ctx);
 			compactionGateNotified = false;
 			pi.sendUserMessage(iterationPrompt(next));
@@ -2245,6 +2262,13 @@ export default function (pi: ExtensionAPI) {
 			pi.sendUserMessage(resumePrompt(state), { deliverAs: 'followUp' });
 		}
 	};
+
+	// Dynamic tool loading (pi "defer_loading"): the four ralph tools stay
+	// inactive until ralph_enable or /ralph start activates them additively.
+	// They carry no promptSnippet/promptGuidelines on purpose — activating a
+	// tool with prompt metadata rebuilds the system prompt and invalidates the
+	// cached prefix, even on providers with native deferred loading. All
+	// behavioural rules live in the tool descriptions instead.
 
 	pi.on('session_start', async (_event, ctx) => {
 		state = undefined;
@@ -2320,6 +2344,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		updateStatus(ctx);
+		syncToolActivation();
 	});
 
 	pi.on('model_select', (_event, ctx) => {

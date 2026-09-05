@@ -53,6 +53,8 @@ function createFakePi() {
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
 	const userMessages: FakeUserMessage[] = [];
 	const customMessages: FakeCustomMessage[] = [];
+	// Mirrors pi: registered tools are active by default.
+	const activeTools: string[] = ['read', 'bash', 'edit', 'write'];
 
 	const pi = {
 		on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
@@ -62,6 +64,7 @@ function createFakePi() {
 		},
 		registerTool: (tool: { name: string }) => {
 			tools.set(tool.name, tool);
+			activeTools.push(tool.name);
 		},
 		registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => unknown }) => {
 			commands.set(name, command);
@@ -74,6 +77,11 @@ function createFakePi() {
 		},
 		sendMessage: (message: { customType?: string; content?: string }, options?: unknown) => {
 			customMessages.push({ message, options });
+		},
+		getActiveTools: () => [...activeTools],
+		setActiveTools: (names: string[]) => {
+			activeTools.length = 0;
+			activeTools.push(...names);
 		}
 	};
 
@@ -84,6 +92,7 @@ function createFakePi() {
 		entries,
 		userMessages,
 		customMessages,
+		activeTools,
 		fire: async (name: string, ctx: unknown, event: unknown = {}) => {
 			let last: unknown;
 			for (const handler of handlers.get(name) ?? []) {
@@ -3628,5 +3637,82 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
 		expect(summary?.message.content).toContain('Checkpoints in this loop:');
 		expect(summary?.message.content).toContain('2. Task two: checkpoint (iteration 1): Half done; next step: finish the tests.');
+	});
+});
+
+describe('ralph-loop extension (lazy tool activation)', () => {
+	const RALPH_TOOLS = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision'];
+
+	beforeEach(async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+	});
+
+	test('ralph tools are disabled when no loop is active', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		for (const name of RALPH_TOOLS) expect(fake.activeTools).not.toContain(name);
+		expect(fake.activeTools).toEqual(['read', 'bash', 'edit', 'write', 'ralph_enable']);
+	});
+
+	test('ralph tools are enabled while the loop runs and stay enabled after stop', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		for (const name of RALPH_TOOLS) expect(fake.activeTools).toContain(name);
+
+		// Loop stop keeps the tools in context (removing them would break the
+		// cached prompt prefix); a fresh session start disables them again.
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		for (const name of RALPH_TOOLS) expect(fake.activeTools).toContain(name);
+
+		const fake2 = createFakePi();
+		extension(fake2.pi as never);
+		const fakeCtx2 = createFakeCtx(dir);
+		await fake2.fire('session_start', fakeCtx2.ctx, { reason: 'startup' });
+		for (const name of RALPH_TOOLS) expect(fake2.activeTools).not.toContain(name);
+	});
+
+	test('ralph_enable unlocks the lazy tools from chat without a loop', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		for (const name of RALPH_TOOLS) expect(fake.activeTools).not.toContain(name);
+
+		const enable = fake.tools.get('ralph_enable') as {
+			execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
+		};
+		await enable.execute('t', {}, undefined, undefined, fakeCtx.ctx);
+
+		for (const name of RALPH_TOOLS) expect(fake.activeTools).toContain(name);
+	});
+
+	test('ralph tools carry no prompt metadata (cache-safe deferred loading)', () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		for (const name of RALPH_TOOLS) {
+			const tool = fake.tools.get(name) as { promptSnippet?: string; promptGuidelines?: string[] };
+			expect(tool.promptSnippet).toBeUndefined();
+			expect(tool.promptGuidelines).toBeUndefined();
+		}
+	});
+
+	test('tool descriptions point at the bundled reference doc', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const todo = fake.tools.get('ralph_todo') as { description: string };
+		const goal = fake.tools.get('ralph_goal') as { description: string };
+		const refPath = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
+		expect(todo.description).toContain(refPath);
+		expect(goal.description).toContain(refPath);
+		const text = await readFile(refPath, 'utf8');
+		expect(text).toContain('call `ralph_enable` first');
+		expect(text).toContain('## ralph_goal actions');
 	});
 });
