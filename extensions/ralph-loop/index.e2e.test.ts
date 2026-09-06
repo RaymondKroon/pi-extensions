@@ -753,4 +753,49 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(todoOnDisk).toContain('GE "All acceptance criteria verified: bun test passes (5 suites)."');
 		}
 	);
+
+	test(
+		'auto mode: context-limit rotation finishes up, then a fresh iteration runs with a clean context',
+		{ timeout: 60000 },
+		async () => {
+			// The auto mode is a config setting: a plain /ralph start stores its
+			// state in _auto_.ralph with an auto-created session category.
+			endpoint = startMockEndpoint([
+				textResponder(`${BLOB_MARKER} work output. `.repeat(400), { prompt_tokens: 1500, completion_tokens: 800 }),
+				textResponder('Finished up; todos recorded for the next iteration.'),
+				textResponder('Continuing from the recorded todos.')
+			]);
+			const sess = await createRalphSession(endpoint.port, {
+				contextThresholds: { __default__: 0.1 },
+				autoApproveDecisions: false,
+				maxIterations: 10,
+				autoMode: 'auto'
+			});
+
+			await sess.prompt('/ralph start');
+
+			// Iteration 1 runs the auto loop prompt against the real pipeline.
+			await waitFor(() => (endpoint!.requests.length >= 1), 'iteration 1 request');
+			expect(requestText(endpoint!.requests[0]!)).toContain('Run the Ralph auto loop');
+
+			// The turn settles above the threshold: the extension must deliver the
+			// finish-up prompt (not a checkpoint prompt) as the next model request.
+			await waitFor(() => endpoint!.requests.length >= 2, 30000);
+			const finishRequest = endpoint!.requests[1]!;
+			expect(requestText(finishRequest)).toContain('Finish up now');
+			expect(requestText(finishRequest)).toContain('ralph_auto');
+
+			// The finish-up turn settles: a fresh iteration starts, and the
+			// context-boundary filter keeps the old work turn out of the model's
+			// context.
+			await waitFor(() => endpoint!.requests.length >= 3, 30000);
+			const freshRequest = endpoint!.requests[2]!;
+			expect(requestText(freshRequest)).toContain('Run the Ralph auto loop');
+			expect(requestText(freshRequest)).not.toContain(BLOB_MARKER);
+
+			// The state file was created with the auto-created session category.
+			const autoFile = await readFile(join(projectDir, '_auto_.ralph'), 'utf8');
+			expect(autoFile).toContain('M list "Session-');
+		}
+	);
 });

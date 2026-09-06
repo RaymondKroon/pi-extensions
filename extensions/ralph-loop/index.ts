@@ -47,6 +47,8 @@ const COMPLETION_SUMMARY_TYPE = 'ralph-loop-completion-summary';
 const COMPACTION_SOURCE = 'ralph-loop';
 const DEFAULT_TODO = 'TODO.ralph';
 const DEFAULT_SPEC = 'SPEC.md';
+/** Fixed state file of the auto mode: loop state and session todos live here. */
+const AUTO_TODO_FILE = '_auto_.ralph';
 /** Generic planning document bundled with this extension for /ralph-init to adapt. */
 const INIT_TEMPLATE_SPEC = join(import.meta.dirname, 'SPEC.template.md');
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
@@ -54,8 +56,18 @@ const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_COMPACTION_MODE = true;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
+/**
+ * The auto mode setting: off — nothing automatic; on — the auto loop starts
+ * at session start; auto — the auto loop arms itself when the context crosses
+ * the budget (at session start or mid-session) and records todos for the next
+ * iteration.
+ */
+type AutoMode = 'off' | 'on' | 'auto';
+const DEFAULT_AUTO_MODE: AutoMode = 'off';
 /** Tools activated additively (defer_loading) by ralph_enable or /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
 const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision'];
+/** The dedicated tool of the auto mode; an active auto loop activates only this one. */
+const AUTO_TOOL_NAME = 'ralph_auto';
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
@@ -74,6 +86,16 @@ interface RalphConfig {
 	 * extension-provided compaction (no LLM call).
 	 */
 	compactionMode: boolean;
+	/**
+	 * The auto loop (state in _auto_.ralph, auto-created session category,
+	 * ralph_auto tool, rotation on the context budget): off — nothing
+	 * automatic; on — the loop starts at session start; auto — the loop arms
+	 * itself when the context crosses the budget (at session start or
+	 * mid-session) and records todos for the next iteration. A plain
+	 * /ralph start uses the auto loop unless the mode is off (an explicit
+	 * --goal start is unaffected).
+	 */
+	autoMode: AutoMode;
 }
 
 interface LegacyRalphConfig {
@@ -87,8 +109,8 @@ interface RalphState {
 	contextThreshold: number;
 	autoApproveDecisions: boolean;
 	enabled: boolean;
-	/** Loop policy: the finite task backlog or the single goal. */
-	mode: 'tasks' | 'goal';
+	/** Loop policy: the finite task backlog, the single goal, or the auto loop. */
+	mode: 'tasks' | 'goal' | 'auto';
 	todoPath: string;
 	specPath: string;
 	/** Backlog snapshot at the start of the current loop (never rotated). */
@@ -125,7 +147,7 @@ function isRalphState(value: unknown): value is RalphState {
 	const state = value as Partial<RalphState>;
 	return (
 		typeof state.enabled === 'boolean' &&
-		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal') &&
+		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal' || state.mode === 'auto') &&
 		typeof state.todoPath === 'string' &&
 		typeof state.specPath === 'string' &&
 		(state.loopStartTodo === undefined || typeof state.loopStartTodo === 'string') &&
@@ -177,6 +199,17 @@ function isMaxIterations(value: unknown): value is number {
 	return typeof value === 'number' && Number.isInteger(value) && value >= 1;
 }
 
+function isAutoMode(value: unknown): value is AutoMode {
+	return value === 'off' || value === 'on' || value === 'auto';
+}
+
+/** Accept the current string values plus the legacy boolean (true = auto, false = off). */
+function normalizeAutoMode(value: unknown): AutoMode | undefined {
+	if (isAutoMode(value)) return value;
+	if (value === true) return 'auto';
+	if (value === false) return 'off';
+}
+
 function isRalphConfig(value: unknown): value is RalphConfig {
 	if (!value || typeof value !== 'object') return false;
 	const config = value as Partial<RalphConfig>;
@@ -186,15 +219,16 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
 		typeof config.autoApproveDecisions === 'boolean' &&
 		isMaxIterations(config.maxIterations) &&
-		typeof config.compactionMode === 'boolean'
+		typeof config.compactionMode === 'boolean' &&
+		isAutoMode(config.autoMode)
 	);
 }
 
 /** A saved config missing newer optional fields; normalizeConfig fills the defaults. */
 function isRalphConfigPartial(
 	value: unknown
-): value is Omit<RalphConfig, 'maxIterations' | 'compactionMode'> &
-	Partial<Pick<RalphConfig, 'maxIterations' | 'compactionMode'>> {
+): value is Omit<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode'> &
+	Partial<Pick<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode'>> {
 	if (!value || typeof value !== 'object') return false;
 	const config = value as Partial<RalphConfig>;
 	return (
@@ -203,7 +237,8 @@ function isRalphConfigPartial(
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
 		typeof config.autoApproveDecisions === 'boolean' &&
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
-		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean')
+		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean') &&
+		(config.autoMode === undefined || normalizeAutoMode(config.autoMode) !== undefined)
 	);
 }
 
@@ -223,7 +258,8 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 		return {
 			...value,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
-			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE
+			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
+			autoMode: normalizeAutoMode(value.autoMode) ?? DEFAULT_AUTO_MODE
 		};
 	}
 	if (isLegacyRalphConfig(value)) {
@@ -231,7 +267,8 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: value.contextThreshold },
 			autoApproveDecisions: value.autoApproveDecisions,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
-			compactionMode: DEFAULT_COMPACTION_MODE
+			compactionMode: DEFAULT_COMPACTION_MODE,
+			autoMode: DEFAULT_AUTO_MODE
 		};
 	}
 }
@@ -241,7 +278,8 @@ function defaultConfig(): RalphConfig {
 		contextThresholds: {},
 		autoApproveDecisions: DEFAULT_AUTO_APPROVE_DECISIONS,
 		maxIterations: DEFAULT_MAX_ITERATIONS,
-		compactionMode: DEFAULT_COMPACTION_MODE
+		compactionMode: DEFAULT_COMPACTION_MODE,
+		autoMode: DEFAULT_AUTO_MODE
 	};
 }
 
@@ -339,7 +377,9 @@ function projectConfigPath(cwd: string): string {
 
 /**
  * Number the task Ralph is currently working on so the status shows an
- * increasing counter (e.g. task 4/12 once three tasks are complete).
+ * increasing counter (e.g. task 4/12 once three tasks are complete):
+ * completed + 1, so the counter tracks work order even when tasks are
+ * completed out of order or reference entries are interleaved.
  */
 function countTodoTasks(todo: string, category?: string): { current: number; total: number } {
 	const { open, total } = todoCounts(todo, category);
@@ -384,6 +424,31 @@ function completedTaskNumbers(previousTodo: string, currentTodo: string, categor
 /** A Ralph backlog is finished when it has no open tasks (Markdown: no unchecked boxes). */
 function isBacklogFinished(todo: string, category?: string): boolean {
 	return todoCounts(todo, category).open === 0;
+}
+
+/**
+ * The auto mode's reference entries: "Goal: " big-picture tracking tasks and
+ * "Findings: " notes from earlier iterations are not work items. ralph_auto
+ * "next" skips them so an iteration never stalls on a reference entry.
+ */
+function isReferenceTaskTitle(title: string): boolean {
+	return title.startsWith('Goal: ') || title.startsWith('Findings: ');
+}
+
+/**
+ * Open work tasks in a ralph backlog snapshot (reference entries excluded),
+ * optionally scoped to a category. Non-ralph formats and parse failures
+ * count as zero.
+ */
+function openWorkTaskCount(todo: string, category?: string): number {
+	if (!isRalphBacklog(todo)) return 0;
+	try {
+		return Backlog.parse(todo)
+			.listTasks(category)
+			.filter((task) => !task.done && !isReferenceTaskTitle(task.title)).length;
+	} catch {
+		return 0;
+	}
 }
 
 type GoalPhase = 'planning' | 'execution' | 're-evaluation';
@@ -504,6 +569,37 @@ function formatDecisionMessage(question: string, context?: string): string {
 }
 
 function iterationPrompt(state: RalphState, reason?: RotationReason): string {
+	if (state.mode === 'auto') {
+		const contextNote =
+			reason === 'context-limit'
+				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. The backlog also carries "Findings: " entries with what the previous iteration learned, and DEBUG.md at the project root may carry durable debug findings — read them before starting work instead of rediscovering what they already establish.'
+				: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
+		// From the second iteration on, the backlog also carries the big-picture
+		// layer ("Goal: " tracking tasks) and the findings layer ("Findings: "
+		// reference notes from earlier iterations).
+		const referenceTaskNote =
+			state.iteration > 1
+				? ' Tasks whose title starts with "Goal: " or "Findings: " are not work items, and "next" skips them: Goal tasks are big-picture tracking tasks (complete one only when its objective is actually met, with evidence), and Findings entries are reference notes from earlier iterations. Read the open Findings entries before starting work, then mark each one done with ralph_auto (action "complete") so the backlog does not accumulate open reference entries.'
+				: '';
+		const bigGoalMaintenance =
+			state.iteration > 1
+				? `
+Keep the big picture in the backlog: if no open task in your category starts with "Goal: ", add the larger remaining objectives this work serves with ralph_auto (action "add", title "Goal: <objective>", body with the acceptance evidence to look for).`
+				: '';
+		return `Run the Ralph auto loop for this repository. ${contextNote}
+
+The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_auto tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Your session's todos live in category "${state.category}".
+
+1. Call ralph_auto with action "next" to get the next open work task in your session category.${referenceTaskNote}
+2. If there is an open task: read the relevant code and source evidence, then implement exactly one coherent vertical slice. Add focused tests and run every quality command required by the backlog and ${state.specPath} (when present).
+3. Only after all acceptance criteria pass, call ralph_auto with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record.
+4. After completing a task, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.
+5. If there are no open tasks, do the work the user asks for in chat; do not invent backlog work.${bigGoalMaintenance}
+Keep the project's knowledge current as you learn: append durable debug findings (root causes, failed approaches, environment quirks) to DEBUG.md at the project root (create it if missing), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed or is not yet documented.
+
+When this iteration reaches its context budget you will be told to finish up: it is OK to leave the code in a bad state — record the remaining work and the important findings as todo entries for the next iteration with ralph_auto (action "add"), and stop. The fresh iteration continues from the backlog.`;
+	}
+
 	const contextNote =
 		reason === 'context-limit'
 			? 'The previous iteration reached its context budget and recorded a durable TODO checkpoint. Re-establish facts from the repository and TODO before continuing; do not rely on the old conversation.'
@@ -707,11 +803,40 @@ Report the checkpoint and the next step succinctly.`;
 	return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
 
 1. Read ${state.todoPath} and identify the currently selected unchecked item.
-2. Update that item in ${state.todoPath} with a concise, non-checkbox “Context checkpoint (iteration ${state.iteration})” note. Include completed implementation/test evidence, relevant changed paths, known failures or risks, and the exact next step. Use the actual iteration number shown above in the label — never a placeholder. If the item already has a “Context checkpoint” note, replace it with this one: keep only the single most recent checkpoint, because an older checkpoint’s state and next step are stale. Do not put this in the completion log: the item is not complete.
+2. Update that item in ${state.todoPath} with a concise, non-checkbox “Context checkpoint (iteration ${state.iteration})” note. Include completed implementation/test evidence, relevant changed paths, known failures or risks, and the exact next step. Use the actual iteration number shown above in the label — never a placeholder. If the item already has a “Context checkpoint” note, replace it with this one: keep only the single most recent checkpoint, because an older checkpoint’s state and next step is stale. Do not put this in the completion log: the item is not complete.
 3. Keep a single exact next step in the checkpoint note.
 4. Do not mark the item complete, do not claim unverified work, do not modify product code, and do not commit. Do not continue implementation after recording the checkpoint.
 
 Report the checkpoint path and the next step succinctly.`;
+}
+
+/**
+ * The auto-mode rotation prompt: sent as the dedicated finish-up turn when the
+ * iteration reaches its context budget. Finishing the handoff matters more
+ * than a clean state: the model may leave the code in a bad state and records
+ * the remaining work as todo entries
+ * for the next iteration in the auto-created session category; from the second
+ * iteration on it also keeps the big-picture ("Goal: ") tracking tasks in the
+ * backlog. The settled turn starts the fresh iteration.
+ */
+function autoFinishPrompt(state: RalphState): string {
+	// From the second iteration on, the handoff also refreshes the big-picture
+	// layer: the first round establishes what the work is about, the later
+	// rounds keep the larger objectives visible in the backlog.
+	const bigPicture =
+		state.iteration > 1
+			? `
+4. Keep the big picture in the backlog: for each larger remaining objective this work serves (not the immediate next step), check whether an open task whose title starts with "Goal: " covers it; if it is missing, add it with ralph_auto (action "add", title "Goal: <objective>", body with the acceptance evidence to look for). Big-picture tasks are tracking tasks, not next steps.`
+			: '';
+	return `The current Ralph auto iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog. This is iteration ${state.iteration} of ${state.maxIterations}.
+
+1. Wrap up what you are doing. Finishing this handoff matters more than a clean state: it is OK to leave the code in a bad state (half-applied edits, failing builds, untested changes) — the next iteration will re-establish the facts and fix it. Mark any finished task complete with ralph_auto (action "complete", with a concise note).
+2. Record the remaining work for the next iteration: call ralph_auto with action "add" (title, optional body) for each todo entry in category "${state.category}". Each entry must be self-contained for a fresh session that has none of this conversation: what remains, why, relevant paths, the current state of the code (including anything broken or half-done), the debugging findings that bear on it (root causes found, approaches tried that failed, current build/test state), and the exact next step.
+3. Log the important findings for the next iteration: call ralph_auto with action "add" (title "Findings: <short summary>", body as markdown bullets) for what this iteration learned that a fresh session would otherwise have to rediscover from scratch: root causes, approaches tried that failed and why, environment or tooling quirks, and key code locations with their current state. One entry per coherent cluster of findings; skip trivialities. Findings entries are reference notes, not work items. Findings of lasting value beyond the next iteration also belong in the repository: append them to DEBUG.md at the project root (create it if missing, organized by topic), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed.
+${bigPicture}
+Finally: do not start new work after recording the todos.
+
+Report the recorded todos and findings succinctly.`;
 }
 
 /**
@@ -1142,6 +1267,19 @@ function suggestCategory(input: string): string {
 		.join(' ');
 }
 
+/**
+ * The auto-created session category of an auto-mode loop: one per loop start
+ * (list names cannot contain spaces, hence the compact timestamp). A collision
+ * (two loops started within the same minute) gets a numeric suffix.
+ */
+function autoCategoryName(existing: string[], now: Date = new Date()): string {
+	const pad = (value: number) => String(value).padStart(2, '0');
+	const base = `Session-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+	let name = base;
+	for (let suffix = 2; existing.includes(name); suffix += 1) name = `${base}-${suffix}`;
+	return name;
+}
+
 type RalphImportOutcome =
 	| {
 			ok: true;
@@ -1304,6 +1442,12 @@ export default function (pi: ExtensionAPI) {
 	// Once per loop: whether the keepRecentTokens gate notification was shown
 	// (a rotation compaction refused because the iteration is too small).
 	let compactionGateNotified = false;
+	// Auto mode "auto": once the auto loop is stopped in this session, the
+	// context-budget intercept must not re-arm it (an explicit stop wins).
+	let autoInterceptSuspended = false;
+	// In-flight auto-arm setup; the promise cache keeps a burst of streaming
+	// updates from arming two loops (two session categories).
+	let autoArmInFlight: Promise<RalphState | undefined> | undefined;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -1338,10 +1482,15 @@ export default function (pi: ExtensionAPI) {
 	// deactivation only happens on session start with no active loop — once
 	// in context, the tools stay in context for the rest of the session
 	// (loop stop does not remove them, which would break the cached prefix).
+	// An active auto loop activates only its dedicated ralph_auto tool; the
+	// task/goal loops activate the full ralph tool set.
 	const syncToolActivation = () => {
 		const active = pi.getActiveTools();
-		const next = active.filter((name) => !RALPH_TOOL_NAMES.includes(name));
-		if (state?.enabled) for (const name of RALPH_TOOL_NAMES) if (!next.includes(name)) next.push(name);
+		const next = active.filter((name) => !RALPH_TOOL_NAMES.includes(name) && name !== AUTO_TOOL_NAME);
+		if (state?.enabled) {
+			const names = state.mode === 'auto' ? [AUTO_TOOL_NAME] : RALPH_TOOL_NAMES;
+			for (const name of names) if (!next.includes(name)) next.push(name);
+		}
 		if (next.length !== active.length) pi.setActiveTools(next);
 	};
 
@@ -1354,20 +1503,32 @@ export default function (pi: ExtensionAPI) {
 				: state?.rotationCheckpointing
 					? state?.rotationReason === 'completed-task' || state?.rotationReason === 'plan-updated'
 						? 'recording'
-						: 'checkpointing'
+						: state?.mode === 'auto'
+							? 'finishing'
+							: 'checkpointing'
 					: state?.stopRequested
 						? 'stopping'
 						: state?.rotationQueued || freshIterationPending
 							? 'starting'
 							: 'on';
-		const label = state?.mode === 'goal' ? 'Ralph (goal)' : 'Ralph';
-		// Non-default modifiers, compact: (auto) and/or (compaction).
-		const modifiers = [autoApproveDecisions ? 'auto' : undefined, config.compactionMode ? 'compaction' : undefined]
+		// The label reflects the active loop's mode (a stopped goal loop keeps
+		// its marker); the auto mode setting shows in the state word instead.
+		const label =
+			state?.mode === 'goal' ? 'Ralph (goal)' : state?.enabled && state.mode === 'auto' ? 'Ralph (auto)' : 'Ralph';
+		// Idle state word: the auto mode setting itself: "on" and "auto" are
+		// armed (the loop starts at session start / at the context budget),
+		// not off.
+		const idleState = label === 'Ralph' ? config.autoMode : 'off';
+		// Non-default modifiers, compact: (auto-approve) and/or (compaction).
+		const modifiers = [autoApproveDecisions ? 'auto-approve' : undefined, config.compactionMode ? 'compaction' : undefined]
 			.filter((part): part is string => part !== undefined)
 			.join(', ');
 		const modifierSuffix = modifiers ? ` (${modifiers})` : '';
+		// In the idle on/auto states the context percentage is still shown: the
+		// auto loop rotates on the context budget, so the headroom matters.
+		const idleContext = idleState !== 'off' ? ` · context: ${contextUsageLabel(ctx, contextThresholdFor(config, ctx))}` : '';
 		const status = !state?.enabled
-			? `${label}: off${modifierSuffix}`
+			? `${label}: ${idleState}${modifierSuffix}${idleContext}`
 			: `${label}: ${mode}${modifierSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
@@ -1409,6 +1570,9 @@ export default function (pi: ExtensionAPI) {
 		taskCount = undefined;
 		goalState = undefined;
 		freshIterationPending = false;
+		// An explicit stop of the auto loop wins over auto mode: the
+		// context-budget intercept must not re-arm the loop in this session.
+		if (state.mode === 'auto') autoInterceptSuspended = true;
 		persistState({
 			...state,
 			enabled: false,
@@ -1445,13 +1609,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'ralph_enable',
 		label: 'Enable Ralph tools',
-		description: 'Enable the ralph_todo, ralph_goal, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable.',
+		description:
+			'Enable the ralph_todo, ralph_goal, ralph_auto, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable.',
 		promptSnippet: 'Enable the Ralph tools',
 		parameters: Type.Object({}),
 		async execute() {
 			const active = pi.getActiveTools();
 			const next = [...active];
-			for (const name of RALPH_TOOL_NAMES) if (!next.includes(name)) next.push(name);
+			for (const name of [...RALPH_TOOL_NAMES, AUTO_TOOL_NAME]) if (!next.includes(name)) next.push(name);
 			if (next.length !== active.length) pi.setActiveTools(next);
 			return {
 				content: [{ type: 'text', text: 'Ralph tools enabled for this session.' }],
@@ -1978,6 +2143,119 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// The dedicated tool of the auto mode: the session todos of _auto_.ralph.
+	// With an active auto loop it is scoped to the loop's auto-created session
+	// category; otherwise it reads the auto backlog unscoped. add and complete
+	// require an active auto loop. The auto loop activates only this tool —
+	// not the full ralph tool set.
+	pi.registerTool({
+		name: AUTO_TOOL_NAME,
+		label: 'Ralph auto session',
+		description:
+			`Read/update the Ralph auto-loop session todos in ${AUTO_TODO_FILE} (ralph format). With an active auto loop, scoped to the loop's session category. Actions: next (first open task), list (open tasks + counts), add (record a todo entry for the next iteration; title + optional body; auto loop only), complete (mark done; note also records the completion log; auto loop only). Never read or modify the file by any other means (no file tools, no grep/cat/sed).`,
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal('next'),
+				Type.Literal('list'),
+				Type.Literal('add'),
+				Type.Literal('complete')
+			]),
+			task: Type.Optional(Type.String({ description: 'Task number as shown by list/next (complete).' })),
+			title: Type.Optional(Type.String({ description: 'Todo title (add).' })),
+			body: Type.Optional(Type.String({ description: 'Todo detail as markdown bullets (add).' })),
+			note: Type.Optional(Type.String({ description: 'Completion summary (complete).' })),
+			verbose: Type.Optional(Type.Boolean())
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const autoLoop = state?.enabled && state.mode === 'auto' ? state : undefined;
+			const todoPath = autoLoop ? autoLoop.todoPath : resolve(ctx.cwd, AUTO_TODO_FILE);
+			const scope = autoLoop?.category;
+			const backlog = await loadTargetBacklog(todoPath, AUTO_TOOL_NAME);
+
+			let mutated = false;
+			let output: string;
+			switch (params.action) {
+				case 'next': {
+					// Reference entries ("Goal: " / "Findings: ") are not work
+					// items: skip them so the iteration never stalls on one.
+					const open = backlog.listTasks(scope).filter((task) => !task.done);
+					const task = open.find((task) => !isReferenceTaskTitle(task.title));
+					if (!task) {
+						const references = open.filter((task) => isReferenceTaskTitle(task.title));
+						output =
+							references.length > 0
+								? `No open work tasks remain${scope ? ` in category "${scope}"` : ''} (open reference entries, not work: ${references
+										.map((reference) => reference.title)
+										.join('; ')}).`
+								: `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
+						break;
+					}
+					output = formatNextTask(backlog, task, scope);
+					break;
+				}
+				case 'list': {
+					output = formatBacklog(backlog, scope, { verbose: params.verbose === true });
+					break;
+				}
+				case 'add': {
+					if (!autoLoop) {
+						throw new Error(
+							'add requires an active Ralph auto loop (set auto mode to "on" or "auto" in /ralph config, or start one with /ralph start).'
+						);
+					}
+					if (!params.title) throw new Error('add requires a title.');
+					const category = autoLoop.category ?? autoCategoryName(backlog.categories());
+					// The category is created at loop start; this is defensive.
+					if (!backlog.categories().includes(category)) backlog.createList(category);
+					const task = backlog.addTask({ title: params.title, body: params.body, category });
+					mutated = true;
+					const number = backlog.taskNumbers(category).get(task.id) ?? task.id;
+					output = `Recorded todo ${number} "${task.title}" for the next iteration in category "${category}".`;
+					break;
+				}
+				case 'complete': {
+					if (!autoLoop)
+						throw new Error(
+							'complete requires an active Ralph auto loop (set auto mode to "on" or "auto" in /ralph config, or start one with /ralph start).'
+						);
+					if (!params.task) throw new Error('complete requires the task number.');
+					const task = backlog.complete(params.task, scope);
+					mutated = true;
+					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+					let recorded = false;
+					if (params.note) {
+						const now = new Date();
+						const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+						backlog.addLogEntry({ task: String(number), date, note: params.note.trim() }, scope);
+						recorded = true;
+					}
+					output = `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}.`;
+					break;
+				}
+			}
+
+			if (mutated) {
+				try {
+					await writeFile(todoPath, backlog.render());
+				} catch (error) {
+					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+			return {
+				content: [{ type: 'text', text: output }],
+				details: { action: params.action, task: params.task ?? null }
+			};
+		},
+		renderResult(result, options) {
+			const text =
+				result.content
+					.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+					.map((part) => part.text)
+					.join('\n') || 'Ralph auto session updated.';
+			return new Markdown(options.isPartial ? '> Ralph auto session…' : text, 0, 0, getMarkdownTheme());
+		}
+	});
+
 	const startFreshIteration = (ctx: ExtensionContext) => {
 		void (async () => {
 			if (!state?.enabled) return;
@@ -1985,8 +2263,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
 				// Goal mode is done when the goal is done, not when the plan is
-				// exhausted: an empty plan is the planning state.
-				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
+				// exhausted: an empty plan is the planning state. Auto mode never
+				// stops on an empty backlog: the session category starts empty.
+				if (state.mode !== 'goal' && state.mode !== 'auto' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
@@ -2113,6 +2392,85 @@ export default function (pi: ExtensionAPI) {
 		})();
 	};
 
+	/**
+	 * Set up the auto loop's durable state: the _auto_.ralph backlog with its
+	 * auto-created session category, the loop state, and the ralph_auto tool
+	 * activation. Shared by /ralph start, the session-start auto start (auto
+	 * mode "on"), and the context-budget intercept (auto mode "auto"). Returns
+	 * undefined (with a notification) when the setup fails.
+	 */
+	const setupAutoLoop = async (ctx: ExtensionContext): Promise<RalphState | undefined> => {
+		const todoPath = resolve(ctx.cwd, AUTO_TODO_FILE);
+		const specPath = resolve(ctx.cwd, DEFAULT_SPEC);
+		try {
+			let backlog: Backlog;
+			if (await pathExists(todoPath)) {
+				const text = await readRequiredFile(todoPath);
+				if (!isRalphBacklog(text)) {
+					ctx.ui.notify(
+						`Ralph auto mode needs a ralph-format backlog: ${AUTO_TODO_FILE} is not one. Delete or replace the file first.`,
+						'warning'
+					);
+					return undefined;
+				}
+				backlog = Backlog.parse(text);
+			} else {
+				backlog = Backlog.empty();
+			}
+			const category = autoCategoryName(backlog.categories());
+			backlog.createList(category);
+			const rendered = backlog.render();
+			await mkdir(dirname(todoPath), { recursive: true });
+			await writeFile(todoPath, rendered);
+			refreshCounts(rendered, category);
+			const next: RalphState = {
+				enabled: true,
+				todoPath,
+				specPath,
+				loopStartTodo: rendered,
+				baselineTodo: rendered,
+				iteration: 1,
+				taskIteration: 1,
+				taskNumber: currentTaskNumber(taskCount.current),
+				maxIterations: config.maxIterations,
+				contextThreshold: contextThresholdFor(config, ctx),
+				autoApproveDecisions: config.autoApproveDecisions,
+				rotationQueued: false,
+				rotationReason: undefined,
+				rotationCheckpointing: false,
+				stopRequested: false,
+				paused: false,
+				blocked: false,
+				blockedItem: undefined,
+				mode: 'auto',
+				category
+			};
+			persistState(next);
+			syncToolActivation();
+			updateStatus(ctx);
+			compactionGateNotified = false;
+			ctx.ui.notify(`Ralph auto loop: state in ${AUTO_TODO_FILE}, session category "${category}"`, 'info');
+			return next;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Ralph auto loop could not start: ${message}`, 'error');
+			return undefined;
+		}
+	};
+
+	/**
+	 * Arm the auto loop at the context budget (auto mode "auto"). The promise
+	 * cache keeps a burst of streaming updates from arming two loops.
+	 */
+	const armAutoLoop = (ctx: ExtensionContext) => {
+		if (!autoArmInFlight) {
+			autoArmInFlight = setupAutoLoop(ctx).finally(() => {
+				autoArmInFlight = undefined;
+			});
+		}
+		return autoArmInFlight;
+	};
+
 	// Shared by /ralph start and the GUI (the backlog view's s key): the same
 	// validation (idle, readable spec + TODO, known category, open tasks) and
 	// the same state setup.
@@ -2126,21 +2484,44 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const { specFile, todoFile, category, goal } = files;
-		const todoPath = resolve(ctx.cwd, todoFile);
+		const { specFile, todoFile, category: requestedCategory, goal } = files;
+		// The auto loop is selected by the auto mode setting (on or auto): a
+		// plain /ralph start stores its state in _auto_.ralph with an
+		// auto-created session category. An explicit --goal start is unaffected.
+		const auto = !goal && config.autoMode !== 'off';
+		const todoPath = auto ? resolve(ctx.cwd, AUTO_TODO_FILE) : resolve(ctx.cwd, todoFile);
 		const specPath = resolve(ctx.cwd, specFile);
+		let category = requestedCategory;
 		try {
-			const baselineTodo = await readRequiredFile(todoPath);
-			await readRequiredFile(specPath);
-			if (!isRalphBacklog(baselineTodo)) {
-				ctx.ui.notify(
-					`Ralph loops run on ralph-format backlogs only: ${todoFile} is not one. Import it first with /ralph import ${todoFile}`,
-					'warning'
-				);
+			// The auto loop runs in any project: SPEC.md may be missing
+			// (the prompt says "when present", and the loop creates it when the
+			// project is not yet documented). The task/goal loops require it.
+			if (!auto) await readRequiredFile(specPath);
+			let baselineTodo: string;
+			let backlog: Backlog;
+			if (auto) {
+				if (todoFile !== DEFAULT_TODO || requestedCategory !== undefined) {
+					ctx.ui.notify(
+						`Auto mode manages its own backlog (${AUTO_TODO_FILE}) and session category; set auto mode to "off" in /ralph config to use a custom backlog or category.`,
+						'warning'
+					);
+					return;
+				}
+				const next = await setupAutoLoop(ctx);
+				if (!next) return;
+				pi.sendUserMessage(iterationPrompt(next));
 				return;
-			}
-			const backlog = Backlog.parse(baselineTodo);
-			if (goal) {
+			} else {
+				baselineTodo = await readRequiredFile(todoPath);
+				if (!isRalphBacklog(baselineTodo)) {
+					ctx.ui.notify(
+						`Ralph loops run on ralph-format backlogs only: ${todoFile} is not one. Import it first with /ralph import ${todoFile}`,
+						'warning'
+					);
+					return;
+				}
+				backlog = Backlog.parse(baselineTodo);
+				if (goal) {
 				const goalRecord = backlog.goal();
 				if (!goalRecord) {
 					ctx.ui.notify(`Ralph goal loop will not start because ${todoFile} has no goal`, 'warning');
@@ -2151,18 +2532,19 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			if (category !== undefined) {
-				const known = backlog.categories();
-				if (!known.includes(category)) {
-					ctx.ui.notify(`Unknown category "${category}" (categories: ${known.join(', ') || 'none'})`, 'warning');
+				if (requestedCategory !== undefined) {
+					const known = backlog.categories();
+					if (!known.includes(requestedCategory)) {
+						ctx.ui.notify(`Unknown category "${requestedCategory}" (categories: ${known.join(', ') || 'none'})`, 'warning');
+						return;
+					}
+				}
+				// Goal mode allows zero open tasks: an empty plan is the planning
+				// state, not a finished loop.
+				if (!goal && isBacklogFinished(baselineTodo, requestedCategory)) {
+					ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
 					return;
 				}
-			}
-			// Goal mode allows zero open tasks: an empty plan is the planning
-			// state, not a finished loop.
-			if (!goal && isBacklogFinished(baselineTodo, category)) {
-				ctx.ui.notify('Ralph loop will not start because all TODO items are complete', 'info');
-				return;
 			}
 			refreshCounts(baselineTodo, category);
 			const next: RalphState = {
@@ -2208,7 +2590,9 @@ export default function (pi: ExtensionAPI) {
 				? completionRecordingPrompt(state)
 				: state.rotationReason === 'plan-updated'
 					? planRecordingPrompt(state)
-					: contextCheckpointPrompt(state);
+					: state.mode === 'auto'
+						? autoFinishPrompt(state)
+						: contextCheckpointPrompt(state);
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
 	};
 
@@ -2300,7 +2684,9 @@ export default function (pi: ExtensionAPI) {
 			config = {
 				contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: state.contextThreshold },
 				autoApproveDecisions: state.autoApproveDecisions,
-				maxIterations: state.maxIterations
+				maxIterations: state.maxIterations,
+				compactionMode: DEFAULT_COMPACTION_MODE,
+				autoMode: DEFAULT_AUTO_MODE
 			};
 		}
 
@@ -2327,8 +2713,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const currentTodo = await readRequiredFile(state.todoPath);
 				// Goal mode is done when the goal is done, not when the plan is
-				// exhausted: an empty plan is the planning state.
-				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
+				// exhausted: an empty plan is the planning state. Auto mode never
+				// stops on an empty backlog.
+				if (state.mode !== 'goal' && state.mode !== 'auto' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
@@ -2341,6 +2728,23 @@ export default function (pi: ExtensionAPI) {
 				}
 			} catch {
 				// The normal iteration path will surface a readable TODO error.
+			}
+		}
+		// Auto mode arms the auto loop without a /ralph start: "on" starts it
+		// at every session start; "auto" starts it when the session already
+		// runs over its context budget (e.g. a resumed long session) — the
+		// finish-up turn records todos for the next iteration, which then
+		// continues from the backlog.
+		if (!state?.enabled) {
+			if (config.autoMode === 'on') {
+				const next = await setupAutoLoop(ctx);
+				if (next) pi.sendUserMessage(iterationPrompt(next));
+			} else if (config.autoMode === 'auto') {
+				const fraction = contextUsageFraction(ctx);
+				if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
+					const next = await setupAutoLoop(ctx);
+					if (next) queueRotation(ctx, 'context-limit');
+				}
 			}
 		}
 		updateStatus(ctx);
@@ -2372,6 +2776,16 @@ export default function (pi: ExtensionAPI) {
 			const fraction = contextUsageFraction(ctx);
 			if (fraction !== undefined && fraction >= state.contextThreshold) {
 				queueRotation(ctx, 'context-limit', { midTurn: true });
+			}
+		} else if (!state?.enabled && config.autoMode === 'auto' && !autoInterceptSuspended && !turnStartedOverBudget) {
+			// Auto mode intercepts a plain session at its context budget: arm
+			// the auto loop and steer the finish-up (todo recording) into the
+			// running turn.
+			const fraction = contextUsageFraction(ctx);
+			if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
+				void armAutoLoop(ctx).then((armed) => {
+					if (armed) queueRotation(ctx, 'context-limit', { midTurn: true });
+				});
 			}
 		}
 	});
@@ -2475,10 +2889,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on('agent_settled', async (_event, ctx) => {
 		freshIterationPending = false;
-		if (!state?.enabled || state.blocked) return;
-		// A paused loop stays paused: user chat turns and any other settles must
-		// not queue rotations or fresh iterations until /ralph resume.
-		if (state.paused) return;
+		if (state?.blocked) return;
 		// An aborted run means the user pressed Escape: pause the loop
 		// immediately, always — even mid-rotation. Continuing (re-sending the
 		// recording prompt, queueing a rotation, or starting a fresh iteration)
@@ -2489,6 +2900,22 @@ export default function (pi: ExtensionAPI) {
 		// next LLM request).
 		const userAborted =
 			lastAssistantStopReason === 'aborted' || runAbortedByUser || !runSawAssistantMessage || runSignal?.aborted === true;
+		if (!state?.enabled) {
+			// Auto mode intercepts a plain session at its context budget: arm
+			// the auto loop and run the finish-up (todo recording) rotation.
+			// An aborted run never arms — the user just tried to end the turn.
+			if (config.autoMode === 'auto' && !autoInterceptSuspended && !userAborted) {
+				const fraction = contextUsageFraction(ctx);
+				if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
+					const armed = await armAutoLoop(ctx);
+					if (armed) queueRotation(ctx, 'context-limit');
+				}
+			}
+			return;
+		}
+		// A paused loop stays paused: user chat turns and any other settles must
+		// not queue rotations or fresh iterations until /ralph resume.
+		if (state.paused) return;
 		if (userAborted) {
 			if (state.stopRequested) {
 				stopLoop(ctx, 'Ralph loop stopped after the current iteration');
@@ -2525,12 +2952,13 @@ export default function (pi: ExtensionAPI) {
 				const currentTodo = await readRequiredFile(state.todoPath);
 				refreshCounts(currentTodo, state?.category);
 				// Goal mode is done when the goal is done, not when the plan is
-				// exhausted: an empty plan is the planning state.
-				if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
+				// exhausted: an empty plan is the planning state. Auto mode never
+				// stops on an empty backlog.
+				if (state.mode !== 'goal' && state.mode !== 'auto' && isBacklogFinished(currentTodo, state?.category)) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				if (hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
+				if (state.mode !== 'auto' && hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
 					queueRotation(ctx, 'completed-task', { currentTodo });
 					return;
 				}
@@ -2557,9 +2985,13 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const currentTodo = await readRequiredFile(state.todoPath);
 			refreshCounts(currentTodo, state?.category);
+			// Re-render with the fresh count: a turn can complete several tasks
+			// (auto mode works task after task), so the bar must not stay stale.
+			updateStatus(ctx);
 			// Goal mode is done when the goal is done, not when the plan is
-			// exhausted: an empty plan is the planning state.
-			if (state.mode !== 'goal' && isBacklogFinished(currentTodo, state?.category)) {
+			// exhausted: an empty plan is the planning state. Auto mode never
+			// stops on an empty backlog.
+			if (state.mode !== 'goal' && state.mode !== 'auto' && isBacklogFinished(currentTodo, state?.category)) {
 				stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 				return;
 			}
@@ -2572,8 +3004,9 @@ export default function (pi: ExtensionAPI) {
 			// Completing an item is a hard context boundary. It must win over the
 			// proactive threshold check below: each rotation inserts a marker that
 			// removes preceding turns from model context, while context-limit first
-			// records a durable TODO checkpoint.
-			if (hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
+			// records a durable TODO checkpoint. Auto mode rotates only on its
+			// context budget: completing a session todo is progress, not a boundary.
+			if (state.mode !== 'auto' && hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category)) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
@@ -2600,6 +3033,22 @@ export default function (pi: ExtensionAPI) {
 			const contextFraction = contextUsageFraction(ctx);
 			if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
 				queueRotation(ctx, 'context-limit');
+				return;
+			}
+
+			// Auto mode rotates only on the context budget: a completed task
+			// under budget is not a boundary, but the loop must not idle
+			// either — start the next open work task instead of waiting for
+			// the user to type "continue".
+			if (
+				state.mode === 'auto' &&
+				hasCompletedTodoItem(state.baselineTodo, currentTodo, state.category) &&
+				openWorkTaskCount(currentTodo, state.category) > 0
+			) {
+				pi.sendUserMessage(
+					'Continue the Ralph auto loop: call ralph_auto with action "next" and start the next open task.',
+					{ deliverAs: 'followUp' }
+				);
 				return;
 			}
 
@@ -2687,6 +3136,14 @@ export default function (pi: ExtensionAPI) {
 				description: 'Continue after a decision request without pausing for your reply; Ralph records the approver as auto-approved.',
 				currentValue: config.autoApproveDecisions ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
+			},
+			{
+				id: 'autoMode',
+				label: 'Auto mode',
+				description:
+					`The auto loop stores its state in ${AUTO_TODO_FILE} with an auto-created session category, rotates on its context budget (the model finishes up and records todos for the next iteration), and uses the dedicated ralph_auto tool. off: nothing automatic. on: the loop starts at session start. auto: the loop arms itself when the context crosses the budget (at session start or mid-session). A plain /ralph start uses the auto loop unless the mode is off (an explicit --goal start is unaffected).`,
+				currentValue: config.autoMode,
+				values: ['off', 'on', 'auto']
 			}
 		];
 
@@ -2711,7 +3168,9 @@ export default function (pi: ExtensionAPI) {
 								? { ...config, maxIterations: Number.parseInt(value, 10) }
 								: id === 'compactionMode'
 									? { ...config, compactionMode: value === 'enabled' }
-								: { ...config, autoApproveDecisions: value === 'enabled' };
+								: id === 'autoMode'
+									? { ...config, autoMode: value as AutoMode }
+									: { ...config, autoApproveDecisions: value === 'enabled' };
 					persistConfig(ctx, next);
 					if (state?.enabled) {
 						persistState({
@@ -2731,7 +3190,9 @@ export default function (pi: ExtensionAPI) {
 								? `maximum iterations ${next.maxIterations}`
 								: id === 'compactionMode'
 									? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
-								: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
+								: id === 'autoMode'
+									? `auto mode ${next.autoMode}`
+									: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
 					ctx.ui.notify(`Ralph configuration saved: ${savedDescription}`, 'info');
 				},
 				() => done(undefined)
@@ -3094,7 +3555,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (command === 'status') {
-				const loopName = state?.mode === 'goal' ? 'Ralph goal loop' : 'Ralph loop';
+				const loopName =
+					state?.mode === 'goal' ? 'Ralph goal loop' : state?.mode === 'auto' ? 'Ralph auto loop' : 'Ralph loop';
 				ctx.ui.notify(
 					!state?.enabled
 						? `${loopName} is stopped`
@@ -3105,7 +3567,9 @@ export default function (pi: ExtensionAPI) {
 								: state.rotationCheckpointing
 									? state.rotationReason === 'completed-task'
 										? `${loopName} is recording the completed task’s progress`
-										: `${loopName} is recording a durable context checkpoint`
+										: state.mode === 'auto'
+											? `${loopName} is finishing up and recording todos for the next iteration`
+											: `${loopName} is recording a durable context checkpoint`
 									: state.stopRequested
 										? `${loopName} will stop after the current iteration`
 										: state.rotationQueued

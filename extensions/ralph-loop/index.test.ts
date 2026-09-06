@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initTheme } from '@earendil-works/pi-coding-agent';
 import { Backlog } from './backlog.ts';
 import extension from './index.ts';
 
@@ -1031,7 +1032,27 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(fake.userMessages.length).toBe(1);
 		expect(fake.userMessages[0].text).toContain('ralph_todo');
 		expect(fake.userMessages[0].text).toContain('SQLite-backed');
+		// The counter is completed + 1: task 3 is done, so the current task is 2 of 3.
 		expect(statusLine(fakeCtx.widgets)).toContain('task: 2/3 (iteration 1)');
+	});
+
+	test('status counter is completed + 1, tracking work order (out-of-order completion)', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		// Tasks 1,2,4 done; tasks 3,5 open. Three tasks are complete, so the
+		// counter is 4/5 even though the first open task is #3.
+		await writeFile(
+			join(dir, 'TODO.ralph'),
+			'# ralph v2\n\nT 1 - "One"\nD 1\n\nT 2 - "Two"\nD 2\n\nT 3 - "Three"\n\nT 4 - "Four"\nD 4\n\nT 5 - "Five"\n'
+		);
+
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo TODO.ralph', fakeCtx.ctx);
+
+		expect(fake.userMessages.length).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 4/5 (iteration 1)');
 	});
 
 	test('start --category scopes the backlog and rejects unknown categories', async () => {
@@ -3714,5 +3735,686 @@ describe('ralph-loop extension (lazy tool activation)', () => {
 		const text = await readFile(refPath, 'utf8');
 		expect(text).toContain('call `ralph_enable` first');
 		expect(text).toContain('## ralph_goal actions');
+	});
+});
+
+describe('ralph-loop extension (auto mode)', () => {
+	const writeAutoConfig = (extra: Record<string, unknown> = {}) =>
+		writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify(
+				{ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'auto', ...extra },
+				null,
+				'\t'
+			)}\n`
+		);
+
+	const autoTool = (fake: ReturnType<typeof createFakePi>) =>
+		fake.tools.get('ralph_auto') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		};
+
+	const stateEntries = (fake: ReturnType<typeof createFakePi>) =>
+		fake.entries.filter((entry) => entry.customType === 'ralph-loop-state');
+
+	beforeEach(async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+	});
+
+	test('status bar shows "Ralph (auto)" when auto mode is enabled and no loop is active', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The idle state word is "auto" (armed, not running), not "off".
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		expect(statusLine(fakeCtx.widgets)).toContain('(compaction)');
+		// The context percentage is shown while idle too: auto mode rotates on
+		// the context budget, so the headroom matters before a start.
+		expect(statusLine(fakeCtx.widgets)).toContain('context: 10% / 50%');
+	});
+
+	test('auto mode is off by default: a plain start is the task loop', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		expect(fake.userMessages[0]!.text).toContain('Run the Ralph loop');
+		expect(fake.activeTools).toContain('ralph_todo');
+		expect(fake.activeTools).not.toContain('ralph_auto');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+	});
+
+	test('auto mode start creates _auto_.ralph with a session category and sends the auto prompt', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		const prompt = fake.userMessages[0]!.text;
+		expect(prompt).toContain('Run the Ralph auto loop');
+		expect(prompt).toContain('only through the ralph_auto tool');
+		expect(prompt).toContain('Session-');
+		// The state file is created in ralph format with the auto-created session category.
+		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(file.startsWith('# ralph v2')).toBe(true);
+		expect(file).toContain('M list "Session-');
+		// Status bar: the auto label and the session category.
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (auto): on');
+		expect(status).toContain('category: Session-');
+		// Only the dedicated tool is activated — not the full ralph tool set.
+		expect(fake.activeTools).toContain('ralph_auto');
+		expect(fake.activeTools).not.toContain('ralph_todo');
+		expect(fake.activeTools).not.toContain('ralph_goal');
+		expect(fake.activeTools).not.toContain('ralph_request_decision');
+		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
+	});
+
+	test('auto mode starts without a SPEC.md (the loop creates it when the project is undocumented)', async () => {
+		await writeAutoConfig();
+		await rm(join(dir, 'SPEC.md'));
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		// The loop starts anyway; the prompt references the spec as optional.
+		expect(fake.userMessages[0]!.text).toContain('Run the Ralph auto loop');
+		expect(fake.userMessages[0]!.text).toContain('(when present)');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
+	});
+
+	test('auto mode start reuses _auto_.ralph and creates a new session category per loop', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		await startLoop(fake, fakeCtx);
+
+		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		// Two loops, two session categories (the same-minute collision gets a suffix).
+		expect(file.match(/M list "Session-/g)).toHaveLength(2);
+	});
+
+	test('auto mode refuses a custom backlog or category', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+
+		await ralph.handler('start --todo OTHER.ralph', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Auto mode manages its own backlog');
+		await ralph.handler('start --category Email', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Auto mode manages its own backlog');
+		// No loop started, no state file created; the bar still shows the auto mode.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		let missing = false;
+		try {
+			await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		} catch {
+			missing = true;
+		}
+		expect(missing).toBe(true);
+	});
+
+	test('auto mode context-limit rotation: finish-up prompt, then a fresh iteration', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// The iteration settles with context usage at/above the 50% threshold.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		// The loop queues the finish-up turn and says so in the status bar.
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		const prompt = fake.userMessages.at(-1)!.text;
+		expect(prompt).toContain('Finish up now');
+		expect(prompt).toContain('iteration 1 of 10');
+		expect(prompt).toContain('ralph_auto');
+		expect(prompt).toContain('action "add"');
+		expect(prompt).toContain('Session-');
+
+		// The finish-up turn settles; the fresh iteration starts from the backlog.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		let status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (auto): starting');
+		expect(status).toContain('iteration 2/10');
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (auto): on');
+		// A context boundary was recorded and the fresh auto iteration prompt sent.
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
+		expect(fake.userMessages.at(-1)?.text).toContain('context budget');
+	});
+
+	test('auto mode finish-up allows a bad state and keeps big-picture tasks from the second iteration on', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// Iteration 1 finishes up at the budget: a bad state is OK, and there is
+		// no big-picture step yet (the first round establishes the work).
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		let finish = fake.userMessages.at(-1)!.text;
+		expect(finish).toContain('OK to leave the code in a bad state');
+		// Auto mode never instructs commits: the handoff is the backlog, not git.
+		expect(finish).not.toContain('commit');
+		// The handoff logs the iteration's findings for the next round.
+		expect(finish).toContain('Findings: ');
+		expect(finish).toContain('rediscover from scratch');
+		expect(finish).not.toContain('Goal: ');
+
+		// The fresh iteration 2 prompt maintains the big-picture layer.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		const fresh = fake.userMessages.at(-1)!.text;
+		expect(fresh).toContain('Keep the big picture in the backlog');
+		expect(fresh).toContain('"next" skips them');
+		expect(fresh).toContain('Findings: ');
+		// Findings entries are consumed (marked done) by the iteration that reads
+		// them, so the backlog does not accumulate open reference entries.
+		expect(fresh).toContain('mark each one done');
+		expect(fresh).not.toContain('never complete them');
+		expect(fresh).not.toContain('commit');
+
+		// Iteration 2 finishes up at the budget: the handoff now also refreshes
+		// the big-picture tasks.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		finish = fake.userMessages.at(-1)!.text;
+		expect(finish).toContain('iteration 2 of 10');
+		expect(finish).toContain('Goal: ');
+		expect(finish).toContain('Findings: ');
+		expect(finish).toContain('OK to leave the code in a bad state');
+	});
+
+	test('auto mode finish-up todos are picked up by the fresh iteration', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		// The model records the remaining work for the next iteration.
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'Finish the parser', body: '- see src/parser.ts' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Add tests' }, undefined, undefined, fakeCtx.ctx);
+
+		// The finish-up turn settles: the fresh iteration continues from the backlog.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
+
+		// The fresh iteration sees the recorded todos in the session category.
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('Finish the parser');
+	});
+
+	test('ralph_auto add records a todo in the session category; complete marks it done with a log entry', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		const added = await tool.execute('t', { action: 'add', title: 'Continue the rewrite', body: '- finish the parser' }, undefined, undefined, fakeCtx.ctx);
+		expect(added.content[0]!.text).toContain('Recorded todo 1');
+		let file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(file).toContain('Continue the rewrite');
+
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('Continue the rewrite');
+
+		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'rewrote the parser' }, undefined, undefined, fakeCtx.ctx);
+		expect(done.content[0]!.text).toContain('Marked task 1');
+		file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(file).toContain('D 1');
+		expect(file).toContain('rewrote the parser');
+	});
+
+	test('ralph_auto add and complete require an active auto loop; next and list work without one', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await writeFile(join(dir, '_auto_.ralph'), '# ralph v2\n\n');
+
+		const tool = autoTool(fake);
+		await expect(tool.execute('t', { action: 'add', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			/requires an active Ralph auto loop/
+		);
+		await expect(tool.execute('t', { action: 'complete', task: '1' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			/requires an active Ralph auto loop/
+		);
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('No open tasks remain');
+		const list = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
+		expect(list.content[0]!.text).toContain('0 open');
+	});
+
+	test('auto mode does not rotate on task completion', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'Small step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+
+		// The iteration settles with low context usage: no rotation, no fresh
+		// prompt. Completing the last open work task also sends no continue
+		// nudge: there is no work left to start.
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.userMessages).toHaveLength(1);
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (auto): on');
+		expect(status).toContain('iteration 1/10');
+	});
+
+	test('auto mode status bar refreshes the task count after a settle (not stale)', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// The tool calls do not refresh the counter themselves; the settle must.
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// Task 1 done, task 2 open: the first open task is #2 -> 2/2.
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 2/2 (iteration 1)');
+	});
+
+	test('auto mode starts the next task after a completion under budget (no rotation)', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+
+		// The iteration settles under budget: no rotation (still iteration 1),
+		// but the loop must not idle — it nudges the model to the next open task
+		// instead of waiting for the user to type "continue".
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.userMessages).toHaveLength(2);
+		expect(fake.userMessages[1]!.text).toContain('Continue the Ralph auto loop');
+		expect(fake.userMessages[1]!.text).toContain('ralph_auto');
+		expect(fake.userMessages[1]!.text).toContain('"next"');
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (auto): on');
+		expect(status).toContain('iteration 1/10');
+	});
+
+	test('auto mode nudge does not fire over budget: the context-limit rotation wins', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+
+		// Settling over budget queues the finish-up rotation, not a nudge.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const last = fake.userMessages.at(-1)!.text;
+		expect(last).toContain('Finish up now');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+	});
+
+	test('ralph_auto next skips Goal/Findings reference entries', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute(
+			't',
+			{ action: 'add', title: 'Findings: dioxus tasks are polled from the GTK event loop' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		await tool.execute('t', { action: 'add', title: 'Goal: working desktop app with verified analysis' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Fix the parser' }, undefined, undefined, fakeCtx.ctx);
+
+		// next skips the reference entries and returns the work task.
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('Fix the parser');
+
+		// After the work task is done, next reports no open work tasks and names
+		// the remaining reference entries.
+		await tool.execute('t', { action: 'complete', task: '3', note: 'fixed' }, undefined, undefined, fakeCtx.ctx);
+		const empty = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(empty.content[0]!.text).toContain('No open work tasks remain');
+		expect(empty.content[0]!.text).toContain('Findings: dioxus tasks are polled from the GTK event loop');
+		expect(empty.content[0]!.text).toContain('Goal: working desktop app with verified analysis');
+	});
+
+	test('auto mode nudge does not fire when only reference entries remain open', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'Goal: working desktop app' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Fix the parser' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'complete', task: '2', note: 'fixed' }, undefined, undefined, fakeCtx.ctx);
+
+		// The work queue is empty (only the Goal entry stays open): no nudge.
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('auto mode scopes the session category: other lists stay out of next', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		// An existing auto backlog with a todo from an earlier session category.
+		await writeFile(
+			join(dir, '_auto_.ralph'),
+			'# ralph v2\n\nM list "Session-Old"\n\nT 1 Session-Old "Old todo"\n\n'
+		);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('No open tasks remain');
+	});
+
+	test('auto mode stops at the maximum iterations', async () => {
+		await writeAutoConfig({ maxIterations: 1 });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/1');
+
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		expect(fakeCtx.notifications.some((n) => n.message.includes('maximum of 1 iterations'))).toBe(true);
+	});
+
+	test('auto mode mid-turn: crossing the threshold during streaming steers the finish-up into the running turn', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('message_update', fakeCtx.ctx);
+
+		const last = fake.userMessages.at(-1)!;
+		expect(last.text).toContain('Finish up now');
+		expect(last.options).toEqual({ deliverAs: 'steer' });
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+
+		// Further streaming updates do not queue a second rotation.
+		const queued = fake.userMessages.length;
+		await fake.fire('message_update', fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(queued);
+	});
+
+	test('auto mode state survives a session reload', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const entry = stateEntries(fake).at(-1)!;
+		expect(entry.data.mode).toBe('auto');
+
+		// Reload the session: the auto loop stays active on an empty backlog.
+		const reloaded = createFakePi();
+		extension(reloaded.pi as never);
+		const reloadedCtx = createFakeCtx(dir);
+		reloadedCtx.ctx.sessionManager.getBranch = () => [entry];
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
+		await reloaded.commands.get('ralph')!.handler('status', reloadedCtx.ctx);
+		expect(reloadedCtx.notifications.at(-1)?.message).toContain('Ralph auto loop is active');
+	});
+
+	test('the config UI offers the auto mode toggle', async () => {
+		// The SettingsList theme needs pi's interactive theme initialized.
+		initTheme();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const created: unknown[] = [];
+		fakeCtx.customControl.factoryHook = (component) => created.push(component);
+		await fake.commands.get('ralph')!.handler('config', fakeCtx.ctx);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		fakeCtx.customControl.factoryHook = undefined;
+
+		const rendered = (created[0] as { render: (width: number) => string[] }).render(200).join('\n');
+		expect(rendered).toContain('Auto mode');
+		// The default auto mode is "off" (the legacy boolean setting is gone).
+		expect(rendered).toContain('off');
+	});
+
+	test('auto mode "on" starts the loop at session start without /ralph start', async () => {
+		await writeAutoConfig({ autoMode: 'on' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The loop is active: the iteration prompt was sent and the state file exists.
+		expect(fake.userMessages[0]!.text).toContain('Run the Ralph auto loop');
+		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(file).toContain('M list "Session-');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
+		expect(fake.activeTools).toContain('ralph_auto');
+	});
+
+	test('auto mode "auto" intercepts a session that starts over its context budget', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.usagePercent.value = 55;
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The loop is armed and the finish-up (todo recording) turn is queued.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
+		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+		expect(fake.userMessages.at(-1)!.text).toContain('action "add"');
+		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(file).toContain('M list "Session-');
+
+		// The finish-up turn settles; the fresh iteration continues from the backlog.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
+		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
+	});
+
+	test('auto mode "auto" stays idle at session start under the context budget', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// No loop armed, no prompt sent, no state file created.
+		expect(fake.userMessages).toHaveLength(0);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		let missing = false;
+		try {
+			await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		} catch {
+			missing = true;
+		}
+		expect(missing).toBe(true);
+	});
+
+	test('auto mode "auto" intercepts a plain session when it crosses the budget mid-session', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The session runs on (no loop) and settles over the 50% budget.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
+		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+		expect(fake.userMessages.at(-1)!.text).toContain('action "add"');
+
+		// The finish-up turn settles; the fresh iteration continues from the backlog.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
+		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
+	});
+
+	test('auto mode "auto" mid-turn: crossing the budget in a plain session steers the finish-up', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('message_update', fakeCtx.ctx);
+		await flush(); // the arm is async (file I/O)
+
+		const last = fake.userMessages.at(-1)!;
+		expect(last.text).toContain('Finish up now');
+		expect(last.options).toEqual({ deliverAs: 'steer' });
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+
+		// Further streaming updates do not arm a second loop or queue a second rotation.
+		await fake.fire('message_update', fakeCtx.ctx);
+		await flush();
+		const files = await readdir(dir);
+		expect(files.filter((name) => name === '_auto_.ralph')).toHaveLength(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+	});
+
+	test('auto mode "auto": stopping the loop suspends the context-budget intercept for the session', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// No re-arm: the explicit stop wins over the auto mode.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('legacy boolean auto mode migrates: true behaves as "auto"', async () => {
+		await writeAutoConfig({ autoMode: true });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.usagePercent.value = 55;
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The legacy true value arms the intercept, like the new "auto" value.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
+		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
 	});
 });
