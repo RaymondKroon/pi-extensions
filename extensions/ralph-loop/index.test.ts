@@ -3743,7 +3743,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify(
-				{ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'auto', ...extra },
+				{ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'on', ...extra },
 				null,
 				'\t'
 			)}\n`
@@ -3767,7 +3767,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
 	});
 
-	test('status bar shows "Ralph (auto)" when auto mode is enabled and no loop is active', async () => {
+	test('status bar shows the armed auto mode when enabled and no loop is active', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3775,12 +3775,40 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The idle state word is "auto" (armed, not running), not "off".
+		// The idle state word is "auto" (armed, not running), not "off" — and
+		// distinct from "on", which means a loop is actually running.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
 		expect(statusLine(fakeCtx.widgets)).toContain('(compaction)');
 		// The context percentage is shown while idle too: auto mode rotates on
 		// the context budget, so the headroom matters before a start.
 		expect(statusLine(fakeCtx.widgets)).toContain('context: 10% / 50%');
+	});
+
+	test('auto mode pre-activates ralph_auto at session start so arming is cache-neutral', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The dedicated tool is in context before the loop arms; the full
+		// ralph tool set stays out.
+		expect(fake.activeTools).toContain('ralph_auto');
+		expect(fake.activeTools).not.toContain('ralph_todo');
+		expect(fake.activeTools).not.toContain('ralph_goal');
+		expect(fake.activeTools).not.toContain('ralph_request_decision');
+		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
+
+		// Arming the loop at the context budget must not change the tool set —
+		// a changed tool set changes the rendered prompt and invalidates the
+		// provider's prefix cache at the largest context of the session.
+		const before = [...fake.activeTools];
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('message_update', fakeCtx.ctx);
+		await flush(); // the arm is async (file I/O)
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.activeTools).toEqual(before);
 	});
 
 	test('auto mode is off by default: a plain start is the task loop', async () => {
@@ -4212,6 +4240,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
+		// The loop stopped; the bar falls back to the armed auto mode word.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
 		expect(fakeCtx.notifications.some((n) => n.message.includes('maximum of 1 iterations'))).toBe(true);
 	});
@@ -4278,7 +4307,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(rendered).toContain('off');
 	});
 
-	test('auto mode "on" starts the loop at session start without /ralph start', async () => {
+	test('auto mode "on" does not start the loop at session start under the context budget', async () => {
 		await writeAutoConfig({ autoMode: 'on' });
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4286,15 +4315,19 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The loop is active: the iteration prompt was sent and the state file exists.
-		expect(fake.userMessages[0]!.text).toContain('Run the Ralph auto loop');
-		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
-		expect(file).toContain('M list "Session-');
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
-		expect(fake.activeTools).toContain('ralph_auto');
+		// The loop only starts via /ralph start: no prompt sent, no state file.
+		expect(fake.userMessages).toHaveLength(0);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		let missing = false;
+		try {
+			await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		} catch {
+			missing = true;
+		}
+		expect(missing).toBe(true);
 	});
 
-	test('auto mode "auto" intercepts a session that starts over its context budget', async () => {
+	test('auto mode "on" intercepts a session that starts over its context budget', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4319,27 +4352,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
 	});
 
-	test('auto mode "auto" stays idle at session start under the context budget', async () => {
-		await writeAutoConfig();
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-
-		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-
-		// No loop armed, no prompt sent, no state file created.
-		expect(fake.userMessages).toHaveLength(0);
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
-		let missing = false;
-		try {
-			await readFile(join(dir, '_auto_.ralph'), 'utf8');
-		} catch {
-			missing = true;
-		}
-		expect(missing).toBe(true);
-	});
-
-	test('auto mode "auto" intercepts a plain session when it crosses the budget mid-session', async () => {
+	test('auto mode "on" intercepts a plain session when it crosses the budget mid-session', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4363,7 +4376,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
 	});
 
-	test('auto mode "auto" mid-turn: crossing the budget in a plain session steers the finish-up', async () => {
+	test('auto mode "on" mid-turn: crossing the budget in a plain session steers the finish-up', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4387,7 +4400,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 	});
 
-	test('auto mode "auto": stopping the loop suspends the context-budget intercept for the session', async () => {
+	test('auto mode "on": stopping the loop suspends the context-budget intercept for the session', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4404,17 +4417,19 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
-	test('legacy boolean auto mode migrates: true behaves as "auto"', async () => {
-		await writeAutoConfig({ autoMode: true });
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-		fakeCtx.usagePercent.value = 55;
+	test('legacy auto mode values migrate: "auto" and true behave as "on"', async () => {
+		for (const legacy of ['auto', true]) {
+			await writeAutoConfig({ autoMode: legacy });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			fakeCtx.usagePercent.value = 55;
 
-		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The legacy true value arms the intercept, like the new "auto" value.
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
-		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+			// The legacy value arms the intercept, like "on".
+			expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
+			expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+		}
 	});
 });

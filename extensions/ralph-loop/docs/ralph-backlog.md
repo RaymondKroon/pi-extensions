@@ -108,15 +108,15 @@ becomes the goal checkpoint.
 ## ralph_auto actions
 
 `ralph_auto` is the dedicated tool of the **auto loop** (the "Auto mode"
-setting in `/ralph config`: off / on / auto). The auto loop stores its state
+setting in `/ralph config`: off / on). The auto loop stores its state
 in `_auto_.ralph` and creates a session category per loop (e.g.
 `Session-20260905-2117`); it rotates on its context budget, tells the model
 to finish up and record todos for the next iteration, and activates only this
-tool (not the full ralph tool set).
+tool (not the full ralph tool set). The loop itself only starts via
+`/ralph start`.
 
 - `off`: nothing automatic; a plain `/ralph start` runs the regular task loop.
-- `on`: the auto loop starts at session start.
-- `auto`: the auto loop arms itself when the context crosses the budget — at
+- `on`: the auto loop arms itself when the context crosses the budget — at
   session start (e.g. a resumed long session) or mid-session — asks the model
   to record the remaining work as todos, then iterates from the backlog.
   A plain `/ralph start` also starts the auto loop. Stopping the loop

@@ -57,16 +57,16 @@ const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_COMPACTION_MODE = true;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 /**
- * The auto mode setting: off — nothing automatic; on — the auto loop starts
- * at session start; auto — the auto loop arms itself when the context crosses
- * the budget (at session start or mid-session) and records todos for the next
- * iteration.
+ * The auto mode setting: off — nothing automatic; on — the auto loop arms
+ * itself when the context crosses the budget (at session start or mid-session)
+ * and records todos for the next iteration. The loop itself only starts via
+ * /ralph start.
  */
-type AutoMode = 'off' | 'on' | 'auto';
+type AutoMode = 'off' | 'on';
 const DEFAULT_AUTO_MODE: AutoMode = 'off';
 /** Tools activated additively (defer_loading) by ralph_enable or /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
 const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision'];
-/** The dedicated tool of the auto mode; an active auto loop activates only this one. */
+/** The dedicated tool of the auto mode; an active auto loop activates only this one. With auto mode "on" it is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
 const AUTO_TOOL_NAME = 'ralph_auto';
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
@@ -200,13 +200,13 @@ function isMaxIterations(value: unknown): value is number {
 }
 
 function isAutoMode(value: unknown): value is AutoMode {
-	return value === 'off' || value === 'on' || value === 'auto';
+	return value === 'off' || value === 'on';
 }
 
-/** Accept the current string values plus the legacy boolean (true = auto, false = off). */
+/** Accept the current string values plus the legacy 'auto' string and boolean (true = on, false = off). */
 function normalizeAutoMode(value: unknown): AutoMode | undefined {
 	if (isAutoMode(value)) return value;
-	if (value === true) return 'auto';
+	if (value === 'auto' || value === true) return 'on';
 	if (value === false) return 'off';
 }
 
@@ -1484,12 +1484,22 @@ export default function (pi: ExtensionAPI) {
 	// (loop stop does not remove them, which would break the cached prefix).
 	// An active auto loop activates only its dedicated ralph_auto tool; the
 	// task/goal loops activate the full ralph tool set.
+	// With auto mode "on", ralph_auto is pre-activated at session start: the
+	// tool definitions are part of every request (vLLM inlines them into the
+	// rendered prompt), so adding the tool when the loop arms at the context
+	// budget would invalidate the prefix cache at the largest context of the
+	// session. The tool is safe to have active without an armed loop —
+	// add/complete require an active auto loop, next/list read the auto
+	// backlog unscoped.
 	const syncToolActivation = () => {
 		const active = pi.getActiveTools();
 		const next = active.filter((name) => !RALPH_TOOL_NAMES.includes(name) && name !== AUTO_TOOL_NAME);
 		if (state?.enabled) {
 			const names = state.mode === 'auto' ? [AUTO_TOOL_NAME] : RALPH_TOOL_NAMES;
 			for (const name of names) if (!next.includes(name)) next.push(name);
+		} else if (config.autoMode === 'on' && !next.includes(AUTO_TOOL_NAME)) {
+			// Pre-activate the auto tool so arming the loop is cache-neutral.
+			next.push(AUTO_TOOL_NAME);
 		}
 		if (next.length !== active.length) pi.setActiveTools(next);
 	};
@@ -1515,10 +1525,10 @@ export default function (pi: ExtensionAPI) {
 		// its marker); the auto mode setting shows in the state word instead.
 		const label =
 			state?.mode === 'goal' ? 'Ralph (goal)' : state?.enabled && state.mode === 'auto' ? 'Ralph (auto)' : 'Ralph';
-		// Idle state word: the auto mode setting itself: "on" and "auto" are
-		// armed (the loop starts at session start / at the context budget),
-		// not off.
-		const idleState = label === 'Ralph' ? config.autoMode : 'off';
+		// Idle state word: the auto mode setting itself: "auto" is armed (the
+		// loop arms itself at the context budget), not off — and distinct from
+		// "on", which means a loop is actually running.
+		const idleState = label === 'Ralph' ? (config.autoMode === 'on' ? 'auto' : 'off') : 'off';
 		// Non-default modifiers, compact: (auto-approve) and/or (compaction).
 		const modifiers = [autoApproveDecisions ? 'auto-approve' : undefined, config.compactionMode ? 'compaction' : undefined]
 			.filter((part): part is string => part !== undefined)
@@ -2200,7 +2210,7 @@ export default function (pi: ExtensionAPI) {
 				case 'add': {
 					if (!autoLoop) {
 						throw new Error(
-							'add requires an active Ralph auto loop (set auto mode to "on" or "auto" in /ralph config, or start one with /ralph start).'
+							'add requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
 						);
 					}
 					if (!params.title) throw new Error('add requires a title.');
@@ -2216,7 +2226,7 @@ export default function (pi: ExtensionAPI) {
 				case 'complete': {
 					if (!autoLoop)
 						throw new Error(
-							'complete requires an active Ralph auto loop (set auto mode to "on" or "auto" in /ralph config, or start one with /ralph start).'
+							'complete requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
 						);
 					if (!params.task) throw new Error('complete requires the task number.');
 					const task = backlog.complete(params.task, scope);
@@ -2395,9 +2405,9 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * Set up the auto loop's durable state: the _auto_.ralph backlog with its
 	 * auto-created session category, the loop state, and the ralph_auto tool
-	 * activation. Shared by /ralph start, the session-start auto start (auto
-	 * mode "on"), and the context-budget intercept (auto mode "auto"). Returns
-	 * undefined (with a notification) when the setup fails.
+	 * activation. Shared by /ralph start and the context-budget intercept
+	 * (auto mode "on"). Returns undefined (with a notification) when the setup
+	 * fails.
 	 */
 	const setupAutoLoop = async (ctx: ExtensionContext): Promise<RalphState | undefined> => {
 		const todoPath = resolve(ctx.cwd, AUTO_TODO_FILE);
@@ -2459,7 +2469,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Arm the auto loop at the context budget (auto mode "auto"). The promise
+	 * Arm the auto loop at the context budget (auto mode "on"). The promise
 	 * cache keeps a burst of streaming updates from arming two loops.
 	 */
 	const armAutoLoop = (ctx: ExtensionContext) => {
@@ -2485,7 +2495,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const { specFile, todoFile, category: requestedCategory, goal } = files;
-		// The auto loop is selected by the auto mode setting (on or auto): a
+		// The auto loop is selected by the auto mode setting (on): a
 		// plain /ralph start stores its state in _auto_.ralph with an
 		// auto-created session category. An explicit --goal start is unaffected.
 		const auto = !goal && config.autoMode !== 'off';
@@ -2652,7 +2662,12 @@ export default function (pi: ExtensionAPI) {
 	// They carry no promptSnippet/promptGuidelines on purpose — activating a
 	// tool with prompt metadata rebuilds the system prompt and invalidates the
 	// cached prefix, even on providers with native deferred loading. All
-	// behavioural rules live in the tool descriptions instead.
+	// behavioural rules live in the tool descriptions instead. The tool
+	// definitions themselves are part of every request (rendered into the
+	// prompt by the provider's chat template), so the tool set must also stay
+	// stable mid-session: syncToolActivation only ever adds tools, and the
+	// one addition that would otherwise land mid-session (ralph_auto when the
+	// auto loop arms at the context budget) is moved to session start.
 
 	pi.on('session_start', async (_event, ctx) => {
 		state = undefined;
@@ -2730,21 +2745,16 @@ export default function (pi: ExtensionAPI) {
 				// The normal iteration path will surface a readable TODO error.
 			}
 		}
-		// Auto mode arms the auto loop without a /ralph start: "on" starts it
-		// at every session start; "auto" starts it when the session already
-		// runs over its context budget (e.g. a resumed long session) — the
-		// finish-up turn records todos for the next iteration, which then
-		// continues from the backlog.
-		if (!state?.enabled) {
-			if (config.autoMode === 'on') {
+		// Auto mode arms the auto loop without a /ralph start when the session
+		// already runs over its context budget (e.g. a resumed long session) —
+		// the finish-up turn records todos for the next iteration, which then
+		// continues from the backlog. The loop itself only starts via
+		// /ralph start.
+		if (!state?.enabled && config.autoMode === 'on') {
+			const fraction = contextUsageFraction(ctx);
+			if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
 				const next = await setupAutoLoop(ctx);
-				if (next) pi.sendUserMessage(iterationPrompt(next));
-			} else if (config.autoMode === 'auto') {
-				const fraction = contextUsageFraction(ctx);
-				if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
-					const next = await setupAutoLoop(ctx);
-					if (next) queueRotation(ctx, 'context-limit');
-				}
+				if (next) queueRotation(ctx, 'context-limit');
 			}
 		}
 		updateStatus(ctx);
@@ -2777,7 +2787,7 @@ export default function (pi: ExtensionAPI) {
 			if (fraction !== undefined && fraction >= state.contextThreshold) {
 				queueRotation(ctx, 'context-limit', { midTurn: true });
 			}
-		} else if (!state?.enabled && config.autoMode === 'auto' && !autoInterceptSuspended && !turnStartedOverBudget) {
+		} else if (!state?.enabled && config.autoMode === 'on' && !autoInterceptSuspended && !turnStartedOverBudget) {
 			// Auto mode intercepts a plain session at its context budget: arm
 			// the auto loop and steer the finish-up (todo recording) into the
 			// running turn.
@@ -2904,7 +2914,7 @@ export default function (pi: ExtensionAPI) {
 			// Auto mode intercepts a plain session at its context budget: arm
 			// the auto loop and run the finish-up (todo recording) rotation.
 			// An aborted run never arms — the user just tried to end the turn.
-			if (config.autoMode === 'auto' && !autoInterceptSuspended && !userAborted) {
+			if (config.autoMode === 'on' && !autoInterceptSuspended && !userAborted) {
 				const fraction = contextUsageFraction(ctx);
 				if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
 					const armed = await armAutoLoop(ctx);
@@ -3141,9 +3151,9 @@ export default function (pi: ExtensionAPI) {
 				id: 'autoMode',
 				label: 'Auto mode',
 				description:
-					`The auto loop stores its state in ${AUTO_TODO_FILE} with an auto-created session category, rotates on its context budget (the model finishes up and records todos for the next iteration), and uses the dedicated ralph_auto tool. off: nothing automatic. on: the loop starts at session start. auto: the loop arms itself when the context crosses the budget (at session start or mid-session). A plain /ralph start uses the auto loop unless the mode is off (an explicit --goal start is unaffected).`,
+					`The auto loop stores its state in ${AUTO_TODO_FILE} with an auto-created session category, rotates on its context budget (the model finishes up and records todos for the next iteration), and uses the dedicated ralph_auto tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session). The loop itself only starts via /ralph start, which uses the auto loop unless the mode is off (an explicit --goal start is unaffected).`,
 				currentValue: config.autoMode,
-				values: ['off', 'on', 'auto']
+				values: ['off', 'on']
 			}
 		];
 

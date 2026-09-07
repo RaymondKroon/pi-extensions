@@ -769,7 +769,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				contextThresholds: { __default__: 0.1 },
 				autoApproveDecisions: false,
 				maxIterations: 10,
-				autoMode: 'auto'
+				autoMode: 'on'
 			});
 
 			await sess.prompt('/ralph start');
