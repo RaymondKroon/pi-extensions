@@ -59,6 +59,50 @@ describe('applyEditsEnhanced — built-in behavior preserved', () => {
 		const { newContent } = applyEditsEnhanced('foo bar\nbaz\n', [{ oldText: 'bar\nbaz', newText: 'qux' }], 'f.ts');
 		expect(newContent).toBe('foo qux\n');
 	});
+
+	test('session regression 01a0803a: edits submitted out of file order are applied at the right offsets', () => {
+		const content = [
+			'    c["other_assets"] = find(rows, lambda r: r["type"] == "current_assets"',
+			'                             and r["id"] not in used)',
+			'    c["other_liab"] = find(rows, lambda r: r["type"] == "current_liabilities"',
+			'                           and r["id"] not in used)',
+			'    return c',
+			'',
+			'',
+			'def line(label, exact):',
+			'    print(f"  {label:<58s} € {r0(exact):>14s}")',
+			'',
+		].join('\n');
+		// edit[0] targets a region AFTER edit[1] in the file (the model submitted
+		// them out of order); both must land at their own positions.
+		const { newContent } = applyEditsEnhanced(content, [
+			{
+				oldText: 'def line(label, exact):\n    print(f"  {label:<58s} € {r0(exact):>14s}")',
+				newText: 'def line(label, exact):\n    print(f"  {label:<58s} € {r0(exact):>14s}")\n\nMIXED_COST_NAFTREKBAAR = 0.265',
+			},
+			{
+				oldText: '    c["other_liab"] = find(rows, lambda r: r["type"] == "current_liabilities"\n                           and r["id"] not in used)',
+				newText: '    c["other_liab"] = find(rows, lambda r: r["type"] == "current_liabilities"\n                           and r["id"] not in used)\n    c["mixed"] = True',
+			},
+		], 'f.py');
+		expect(newContent).toBe(
+			[
+				'    c["other_assets"] = find(rows, lambda r: r["type"] == "current_assets"',
+				'                             and r["id"] not in used)',
+				'    c["other_liab"] = find(rows, lambda r: r["type"] == "current_liabilities"',
+				'                           and r["id"] not in used)',
+				'    c["mixed"] = True',
+				'    return c',
+				'',
+				'',
+				'def line(label, exact):',
+				'    print(f"  {label:<58s} € {r0(exact):>14s}")',
+				'',
+				'MIXED_COST_NAFTREKBAAR = 0.265',
+				'',
+			].join('\n'),
+		);
+	});
 });
 
 describe('applyEditsEnhanced — indentation-tolerant matching', () => {

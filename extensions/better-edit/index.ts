@@ -629,10 +629,12 @@ export function applyEditsEnhanced(
 	}
 
 	const baseContent = content;
+	// applyReplacements iterates from the end of the array, so it requires the
+	// replacements sorted by position (like pi core); edit order is not file order.
 	const newContent =
 		baseStage === "exact"
-			? applyReplacements(content, matched, 0)
-			: applyReplacementsPreservingUnchangedLines(content, replacementBase, matched);
+			? applyReplacements(content, sorted, 0)
+			: applyReplacementsPreservingUnchangedLines(content, replacementBase, sorted);
 
 	if (baseContent === newContent) {
 		throw new Error(
