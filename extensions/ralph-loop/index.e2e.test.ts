@@ -492,7 +492,9 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect((compaction as { fromHook?: boolean }).fromHook).toBe(true);
 			expect((compaction as { details?: { source?: string } }).details?.source).toBe('ralph-loop');
 			expect(compaction!.summary).toContain('progress in this loop');
-			expect(compaction!.summary).toContain('Implemented task one; changed a.ts; bun test passed.');
+			// Titles only: the completion log entry stays in the backlog, not the summary.
+			expect(compaction!.summary).toContain('1. Task one');
+			expect(compaction!.summary).not.toContain('Implemented task one; changed a.ts; bun test passed.');
 			// The recording prompt, identified by its unique text (the iteration
 			// prompts mention the completion log too, and the fresh iteration
 			// prompt is already in the branch by now).

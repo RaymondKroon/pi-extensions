@@ -3365,7 +3365,9 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(result.compaction.tokensBefore).toBe(123);
 		expect(result.compaction.details.source).toBe('ralph-loop');
 		expect(result.compaction.summary).toContain('Completed in this loop:');
-		expect(result.compaction.summary).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
+		// Titles only: the completion log entry stays in the backlog, not the summary.
+		expect(result.compaction.summary).toContain('1. Task one');
+		expect(result.compaction.summary).not.toContain('Implemented task one; changed a.ts; bun test passed.');
 
 		// After the compaction settles: summary → boundary → prompt, in order
 		// (the summary lands before the cut, so the model context drops it).
@@ -3577,10 +3579,11 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(boundary).toBeDefined();
 		expect(summary).toBeDefined();
 		expect(fake.customMessages.indexOf(summary!)).toBeLessThan(fake.customMessages.indexOf(boundary!));
-		expect(summary?.message.content).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
+		expect(summary?.message.content).toContain('1. Task one');
+		expect(summary?.message.content).not.toContain('Implemented task one; changed a.ts; bun test passed.');
 	});
 
-	test('rotation: completed tasks without a log entry are listed as such', async () => {
+	test('rotation: completed tasks without a log entry are listed by title only', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3593,7 +3596,8 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		await flush();
 
 		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
-		expect(summary?.message.content).toContain('1. Task one: completed (no completion log entry)');
+		expect(summary?.message.content).toContain('1. Task one');
+		expect(summary?.message.content).not.toContain('no completion log entry');
 	});
 
 	test('rotation: completions from earlier iterations stay in later summaries', async () => {
@@ -3620,8 +3624,8 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		// earlier iteration's completion, not just the last one.
 		const summaries = fake.customMessages.filter((m) => m.message.customType === 'ralph-loop-completion-summary');
 		const summary = summaries.at(-1)?.message.content ?? '';
-		expect(summary).toContain('1. Task one: (2026-09-04) Implemented task one; changed a.ts; bun test passed.');
-		expect(summary).toContain('2. Task two: (2026-09-05) Implemented task two; changed b.ts; bun test passed.');
+		expect(summary).toContain('1. Task one');
+		expect(summary).toContain('2. Task two');
 	});
 
 	test('rotation: tasks completed before the loop started stay out of the summary', async () => {
@@ -3638,7 +3642,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		await flush();
 
 		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
-		expect(summary?.message.content).toContain('2. Task two: (2026-09-05) Implemented task two; changed b.ts; bun test passed.');
+		expect(summary?.message.content).toContain('2. Task two');
 		expect(summary?.message.content).not.toContain('Task one');
 	});
 
@@ -4042,7 +4046,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(file).toContain('rewrote the parser');
 	});
 
-	test('ralph_auto add and complete require an active auto loop; next and list work without one', async () => {
+	test('ralph_auto add and complete require an active auto loop when auto mode is off; next and list work without one', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -4060,6 +4064,82 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(next.content[0]!.text).toContain('No open tasks remain');
 		const list = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
 		expect(list.content[0]!.text).toContain('0 open');
+	});
+
+	test('ralph_auto add starts the auto loop when auto mode is on and no loop is active', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+
+		const tool = autoTool(fake);
+		const added = await tool.execute('t', { action: 'add', title: 'First step', body: '- do it' }, undefined, undefined, fakeCtx.ctx);
+		expect(added.content[0]!.text).toContain('Recorded todo 1');
+		expect(added.content[0]!.text).toContain('The Ralph auto loop was started');
+
+		// The loop is active now: state persisted, status bar switched to on.
+		expect(stateEntries(fake).at(-1)!.data).toMatchObject({ enabled: true, mode: 'auto', iteration: 1 });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+
+		// The todo landed in the auto-created session category of the auto backlog.
+		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(file).toContain('First step');
+
+		// next/complete now work scoped to the session category.
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('First step');
+		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+		expect(done.content[0]!.text).toContain('Marked task 1');
+	});
+
+	test('concurrent ralph_auto adds arm the auto loop once and both todos survive (no torn file)', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const tool = autoTool(fake);
+		const [first, second] = await Promise.all([
+			tool.execute('t1', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx),
+			tool.execute('t2', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx)
+		]);
+		// Both sibling calls succeed against one armed loop (the armAutoLoop
+		// promise cache), and the per-file lock serializes their
+		// load → mutate → write cycles: no lost todo, no torn file.
+		expect(first.content[0]!.text).toContain('Recorded todo 1');
+		expect(second.content[0]!.text).toContain('Recorded todo 2');
+		expect(first.content[0]!.text).toContain('The Ralph auto loop was started');
+		expect(second.content[0]!.text).toContain('The Ralph auto loop was started');
+		const armed = stateEntries(fake).filter((entry) => (entry.data as { enabled?: boolean }).enabled === true);
+		expect(armed).toHaveLength(1);
+
+		// The file still parses and both todos are in the session category.
+		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		expect(() => Backlog.parse(file)).not.toThrow();
+		const list = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
+		expect(list.content[0]!.text).toContain('2 open');
+	});
+
+	test('ralph_auto add re-arms the auto loop after an explicit stop', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+
+		// A new explicit request supersedes the stop: auto mode is still "on",
+		// so the todo is recorded and the auto loop starts again.
+		const tool = autoTool(fake);
+		const added = await tool.execute('t', { action: 'add', title: 'x' }, undefined, undefined, fakeCtx.ctx);
+		expect(added.content[0]!.text).toContain('Recorded todo');
+		expect(added.content[0]!.text).toContain('The Ralph auto loop was started');
+		expect(stateEntries(fake).at(-1)!.data).toMatchObject({ enabled: true, mode: 'auto' });
 	});
 
 	test('auto mode does not rotate on task completion', async () => {
@@ -4086,18 +4166,21 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(status).toContain('iteration 1/10');
 	});
 
-	test('auto mode status bar refreshes the task count after a settle (not stale)', async () => {
+	test('auto mode status bar shows the task count live after tool mutations and after a settle', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		// The tool calls do not refresh the counter themselves; the settle must.
+		// Mutations refresh the footer live — no settle in between.
 		const tool = autoTool(fake);
 		await tool.execute('t', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 1/1 (iteration 1)');
 		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 1/2 (iteration 1)');
 		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 2/2 (iteration 1)');
 
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);

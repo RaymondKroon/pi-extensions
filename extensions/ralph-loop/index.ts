@@ -568,7 +568,19 @@ function formatDecisionMessage(question: string, context?: string): string {
 	].join('\n');
 }
 
+/**
+ * Prefix for every prompt Ralph injects as a user message. It makes the
+ * sender explicit so the model does not misattribute these to the human user
+ * in its reasoning (e.g. narrating "The user is saying to continue.").
+ */
+const AUTOMATED_PREFIX =
+	'[Automated Ralph loop instruction — sent by the ralph-loop extension, not typed by the human user. Do not restate or narrate this message in your thinking; just act on it.]\n\n';
+
 function iterationPrompt(state: RalphState, reason?: RotationReason): string {
+	return AUTOMATED_PREFIX + iterationPromptBody(state, reason);
+}
+
+function iterationPromptBody(state: RalphState, reason?: RotationReason): string {
 	if (state.mode === 'auto') {
 		const contextNote =
 			reason === 'context-limit'
@@ -699,14 +711,15 @@ ${decisionNote}`;
 /**
  * Compact summary of the progress made in the current loop, re-derived by
  * diffing the backlog against the snapshot taken when the loop started:
- * tasks completed in this loop (with the completion log entries added in this
- * loop), tasks checkpointed in this loop, and the goal checkpoint when it
- * changed. Tasks completed before the loop started stay out. Used as the text
- * of the ralph-provided compaction at each rotation and as the visible custom
- * message injected at the start of each fresh Ralph iteration. At rotations it
- * is sent before the context boundary, so it stays in the session (audit
- * trail, TUI) but is dropped from the model context — the model checks its own
- * progress with the ralph_todo/ralph_goal tools.
+ * tasks completed in this loop (titles only — the completion log entries
+ * stay in the backlog), tasks checkpointed in this loop, and the goal
+ * checkpoint when it changed. Tasks completed before the loop started stay
+ * out. Used as the text of the ralph-provided compaction at each rotation
+ * and as the visible custom message injected at the start of each fresh
+ * Ralph iteration. At rotations it is sent before the context boundary, so
+ * it stays in the session (audit trail, TUI) but is dropped from the model
+ * context — the model checks its own progress with the ralph_todo/ralph_goal
+ * tools.
  */
 function completionSummary(todo: string, loopStartTodo: string, category?: string): string | undefined {
 	if (!isRalphBacklog(todo)) return undefined;
@@ -738,14 +751,10 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
 		const newEntries = newEntriesByTask.get(task.id) ?? [];
 		const wasDone = baseline ? (baselineDone.get(task.id) ?? false) : false;
 		if (task.done && (!wasDone || newEntries.some((entry) => entry.kind === 'done'))) {
-			if (newEntries.length === 0) {
-				completionLines.push(`${number}. ${task.title}: completed (no completion log entry)`);
-				return;
-			}
-			const notes = newEntries
-				.map((entry) => `${entry.date ? `(${entry.date}) ` : ''}${entry.kind === 'reopen' ? 'reopened: ' : ''}${entry.note}`)
-				.join('; ');
-			completionLines.push(`${number}. ${task.title}: ${notes}`);
+			// Title only: the completion log entries (outcome, evidence,
+			// verification) stay durable in the backlog's completion log; the
+			// summary is a compact progress list for the TUI/audit trail.
+			completionLines.push(`${number}. ${task.title}`);
 		}
 		const previousCheckpoint = baseline ? (baselineCheckpoints.get(task.id) ?? null) : null;
 		if (task.checkpoint !== null && task.checkpoint !== previousCheckpoint) {
@@ -774,10 +783,14 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
  * iteration continues from the durable state instead of starting over.
  */
 function resumePrompt(state: RalphState): string {
-	return `The Ralph loop was paused and is now resumed. Continue the current iteration exactly where the interrupted turn left off. Re-read ${state.todoPath} and the repository as the source of truth, verify what is already done, and proceed with the remaining work of the current task.`;
+	return `${AUTOMATED_PREFIX}The Ralph loop was paused and is now resumed. Continue the current iteration exactly where the interrupted turn left off. Re-read ${state.todoPath} and the repository as the source of truth, verify what is already done, and proceed with the remaining work of the current task.`;
 }
 
 function contextCheckpointPrompt(state: RalphState): string {
+	return AUTOMATED_PREFIX + contextCheckpointPromptBody(state);
+}
+
+function contextCheckpointPromptBody(state: RalphState): string {
 	if (isRalphBacklog(state.baselineTodo)) {
 		// Task-less goal iterations (planning/re-evaluation) have no task to
 		// checkpoint: the goal carries the durable state instead.
@@ -828,7 +841,7 @@ function autoFinishPrompt(state: RalphState): string {
 			? `
 4. Keep the big picture in the backlog: for each larger remaining objective this work serves (not the immediate next step), check whether an open task whose title starts with "Goal: " covers it; if it is missing, add it with ralph_auto (action "add", title "Goal: <objective>", body with the acceptance evidence to look for). Big-picture tasks are tracking tasks, not next steps.`
 			: '';
-	return `The current Ralph auto iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog. This is iteration ${state.iteration} of ${state.maxIterations}.
+	return `${AUTOMATED_PREFIX}The current Ralph auto iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog. This is iteration ${state.iteration} of ${state.maxIterations}.
 
 1. Wrap up what you are doing. Finishing this handoff matters more than a clean state: it is OK to leave the code in a bad state (half-applied edits, failing builds, untested changes) — the next iteration will re-establish the facts and fix it. Mark any finished task complete with ralph_auto (action "complete", with a concise note).
 2. Record the remaining work for the next iteration: call ralph_auto with action "add" (title, optional body) for each todo entry in category "${state.category}". Each entry must be self-contained for a fresh session that has none of this conversation: what remains, why, relevant paths, the current state of the code (including anything broken or half-done), the debugging findings that bear on it (root causes found, approaches tried that failed, current build/test state), and the exact next step.
@@ -845,6 +858,10 @@ Report the recorded todos and findings succinctly.`;
  * the next iteration starts.
  */
 function completionRecordingPrompt(state: RalphState): string {
+	return AUTOMATED_PREFIX + completionRecordingPromptBody(state);
+}
+
+function completionRecordingPromptBody(state: RalphState): string {
 	if (isRalphBacklog(state.baselineTodo)) {
 		const numbers = state.completedTasks ?? [];
 		if (numbers.length > 0) {
@@ -883,7 +900,7 @@ Report the recorded entry and the commit (if any) succinctly.`;
  * was completed in the turn.
  */
 function planRecordingPrompt(state: RalphState): string {
-	return `The Ralph plan was just updated: new tasks were added to the backlog. Commit the updated plan now, then stop working; a fresh Ralph iteration will start after this turn.
+	return `${AUTOMATED_PREFIX}The Ralph plan was just updated: new tasks were added to the backlog. Commit the updated plan now, then stop working; a fresh Ralph iteration will start after this turn.
 
 1. Check git status. If the updated plan (or any other uncommitted work from this iteration) is not committed locally, commit it with a concise message. Do not push.
 2. Do not add a completion log entry: no task was completed in this iteration.
@@ -1395,7 +1412,7 @@ ${goal.body ? `${goal.body}\n` : ''}
 Keep the goal text exactly as given — it is the user's contract and is already recorded in the ralph-format backlog; do not reword it. Derive explicit, verifiable acceptance criteria for the goal from the project brief and put them with the goal in the specification. The goal loop plans from the goal, executes the planned tasks, and only stops when the goal is verified complete and approved.
 `
 		: '';
-	return `Create the Ralph specification now. This is planning work only; do not implement the product brief.
+	return `${AUTOMATED_PREFIX}Create the Ralph specification now. This is planning work only; do not implement the product brief.
 
 Project brief:
 ${prompt}
@@ -1442,8 +1459,10 @@ export default function (pi: ExtensionAPI) {
 	// Once per loop: whether the keepRecentTokens gate notification was shown
 	// (a rotation compaction refused because the iteration is too small).
 	let compactionGateNotified = false;
-	// Auto mode "auto": once the auto loop is stopped in this session, the
-	// context-budget intercept must not re-arm it (an explicit stop wins).
+	// Auto mode: once the auto loop is stopped in this session, the automatic
+	// context-budget intercept must not re-arm it (an explicit stop wins). An
+	// explicit ralph_auto add/complete still re-arms the loop: the new request
+	// supersedes the stop.
 	let autoInterceptSuspended = false;
 	// In-flight auto-arm setup; the promise cache keeps a burst of streaming
 	// updates from arming two loops (two session categories).
@@ -1489,8 +1508,8 @@ export default function (pi: ExtensionAPI) {
 	// rendered prompt), so adding the tool when the loop arms at the context
 	// budget would invalidate the prefix cache at the largest context of the
 	// session. The tool is safe to have active without an armed loop —
-	// add/complete require an active auto loop, next/list read the auto
-	// backlog unscoped.
+	// add/complete arm the auto loop when auto mode is on (otherwise they
+	// require an active one), next/list read the auto backlog unscoped.
 	const syncToolActivation = () => {
 		const active = pi.getActiveTools();
 		const next = active.filter((name) => !RALPH_TOOL_NAMES.includes(name) && name !== AUTO_TOOL_NAME);
@@ -1580,8 +1599,9 @@ export default function (pi: ExtensionAPI) {
 		taskCount = undefined;
 		goalState = undefined;
 		freshIterationPending = false;
-		// An explicit stop of the auto loop wins over auto mode: the
-		// context-budget intercept must not re-arm the loop in this session.
+		// An explicit stop of the auto loop wins over auto mode for the rest
+		// of the session: the automatic context-budget intercept must not
+		// re-arm the loop (an explicit ralph_auto add/complete may still do).
 		if (state.mode === 'auto') autoInterceptSuspended = true;
 		persistState({
 			...state,
@@ -1708,6 +1728,20 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Per-backlog-file mutation queue. Sibling tool calls from one assistant
+	// message execute concurrently, and each call parses its own in-memory
+	// backlog: without serialization, two calls on the same file interleave
+	// (lost tasks, torn renders). The queue serializes each call's full
+	// load → mutate → write cycle per path, so every call loads the state the
+	// previous call left behind.
+	const backlogLocks = new Map<string, Promise<unknown>>();
+	const withBacklogLock = <T>(path: string, fn: () => Promise<T>): Promise<T> => {
+		const previous = backlogLocks.get(path) ?? Promise.resolve();
+		const run = previous.then(fn, fn);
+		backlogLocks.set(path, run.then(() => undefined, () => undefined));
+		return run;
+	};
+
 	// Shared parse discipline for the backlog tools (ralph_todo, ralph_goal):
 	// load the target file, require the ralph format, and parse it.
 	const loadTargetBacklog = async (todoPath: string, toolName: string): Promise<Backlog> => {
@@ -1795,207 +1829,218 @@ export default function (pi: ExtensionAPI) {
 			// Import always targets the project's main backlog (TODO.ralph), which
 			// may not exist yet, so it runs before the target read below.
 			if (params.action === 'import') {
-				if (!params.file) throw new Error('import requires the file path.');
-				const outcome = await importMarkdownBacklog(ctx.cwd, params.file, {
-					category: params.category,
-					force: params.force
+				return withBacklogLock(resolve(ctx.cwd, 'TODO.ralph'), async () => {
+					if (!params.file) throw new Error('import requires the file path.');
+					const outcome = await importMarkdownBacklog(ctx.cwd, params.file, {
+						category: params.category,
+						force: params.force
+					});
+					if (!outcome.ok) throw new Error(outcome.message);
+					const counts = outcome.counts;
+					const categoryNote = ` in category "${outcome.category}"`;
+					const text = outcome.merged
+						? `Merged ${outcome.merged.tasks} tasks${outcome.merged.logEntries ? ` and ${outcome.merged.logEntries} log entries` : ''} from ${params.file} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total).`
+						: `Imported ${counts.total} tasks (${counts.open} open) from ${params.file} to ${outcome.outName}${categoryNote}.`;
+					return {
+						content: [{ type: 'text', text }],
+						details: { action: 'import', file: params.file }
+					};
 				});
-				if (!outcome.ok) throw new Error(outcome.message);
-				const counts = outcome.counts;
-				const categoryNote = ` in category "${outcome.category}"`;
-				const text = outcome.merged
-					? `Merged ${outcome.merged.tasks} tasks${outcome.merged.logEntries ? ` and ${outcome.merged.logEntries} log entries` : ''} from ${params.file} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total).`
-					: `Imported ${counts.total} tasks (${counts.open} open) from ${params.file} to ${outcome.outName}${categoryNote}.`;
-				return {
-					content: [{ type: 'text', text }],
-					details: { action: 'import', file: params.file }
-				};
 			}
 			// Target: the active loop's backlog, else the project's main backlog.
 			const todoPath = state?.enabled ? state.todoPath : resolve(ctx.cwd, 'TODO.ralph');
 			// Init bootstraps a missing backlog file, so it runs before the target read.
 			if (params.action === 'init') {
-				const status = await inspectInitTarget(todoPath);
-				if (status.kind === 'error') throw new Error(status.message);
-				if (status.kind === 'exists') {
-					if (status.ralph) {
-						return {
-							content: [{ type: 'text', text: `${todoPath} already exists as a ralph-format backlog; nothing to do.` }],
-							details: { action: 'init', task: null }
-						};
+				return withBacklogLock(todoPath, async () => {
+					const status = await inspectInitTarget(todoPath);
+					if (status.kind === 'error') throw new Error(status.message);
+					if (status.kind === 'exists') {
+						if (status.ralph) {
+							return {
+								content: [{ type: 'text', text: `${todoPath} already exists as a ralph-format backlog; nothing to do.` }],
+								details: { action: 'init', task: null }
+							};
+						}
+						throw new Error(`${todoPath} exists but is not a ralph-format backlog; refusing to overwrite it.`);
 					}
-					throw new Error(`${todoPath} exists but is not a ralph-format backlog; refusing to overwrite it.`);
+					try {
+						await mkdir(dirname(todoPath), { recursive: true });
+						await writeFile(todoPath, Backlog.empty().render());
+					} catch (error) {
+						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+					}
+					return {
+						content: [{ type: 'text', text: `Created empty Ralph backlog at ${todoPath}. Add tasks with action "add" and lists with action "new-list".` }],
+						details: { action: 'init', task: null }
+					};
+				});
+			}
+			return withBacklogLock(todoPath, async () => {
+				const backlog = await loadTargetBacklog(todoPath, 'ralph_todo');
+
+				let mutated = false;
+				let output: string;
+				const scope = state?.enabled ? state.category : undefined;
+				switch (params.action) {
+					case 'next': {
+						const task = backlog.nextOpenTask(scope);
+						if (!task) {
+							output = `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
+							break;
+						}
+						output = formatNextTask(backlog, task, scope);
+						break;
+					}
+					case 'list': {
+						const listScope = params.category ?? scope;
+						if (params.category !== undefined && !backlog.categories().includes(params.category)) {
+							throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
+						}
+						if (params.task !== undefined) {
+							const task = backlog.findTaskByNumber(params.task, listScope);
+							if (!task) {
+								const known = [...backlog.taskNumbers(listScope).values()].join(', ');
+								throw new Error(`no task ${params.task} (tasks: ${known || 'none'})`);
+							}
+							output = formatTaskDetail(backlog, task, listScope);
+							break;
+						}
+						output = formatBacklog(backlog, listScope, { verbose: params.verbose === true });
+						break;
+					}
+					case 'search': {
+						if (!params.query) throw new Error('search requires the query text.');
+						const searchScope = params.category ?? scope;
+						if (params.category !== undefined && !backlog.categories().includes(params.category)) {
+							throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
+						}
+						output = formatSearchResults(backlog, params.query, searchScope);
+						break;
+					}
+					case 'complete': {
+						if (!params.task) throw new Error('complete requires the task number.');
+						const task = backlog.complete(params.task, scope);
+						mutated = true;
+						const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+						let recorded = false;
+						if (params.note) {
+							const now = new Date();
+							const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+							backlog.addLogEntry({ task: String(number), date, note: params.note.trim() }, scope);
+							recorded = true;
+						}
+						output = state?.enabled
+							? `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}. Stop working now — the iteration is finished; the loop records the completion and starts a fresh iteration.`
+							: `Marked task ${number} "${task.title}" done in ${todoPath}${recorded ? ' and recorded the completion log entry' : ''}.`;
+						break;
+					}
+					case 'checkpoint': {
+						if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
+						if (!params.task || !params.note) throw new Error('checkpoint requires the task number and a note.');
+						const task = backlog.setCheckpoint(params.task, params.note.trim(), state.iteration, scope);
+						mutated = true;
+						const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+						output = `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						break;
+					}
+					case 'add': {
+						if (!params.title) throw new Error('add requires a title.');
+						if (!params.category) throw new Error('add requires a category (an existing list); create it first with action "new-list"');
+						const targetCategory = params.category;
+						if (!backlog.categories().includes(targetCategory)) {
+							throw new Error(`no list named "${targetCategory}" (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`);
+						}
+						const task = backlog.addTask({
+							title: params.title,
+							body: params.body,
+							category: targetCategory
+						});
+						mutated = true;
+						const number = backlog.taskNumbers(targetCategory).get(task.id) ?? task.id;
+						output = `Added task ${number} "${task.title}" in category "${targetCategory}".`;
+						break;
+					}
+					case 'add-many': {
+						const items = params.tasks;
+						if (!Array.isArray(items) || items.length === 0) {
+							throw new Error('add-many requires a non-empty "tasks" array.');
+						}
+						if (!params.category) {
+							throw new Error('add-many requires a category (an existing list) for the batch; create it first with action "new-list"');
+						}
+						const batchCategory = params.category;
+						// Validate the whole batch first so an invalid entry adds nothing.
+						const missingLists = [
+							...new Set(
+								[batchCategory, ...items.map((item) => item.category)]
+									.filter((category): category is string => category !== undefined && !backlog.categories().includes(category))
+							)
+						];
+						if (missingLists.length > 0) {
+							throw new Error(
+								`no list named ${missingLists.map((name) => `"${name}"`).join(', ')} (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`
+							);
+						}
+						const added = items.map((item) =>
+							backlog.addTask({ title: item.title, body: item.body, category: item.category ?? batchCategory })
+						);
+						mutated = true;
+						const summary = added
+							.map((task) => {
+								const number = backlog.taskNumbers(task.category ?? scope).get(task.id) ?? task.id;
+								return `${number} "${task.title}"${task.category ? ` [${task.category}]` : ''}`;
+							})
+							.join(', ');
+						output = `Added ${added.length} task${added.length === 1 ? '' : 's'}: ${summary}.`;
+						break;
+					}
+					case 'new-list': {
+						if (!params.name) throw new Error('new-list requires a name.');
+						backlog.createList(params.name);
+						mutated = true;
+						output = `Created list "${params.name.trim()}". It is empty; add tasks to it with action "add" and category "${params.name.trim()}".`;
+						break;
+					}
+					case 'log': {
+						if (!params.task) throw new Error('log requires the task number.');
+						if (!params.note) throw new Error('log requires a note.');
+						const entry = backlog.addLogEntry({ task: params.task, date: params.date, note: params.note, kind: params.kind }, scope);
+						mutated = true;
+						const number = backlog.taskNumbers(scope).get(entry.taskId) ?? String(entry.taskId);
+						output = `Completion log entry recorded for task ${number}${entry.date ? ` dated ${entry.date}` : ''}.`;
+						break;
+					}
+					case 'move': {
+						if (!params.task) throw new Error('move requires the task number.');
+						if (params.direction !== 'up' && params.direction !== 'down') {
+							throw new Error('move requires direction "up" or "down".');
+						}
+						const steps = params.by ?? 1;
+						const task = backlog.moveTask(params.task, params.direction, steps, scope);
+						mutated = true;
+						const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+						output = `Moved task ${number} "${task.title}" ${params.direction} by ${steps}.`;
+						break;
+					}
 				}
-				try {
-					await mkdir(dirname(todoPath), { recursive: true });
-					await writeFile(todoPath, Backlog.empty().render());
-				} catch (error) {
-					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+
+				if (mutated) {
+					const rendered = backlog.render();
+					try {
+						await writeFile(todoPath, rendered);
+					} catch (error) {
+						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+					}
+					// Live status: the footer's task count must not wait for the
+					// settle to reflect mutations made mid-turn.
+					refreshCounts(rendered, scope);
+					updateStatus(ctx);
 				}
 				return {
-					content: [{ type: 'text', text: `Created empty Ralph backlog at ${todoPath}. Add tasks with action "add" and lists with action "new-list".` }],
-					details: { action: 'init', task: null }
+					content: [{ type: 'text', text: output }],
+					details: { action: params.action, task: params.task ?? null }
 				};
-			}
-			const backlog = await loadTargetBacklog(todoPath, 'ralph_todo');
-
-			let mutated = false;
-			let output: string;
-			const scope = state?.enabled ? state.category : undefined;
-			switch (params.action) {
-				case 'next': {
-					const task = backlog.nextOpenTask(scope);
-					if (!task) {
-						output = `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
-						break;
-					}
-					output = formatNextTask(backlog, task, scope);
-					break;
-				}
-				case 'list': {
-					const listScope = params.category ?? scope;
-					if (params.category !== undefined && !backlog.categories().includes(params.category)) {
-						throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
-					}
-					if (params.task !== undefined) {
-						const task = backlog.findTaskByNumber(params.task, listScope);
-						if (!task) {
-							const known = [...backlog.taskNumbers(listScope).values()].join(', ');
-							throw new Error(`no task ${params.task} (tasks: ${known || 'none'})`);
-						}
-						output = formatTaskDetail(backlog, task, listScope);
-						break;
-					}
-					output = formatBacklog(backlog, listScope, { verbose: params.verbose === true });
-					break;
-				}
-				case 'search': {
-					if (!params.query) throw new Error('search requires the query text.');
-					const searchScope = params.category ?? scope;
-					if (params.category !== undefined && !backlog.categories().includes(params.category)) {
-						throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
-					}
-					output = formatSearchResults(backlog, params.query, searchScope);
-					break;
-				}
-				case 'complete': {
-					if (!params.task) throw new Error('complete requires the task number.');
-					const task = backlog.complete(params.task, scope);
-					mutated = true;
-					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
-					let recorded = false;
-					if (params.note) {
-						const now = new Date();
-						const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-						backlog.addLogEntry({ task: String(number), date, note: params.note.trim() }, scope);
-						recorded = true;
-					}
-					output = state?.enabled
-						? `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}. Stop working now — the iteration is finished; the loop records the completion and starts a fresh iteration.`
-						: `Marked task ${number} "${task.title}" done in ${todoPath}${recorded ? ' and recorded the completion log entry' : ''}.`;
-					break;
-				}
-				case 'checkpoint': {
-					if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
-					if (!params.task || !params.note) throw new Error('checkpoint requires the task number and a note.');
-					const task = backlog.setCheckpoint(params.task, params.note.trim(), state.iteration, scope);
-					mutated = true;
-					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
-					output = `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
-					break;
-				}
-				case 'add': {
-					if (!params.title) throw new Error('add requires a title.');
-					if (!params.category) throw new Error('add requires a category (an existing list); create it first with action "new-list"');
-					const targetCategory = params.category;
-					if (!backlog.categories().includes(targetCategory)) {
-						throw new Error(`no list named "${targetCategory}" (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`);
-					}
-					const task = backlog.addTask({
-						title: params.title,
-						body: params.body,
-						category: targetCategory
-					});
-					mutated = true;
-					const number = backlog.taskNumbers(targetCategory).get(task.id) ?? task.id;
-					output = `Added task ${number} "${task.title}" in category "${targetCategory}".`;
-					break;
-				}
-				case 'add-many': {
-					const items = params.tasks;
-					if (!Array.isArray(items) || items.length === 0) {
-						throw new Error('add-many requires a non-empty "tasks" array.');
-					}
-					if (!params.category) {
-						throw new Error('add-many requires a category (an existing list) for the batch; create it first with action "new-list"');
-					}
-					const batchCategory = params.category;
-					// Validate the whole batch first so an invalid entry adds nothing.
-					const missingLists = [
-						...new Set(
-							[batchCategory, ...items.map((item) => item.category)]
-								.filter((category): category is string => category !== undefined && !backlog.categories().includes(category))
-						)
-					];
-					if (missingLists.length > 0) {
-						throw new Error(
-							`no list named ${missingLists.map((name) => `"${name}"`).join(', ')} (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`
-						);
-					}
-					const added = items.map((item) =>
-						backlog.addTask({ title: item.title, body: item.body, category: item.category ?? batchCategory })
-					);
-					mutated = true;
-					const summary = added
-						.map((task) => {
-							const number = backlog.taskNumbers(task.category ?? scope).get(task.id) ?? task.id;
-							return `${number} "${task.title}"${task.category ? ` [${task.category}]` : ''}`;
-						})
-						.join(', ');
-					output = `Added ${added.length} task${added.length === 1 ? '' : 's'}: ${summary}.`;
-					break;
-				}
-				case 'new-list': {
-					if (!params.name) throw new Error('new-list requires a name.');
-					backlog.createList(params.name);
-					mutated = true;
-					output = `Created list "${params.name.trim()}". It is empty; add tasks to it with action "add" and category "${params.name.trim()}".`;
-					break;
-				}
-				case 'log': {
-					if (!params.task) throw new Error('log requires the task number.');
-					if (!params.note) throw new Error('log requires a note.');
-					const entry = backlog.addLogEntry({ task: params.task, date: params.date, note: params.note, kind: params.kind }, scope);
-					mutated = true;
-					const number = backlog.taskNumbers(scope).get(entry.taskId) ?? String(entry.taskId);
-					output = `Completion log entry recorded for task ${number}${entry.date ? ` dated ${entry.date}` : ''}.`;
-					break;
-				}
-				case 'move': {
-					if (!params.task) throw new Error('move requires the task number.');
-					if (params.direction !== 'up' && params.direction !== 'down') {
-						throw new Error('move requires direction "up" or "down".');
-					}
-					const steps = params.by ?? 1;
-					const task = backlog.moveTask(params.task, params.direction, steps, scope);
-					mutated = true;
-					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
-					output = `Moved task ${number} "${task.title}" ${params.direction} by ${steps}.`;
-					break;
-				}
-			}
-
-			if (mutated) {
-				try {
-					await writeFile(todoPath, backlog.render());
-				} catch (error) {
-					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			}
-			return {
-				content: [{ type: 'text', text: output }],
-				details: { action: params.action, task: params.task ?? null }
-			};
+			});
 		},
 		renderResult(result, options) {
 			const text =
@@ -2035,113 +2080,115 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			// Target: the active loop's backlog, else the project's main backlog.
 			const todoPath = state?.enabled ? state.todoPath : resolve(ctx.cwd, 'TODO.ralph');
-			const backlog = await loadTargetBacklog(todoPath, 'ralph_goal');
-			const goal = backlog.goal();
+			return withBacklogLock(todoPath, async () => {
+				const backlog = await loadTargetBacklog(todoPath, 'ralph_goal');
+				const goal = backlog.goal();
 
-			let mutated = false;
-			let terminated = false;
-			let output: string;
-			// Keep the cached status-line state in sync with a goal mutation before
-			// the loop reacts to it (e.g. the blocked approval gate).
-			const syncGoalState = () => {
-				if (state?.enabled && state.todoPath === todoPath) goalState = backlog.goal()?.status;
-			};
-			switch (params.action) {
-				case 'show': {
-					if (!goal) {
-						output = `No goal in ${todoPath}.`;
+				let mutated = false;
+				let terminated = false;
+				let output: string;
+				// Keep the cached status-line state in sync with a goal mutation before
+				// the loop reacts to it (e.g. the blocked approval gate).
+				const syncGoalState = () => {
+					if (state?.enabled && state.todoPath === todoPath) goalState = backlog.goal()?.status;
+				};
+				switch (params.action) {
+					case 'show': {
+						if (!goal) {
+							output = `No goal in ${todoPath}.`;
+							break;
+						}
+						output = formatGoal(goal);
 						break;
 					}
-					output = formatGoal(goal);
-					break;
-				}
-				case 'checkpoint': {
-					if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
-					if (state.mode !== 'goal') {
-						throw new Error('checkpoint requires an active goal loop (start one with /ralph start --goal).');
+					case 'checkpoint': {
+						if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
+						if (state.mode !== 'goal') {
+							throw new Error('checkpoint requires an active goal loop (start one with /ralph start --goal).');
+						}
+						if (!params.note) throw new Error('checkpoint requires a note.');
+						const updated = backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
+						mutated = true;
+						output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						break;
 					}
-					if (!params.note) throw new Error('checkpoint requires a note.');
-					const updated = backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
-					mutated = true;
-					output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
-					break;
-				}
-				case 'complete': {
-					if (!state?.enabled) throw new Error('complete requires an active Ralph loop (start one with /ralph start).');
-					if (state.mode !== 'goal') {
-						throw new Error('complete requires an active goal loop (start one with /ralph start --goal).');
-					}
-					if (!params.note) throw new Error('complete requires the verification evidence note.');
-					if (!goal) throw new Error(`no goal in ${todoPath}`);
-					if (goal.status !== 'open') {
-						throw new Error(`cannot complete the goal: it is ${goal.status} (complete requires open)`);
-					}
-					const open = backlog.counts().open;
-					if (open > 0) {
-						throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
-					}
-					const evidence = params.note.trim();
-					const claimed = backlog.claimGoal(evidence);
-					mutated = true;
-					syncGoalState();
-					if (state.autoApproveDecisions) {
-						// Delegated approval, consistent with the decision semantics:
-						// the claim is confirmed immediately.
-						const done = backlog.confirmGoal();
+					case 'complete': {
+						if (!state?.enabled) throw new Error('complete requires an active Ralph loop (start one with /ralph start).');
+						if (state.mode !== 'goal') {
+							throw new Error('complete requires an active goal loop (start one with /ralph start --goal).');
+						}
+						if (!params.note) throw new Error('complete requires the verification evidence note.');
+						if (!goal) throw new Error(`no goal in ${todoPath}`);
+						if (goal.status !== 'open') {
+							throw new Error(`cannot complete the goal: it is ${goal.status} (complete requires open)`);
+						}
+						const open = backlog.counts().open;
+						if (open > 0) {
+							throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
+						}
+						const evidence = params.note.trim();
+						const claimed = backlog.claimGoal(evidence);
+						mutated = true;
 						syncGoalState();
-						output = `Goal "${done.title}" is done (approver: auto-approved). Stop working now; the loop records the completion.`;
+						if (state.autoApproveDecisions) {
+							// Delegated approval, consistent with the decision semantics:
+							// the claim is confirmed immediately.
+							const done = backlog.confirmGoal();
+							syncGoalState();
+							output = `Goal "${done.title}" is done (approver: auto-approved). Stop working now; the loop records the completion.`;
+							break;
+						}
+						// User approval gate: the goal stays claimed and the loop pauses
+						// until the user answers (the ralph_request_decision pattern).
+						const question = `Approve completion of the goal "${claimed.title}"?`;
+						blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
+						terminated = true;
+						output = `Goal "${claimed.title}" is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
 						break;
 					}
-					// User approval gate: the goal stays claimed and the loop pauses
-					// until the user answers (the ralph_request_decision pattern).
-					const question = `Approve completion of the goal "${claimed.title}"?`;
-					blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
-					terminated = true;
-					output = `Goal "${claimed.title}" is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
-					break;
-				}
-				case 'confirm': {
-					if (!state?.enabled) throw new Error('confirm requires an active Ralph loop (start one with /ralph start).');
-					if (state.mode !== 'goal') {
-						throw new Error('confirm requires an active goal loop (start one with /ralph start --goal).');
+					case 'confirm': {
+						if (!state?.enabled) throw new Error('confirm requires an active Ralph loop (start one with /ralph start).');
+						if (state.mode !== 'goal') {
+							throw new Error('confirm requires an active goal loop (start one with /ralph start --goal).');
+						}
+						if (!goal) throw new Error(`no goal in ${todoPath}`);
+						const done = backlog.confirmGoal();
+						mutated = true;
+						syncGoalState();
+						output = `Goal "${done.title}" is done (approved). Stop working now; the loop records the completion.`;
+						break;
 					}
-					if (!goal) throw new Error(`no goal in ${todoPath}`);
-					const done = backlog.confirmGoal();
-					mutated = true;
-					syncGoalState();
-					output = `Goal "${done.title}" is done (approved). Stop working now; the loop records the completion.`;
-					break;
-				}
-				case 'withdraw': {
-					if (!state?.enabled) throw new Error('withdraw requires an active Ralph loop (start one with /ralph start).');
-					if (state.mode !== 'goal') {
-						throw new Error('withdraw requires an active goal loop (start one with /ralph start --goal).');
+					case 'withdraw': {
+						if (!state?.enabled) throw new Error('withdraw requires an active Ralph loop (start one with /ralph start).');
+						if (state.mode !== 'goal') {
+							throw new Error('withdraw requires an active goal loop (start one with /ralph start --goal).');
+						}
+						if (!params.note) throw new Error('withdraw requires a note describing what is missing.');
+						if (!goal) throw new Error(`no goal in ${todoPath}`);
+						const withdrawn = backlog.withdrawGoal(params.note.trim());
+						mutated = true;
+						syncGoalState();
+						output = `Goal "${withdrawn.title}" is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
+						break;
 					}
-					if (!params.note) throw new Error('withdraw requires a note describing what is missing.');
-					if (!goal) throw new Error(`no goal in ${todoPath}`);
-					const withdrawn = backlog.withdrawGoal(params.note.trim());
-					mutated = true;
-					syncGoalState();
-					output = `Goal "${withdrawn.title}" is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
-					break;
 				}
-			}
 
-			if (mutated) {
-				try {
-					await writeFile(todoPath, backlog.render());
-				} catch (error) {
-					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+				if (mutated) {
+					try {
+						await writeFile(todoPath, backlog.render());
+					} catch (error) {
+						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+					}
+					// The status widget captures its label when updateStatus runs; refresh
+					// it so the new goal state is visible without waiting for the settle.
+					if (state?.enabled) updateStatus(ctx);
 				}
-				// The status widget captures its label when updateStatus runs; refresh
-				// it so the new goal state is visible without waiting for the settle.
-				if (state?.enabled) updateStatus(ctx);
-			}
-			return {
-				content: [{ type: 'text', text: output }],
-				details: { action: params.action },
-				...(terminated ? { terminate: true } : {})
-			};
+				return {
+					content: [{ type: 'text', text: output }],
+					details: { action: params.action },
+					...(terminated ? { terminate: true } : {})
+				};
+			});
 		},
 		renderResult(result, options) {
 			const text =
@@ -2156,13 +2203,17 @@ export default function (pi: ExtensionAPI) {
 	// The dedicated tool of the auto mode: the session todos of _auto_.ralph.
 	// With an active auto loop it is scoped to the loop's auto-created session
 	// category; otherwise it reads the auto backlog unscoped. add and complete
+	// start the auto loop first when auto mode is "on" and no loop is active
+	// yet (the context-budget intercept would arm the same loop at the
+	// budget) — including right after an explicit /ralph stop, because the
+	// recorded todo is a new request that supersedes the stop; otherwise they
 	// require an active auto loop. The auto loop activates only this tool —
 	// not the full ralph tool set.
 	pi.registerTool({
 		name: AUTO_TOOL_NAME,
 		label: 'Ralph auto session',
 		description:
-			`Read/update the Ralph auto-loop session todos in ${AUTO_TODO_FILE} (ralph format). With an active auto loop, scoped to the loop's session category. Actions: next (first open task), list (open tasks + counts), add (record a todo entry for the next iteration; title + optional body; auto loop only), complete (mark done; note also records the completion log; auto loop only). Never read or modify the file by any other means (no file tools, no grep/cat/sed).`,
+			`Read/update the Ralph auto-loop session todos in ${AUTO_TODO_FILE} (ralph format). With an active auto loop, scoped to the loop's session category. Actions: next (first open task), list (open tasks + counts), add (record a todo entry for the next iteration; title + optional body), complete (mark done; note also records the completion log). add and complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the file by any other means (no file tools, no grep/cat/sed).`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('next'),
@@ -2177,84 +2228,109 @@ export default function (pi: ExtensionAPI) {
 			verbose: Type.Optional(Type.Boolean())
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const autoLoop = state?.enabled && state.mode === 'auto' ? state : undefined;
+			let autoLoop = state?.enabled && state.mode === 'auto' ? state : undefined;
+			let armedNow = false;
+			// The first mutation enables the auto loop when auto mode is "on" and
+			// no loop is active yet: the context-budget intercept would arm the
+			// same loop later (at the budget), this moves the arming up to the
+			// first recorded todo. An explicit /ralph stop does not block this:
+			// the recorded todo is a new request that supersedes the stop (the
+			// stop only suspends the automatic context-budget intercept). An
+			// active non-auto loop still wins. The armAutoLoop promise cache
+			// keeps concurrent sibling calls from arming two loops.
+			if (
+				!autoLoop &&
+				!state?.enabled &&
+				(params.action === 'add' || params.action === 'complete') &&
+				config.autoMode === 'on'
+			) {
+				autoLoop = await armAutoLoop(ctx);
+				armedNow = autoLoop !== undefined;
+			}
 			const todoPath = autoLoop ? autoLoop.todoPath : resolve(ctx.cwd, AUTO_TODO_FILE);
-			const scope = autoLoop?.category;
-			const backlog = await loadTargetBacklog(todoPath, AUTO_TOOL_NAME);
+			return withBacklogLock(todoPath, async () => {
+				const scope = autoLoop?.category;
+				const backlog = await loadTargetBacklog(todoPath, AUTO_TOOL_NAME);
 
-			let mutated = false;
-			let output: string;
-			switch (params.action) {
-				case 'next': {
-					// Reference entries ("Goal: " / "Findings: ") are not work
-					// items: skip them so the iteration never stalls on one.
-					const open = backlog.listTasks(scope).filter((task) => !task.done);
-					const task = open.find((task) => !isReferenceTaskTitle(task.title));
-					if (!task) {
-						const references = open.filter((task) => isReferenceTaskTitle(task.title));
-						output =
-							references.length > 0
-								? `No open work tasks remain${scope ? ` in category "${scope}"` : ''} (open reference entries, not work: ${references
-										.map((reference) => reference.title)
-										.join('; ')}).`
-								: `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
+				let mutated = false;
+				let output: string;
+				switch (params.action) {
+					case 'next': {
+						// Reference entries ("Goal: " / "Findings: ") are not work
+						// items: skip them so the iteration never stalls on one.
+						const open = backlog.listTasks(scope).filter((task) => !task.done);
+						const task = open.find((task) => !isReferenceTaskTitle(task.title));
+						if (!task) {
+							const references = open.filter((task) => isReferenceTaskTitle(task.title));
+							output =
+								references.length > 0
+									? `No open work tasks remain${scope ? ` in category "${scope}"` : ''} (open reference entries, not work: ${references
+											.map((reference) => reference.title)
+											.join('; ')}).`
+									: `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
+							break;
+						}
+						output = formatNextTask(backlog, task, scope);
 						break;
 					}
-					output = formatNextTask(backlog, task, scope);
-					break;
-				}
-				case 'list': {
-					output = formatBacklog(backlog, scope, { verbose: params.verbose === true });
-					break;
-				}
-				case 'add': {
-					if (!autoLoop) {
-						throw new Error(
-							'add requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
-						);
+					case 'list': {
+						output = formatBacklog(backlog, scope, { verbose: params.verbose === true });
+						break;
 					}
-					if (!params.title) throw new Error('add requires a title.');
-					const category = autoLoop.category ?? autoCategoryName(backlog.categories());
-					// The category is created at loop start; this is defensive.
-					if (!backlog.categories().includes(category)) backlog.createList(category);
-					const task = backlog.addTask({ title: params.title, body: params.body, category });
-					mutated = true;
-					const number = backlog.taskNumbers(category).get(task.id) ?? task.id;
-					output = `Recorded todo ${number} "${task.title}" for the next iteration in category "${category}".`;
-					break;
-				}
-				case 'complete': {
-					if (!autoLoop)
-						throw new Error(
-							'complete requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
-						);
-					if (!params.task) throw new Error('complete requires the task number.');
-					const task = backlog.complete(params.task, scope);
-					mutated = true;
-					const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
-					let recorded = false;
-					if (params.note) {
-						const now = new Date();
-						const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-						backlog.addLogEntry({ task: String(number), date, note: params.note.trim() }, scope);
-						recorded = true;
+					case 'add': {
+						if (!autoLoop) {
+							throw new Error(
+								'add requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
+							);
+						}
+						if (!params.title) throw new Error('add requires a title.');
+						const category = autoLoop.category ?? autoCategoryName(backlog.categories());
+						// The category is created at loop start; this is defensive.
+						if (!backlog.categories().includes(category)) backlog.createList(category);
+						const task = backlog.addTask({ title: params.title, body: params.body, category });
+						mutated = true;
+						const number = backlog.taskNumbers(category).get(task.id) ?? task.id;
+						output = `Recorded todo ${number} "${task.title}" for the next iteration in category "${category}".${armedNow ? ' The Ralph auto loop was started (iteration 1).' : ''}`;
+						break;
 					}
-					output = `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}.`;
-					break;
-				}
-			}
+					case 'complete': {
+						if (!autoLoop)
+							throw new Error(
+								'complete requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
+							);
+						if (!params.task) throw new Error('complete requires the task number.');
+						const task = backlog.complete(params.task, scope);
+						mutated = true;
+						const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
+						let recorded = false;
+						if (params.note) {
+							const now = new Date();
+							const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+							backlog.addLogEntry({ task: String(number), date, note: params.note.trim() }, scope);
+							recorded = true;
+							}
+						output = `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}.${armedNow ? ' The Ralph auto loop was started (iteration 1).' : ''}`;
+						break;
+						}
+					}
 
-			if (mutated) {
-				try {
-					await writeFile(todoPath, backlog.render());
-				} catch (error) {
-					throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+					if (mutated) {
+						const rendered = backlog.render();
+					try {
+						await writeFile(todoPath, rendered);
+					} catch (error) {
+						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+					}
+					// Live status: the footer's task count must not wait for the
+					// settle to reflect todos recorded mid-turn.
+					refreshCounts(rendered, scope);
+					updateStatus(ctx);
 				}
-			}
-			return {
-				content: [{ type: 'text', text: output }],
-				details: { action: params.action, task: params.task ?? null }
-			};
+				return {
+					content: [{ type: 'text', text: output }],
+					details: { action: params.action, task: params.task ?? null }
+				};
+			});
 		},
 		renderResult(result, options) {
 			const text =
@@ -2748,8 +2824,8 @@ export default function (pi: ExtensionAPI) {
 		// Auto mode arms the auto loop without a /ralph start when the session
 		// already runs over its context budget (e.g. a resumed long session) —
 		// the finish-up turn records todos for the next iteration, which then
-		// continues from the backlog. The loop itself only starts via
-		// /ralph start.
+		// continues from the backlog. The loop also arms on the first
+		// ralph_auto add/complete; /ralph start begins it immediately.
 		if (!state?.enabled && config.autoMode === 'on') {
 			const fraction = contextUsageFraction(ctx);
 			if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
@@ -3056,7 +3132,7 @@ export default function (pi: ExtensionAPI) {
 				openWorkTaskCount(currentTodo, state.category) > 0
 			) {
 				pi.sendUserMessage(
-					'Continue the Ralph auto loop: call ralph_auto with action "next" and start the next open task.',
+					`${AUTOMATED_PREFIX}Continue the Ralph auto loop: call ralph_auto with action "next" and start the next open task.`,
 					{ deliverAs: 'followUp' }
 				);
 				return;
@@ -3151,7 +3227,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'autoMode',
 				label: 'Auto mode',
 				description:
-					`The auto loop stores its state in ${AUTO_TODO_FILE} with an auto-created session category, rotates on its context budget (the model finishes up and records todos for the next iteration), and uses the dedicated ralph_auto tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session). The loop itself only starts via /ralph start, which uses the auto loop unless the mode is off (an explicit --goal start is unaffected).`,
+					`The auto loop stores its state in ${AUTO_TODO_FILE} with an auto-created session category, rotates on its context budget (the model finishes up and records todos for the next iteration), and uses the dedicated ralph_auto tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session) or on the first ralph_auto add/complete. /ralph start begins the auto loop immediately with an iteration prompt unless the mode is off (an explicit --goal start is unaffected).`,
 				currentValue: config.autoMode,
 				values: ['off', 'on']
 			}

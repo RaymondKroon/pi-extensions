@@ -120,7 +120,8 @@ tool (not the full ralph tool set). The loop itself only starts via
   session start (e.g. a resumed long session) or mid-session — asks the model
   to record the remaining work as todos, then iterates from the backlog.
   A plain `/ralph start` also starts the auto loop. Stopping the loop
-  suspends the intercept for the rest of the session.
+  suspends the automatic intercept for the rest of the session (an explicit
+  `ralph_auto add`/`complete` still re-arms the loop).
 
 The handoff is deliberately tolerant of a bad state: when an iteration reaches
 its context budget, the model may leave the code broken or half-done — the
@@ -140,22 +141,30 @@ them when missing, skips them when selecting work (`next` never returns one),
 and completes one only when its objective is actually met.
 
 The tool targets the active auto loop's session category; without an active
-auto loop it reads### next
+auto loop it reads the backlog unscoped. `add` and `complete` start the auto
+loop first when auto mode is "on" and no loop is active yet — including right
+after an explicit `/ralph stop`, because the recorded todo is a new request
+that supersedes the stop (the stop only suspends the automatic context-budget
+intercept).
+
+### next
 Compact view of the first open **work** task of the session category.
 Reference entries (titles starting with `Goal: ` or `Findings: `) are not
 work items and are skipped; when only reference entries remain open, the
-result says so and lists them.sk of the session category.
+result says so and lists them.
 
 ### list
 Counts and open tasks of the session category. `verbose: true` also includes
 completed tasks and completion log entries.
 
 ### add
-Auto loop only. Records a todo entry for the next iteration in the session
-category (auto-created at loop start). Requires `title`; `body` is optional
+Records a todo entry for the next iteration in the session
+category (auto-created at loop start). Starts the auto loop first when auto
+mode is "on" and no loop is active yet. Requires `title`; `body` is optional
 markdown bullets. Each entry should be self-contained for a fresh session:
 what remains, why, relevant paths, and the exact next step.
 
 ### complete
-Auto loop only. Marks the task (`task` number) done. With `note` it also
+Marks the task (`task` number) done. Starts the auto loop first when auto
+mode is "on" and no loop is active yet. With `note` it also
 records the completion log entry in the same call.
