@@ -126,8 +126,11 @@ tool (not the full ralph tool set). The loop itself only starts via
 The handoff is deliberately tolerant of a bad state: when an iteration reaches
 its context budget, the model may leave the code broken or half-done — the
 finish-up turn records the remaining work (including what is broken) as
-self-contained todos for the next iteration. Auto mode never instructs
-commits: the backlog is the handoff, not git. `SPEC.md` is optional: the auto
+self-contained todos for the next iteration. Auto mode commits every completed
+task locally (never pushes): the backlog is the handoff, and the per-task
+commit is the durable checkpoint of finished work. The finish-up turn commits
+completed work that is still uncommitted, but never broken or half-done work.
+`SPEC.md` is optional: the auto
 loop runs in any project and creates it (along with `DEBUG.md`) when the
 project is not yet documented. Every finish-up also logs the
 iteration's important findings as reference entries (titles starting with

@@ -3947,6 +3947,9 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
 		expect(fake.userMessages.at(-1)?.text).toContain('context budget');
+		// The auto iteration commits every completed task locally (never pushes).
+		expect(fake.userMessages.at(-1)?.text).toContain('Commit the completed task locally');
+		expect(fake.userMessages.at(-1)?.text).toContain('Do not push');
 	});
 
 	test('auto mode finish-up allows a bad state and keeps big-picture tasks from the second iteration on', async () => {
@@ -3963,8 +3966,10 @@ describe('ralph-loop extension (auto mode)', () => {
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		let finish = fake.userMessages.at(-1)!.text;
 		expect(finish).toContain('OK to leave the code in a bad state');
-		// Auto mode never instructs commits: the handoff is the backlog, not git.
-		expect(finish).not.toContain('commit');
+		// The finish-up commits completed work (never pushes) but never broken
+		// or half-done work: the handoff is the backlog, git the checkpoint.
+		expect(finish).toContain('commit');
+		expect(finish).toContain('do not commit broken or half-done work');
 		// The handoff logs the iteration's findings for the next round.
 		expect(finish).toContain('Findings: ');
 		expect(finish).toContain('rediscover from scratch');
@@ -3983,7 +3988,9 @@ describe('ralph-loop extension (auto mode)', () => {
 		// them, so the backlog does not accumulate open reference entries.
 		expect(fresh).toContain('mark each one done');
 		expect(fresh).not.toContain('never complete them');
-		expect(fresh).not.toContain('commit');
+		// The auto iteration commits every completed task locally (never pushes).
+		expect(fresh).toContain('Commit the completed task locally');
+		expect(fresh).toContain('Do not push');
 
 		// Iteration 2 finishes up at the budget: the handoff now also refreshes
 		// the big-picture tasks.

@@ -605,8 +605,9 @@ The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and
 1. Call ralph_auto with action "next" to get the next open work task in your session category.${referenceTaskNote}
 2. If there is an open task: read the relevant code and source evidence, then implement exactly one coherent vertical slice. Add focused tests and run every quality command required by the backlog and ${state.specPath} (when present).
 3. Only after all acceptance criteria pass, call ralph_auto with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record.
-4. After completing a task, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.
-5. If there are no open tasks, do the work the user asks for in chat; do not invent backlog work.${bigGoalMaintenance}
+4. Commit the completed task locally in a single commit that also includes the ${state.todoPath} update. Do not push. One commit per completed task: the commit is the durable checkpoint of finished work, so the next iteration (or a human) can always see exactly what is done.
+5. After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.
+6. If there are no open tasks, do the work the user asks for in chat; do not invent backlog work.${bigGoalMaintenance}
 Keep the project's knowledge current as you learn: append durable debug findings (root causes, failed approaches, environment quirks) to DEBUG.md at the project root (create it if missing), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed or is not yet documented.
 
 When this iteration reaches its context budget you will be told to finish up: it is OK to leave the code in a bad state — record the remaining work and the important findings as todo entries for the next iteration with ralph_auto (action "add"), and stop. The fresh iteration continues from the backlog.`;
@@ -830,7 +831,8 @@ Report the checkpoint path and the next step succinctly.`;
  * the remaining work as todo entries
  * for the next iteration in the auto-created session category; from the second
  * iteration on it also keeps the big-picture ("Goal: ") tracking tasks in the
- * backlog. The settled turn starts the fresh iteration.
+ * backlog. Completed work gets its local commit (broken or half-done work does
+ * not). The settled turn starts the fresh iteration.
  */
 function autoFinishPrompt(state: RalphState): string {
 	// From the second iteration on, the handoff also refreshes the big-picture
@@ -843,7 +845,7 @@ function autoFinishPrompt(state: RalphState): string {
 			: '';
 	return `${AUTOMATED_PREFIX}The current Ralph auto iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog. This is iteration ${state.iteration} of ${state.maxIterations}.
 
-1. Wrap up what you are doing. Finishing this handoff matters more than a clean state: it is OK to leave the code in a bad state (half-applied edits, failing builds, untested changes) — the next iteration will re-establish the facts and fix it. Mark any finished task complete with ralph_auto (action "complete", with a concise note).
+1. Wrap up what you are doing. Finishing this handoff matters more than a clean state: it is OK to leave the code in a bad state (half-applied edits, failing builds, untested changes) — the next iteration will re-establish the facts and fix it. Mark any finished task complete with ralph_auto (action "complete", with a concise note). If completed work (or the ${state.todoPath} update) is not committed locally yet, commit it with a concise message. Do not push, and do not commit broken or half-done work.
 2. Record the remaining work for the next iteration: call ralph_auto with action "add" (title, optional body) for each todo entry in category "${state.category}". Each entry must be self-contained for a fresh session that has none of this conversation: what remains, why, relevant paths, the current state of the code (including anything broken or half-done), the debugging findings that bear on it (root causes found, approaches tried that failed, current build/test state), and the exact next step.
 3. Log the important findings for the next iteration: call ralph_auto with action "add" (title "Findings: <short summary>", body as markdown bullets) for what this iteration learned that a fresh session would otherwise have to rediscover from scratch: root causes, approaches tried that failed and why, environment or tooling quirks, and key code locations with their current state. One entry per coherent cluster of findings; skip trivialities. Findings entries are reference notes, not work items. Findings of lasting value beyond the next iteration also belong in the repository: append them to DEBUG.md at the project root (create it if missing, organized by topic), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed.
 ${bigPicture}
