@@ -109,8 +109,16 @@ becomes the goal checkpoint.
 
 `ralph_auto` is the dedicated tool of the **auto loop** (the "Auto mode"
 setting in `/ralph config`: off / on). The auto loop stores its state
-in `_auto_.ralph` and creates a session category per loop (e.g.
-`Session-20260905-2117`); it rotates on its context budget, tells the model
+in a per-session file in the `ralph` directory of pi's global agent
+directory (`<session-id>.ralph`, like sessions in its `sessions`
+directory) and uses one session category per session, named after the pi
+session when it has a name (e.g. `Fix-login-flow`, spaces become dashes) or
+`General` for unnamed sessions (a restarted loop continues the same
+category). The loop works through **every list** in the file — `next`,
+`list`, and `complete` are unscoped (one global task numbering, each task
+shows its list) — while `add` records to the session's own list, so lists
+you add by hand are picked up automatically. It rotates on its context
+budget, tells the model
 to finish up and record todos for the next iteration, and activates only this
 tool (not the full ralph tool set). The loop itself only starts via
 `/ralph start`.

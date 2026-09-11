@@ -238,6 +238,9 @@ let endpoint: ReturnType<typeof startMockEndpoint> | undefined;
 beforeEach(async () => {
 	projectDir = await mkdtemp(join(tmpdir(), 'ralph-e2e-proj-'));
 	agentDir = await mkdtemp(join(tmpdir(), 'ralph-e2e-agent-'));
+	// Point getAgentDir() (the auto mode's state location) at the temp agent
+	// directory so tests never touch the real ~/.pi/agent.
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	await mkdir(join(agentDir, 'extensions'), { recursive: true });
 	await writeFile(join(projectDir, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
 	await writeFile(join(projectDir, 'TODO.ralph'), RALPH_V1);
@@ -245,6 +248,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	delete process.env.PI_CODING_AGENT_DIR;
 	session?.dispose();
 	session = undefined;
 	endpoint?.server.stop(true);
@@ -761,7 +765,8 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		{ timeout: 60000 },
 		async () => {
 			// The auto mode is a config setting: a plain /ralph start stores its
-			// state in _auto_.ralph with an auto-created session category.
+			// state in the per-session auto file (ralph/<session-id>.ralph in the
+			// agent directory) with an auto-created session category.
 			endpoint = startMockEndpoint([
 				textResponder(`${BLOB_MARKER} work output. `.repeat(400), { prompt_tokens: 1500, completion_tokens: 800 }),
 				textResponder('Finished up; todos recorded for the next iteration.'),
@@ -796,8 +801,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(requestText(freshRequest)).not.toContain(BLOB_MARKER);
 
 			// The state file was created with the auto-created session category.
-			const autoFile = await readFile(join(projectDir, '_auto_.ralph'), 'utf8');
-			expect(autoFile).toContain('M list "Session-');
+			const autoFile = await readFile(
+				join(agentDir, 'ralph', `${session!.sessionManager.getSessionId()}.ralph`),
+				'utf8'
+			);
+			expect(autoFile).toContain('M list "General"');
 		}
 	);
 });

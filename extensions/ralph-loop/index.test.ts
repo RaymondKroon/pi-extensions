@@ -117,6 +117,8 @@ interface FakeCtx {
 		sessionManager: {
 			getBranch: () => unknown[];
 			getSessionFile: () => string;
+			getSessionId: () => string;
+			getSessionName: () => string | undefined;
 		};
 		ui: {
 			setWidget: (id: string, widget: unknown) => void;
@@ -133,6 +135,8 @@ interface FakeCtx {
 	usagePercent: { value: number };
 	/** Abort the current run, like the user pressing Escape. */
 	abortRun: () => void;
+	/** ctx.abort() calls (e.g. /ralph stop --force on a non-idle session). */
+	abortCalls: { value: number };
 	/** Whether the fake session reports itself idle (for /ralph stop). */
 	idle: { value: boolean };
 	/** Factories passed to ui.custom (e.g. the backlog view). */
@@ -171,6 +175,7 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const usagePercent = { value: 10 };
 	const idle = { value: true };
 	const runAbortController = new AbortController();
+	const abortCalls = { value: 0 };
 	const customFactories: FakeCtx['customFactories'] = [];
 	const customOptions: FakeCtx['customOptions'] = [];
 	const customResultQueue: FakeCtx['customResultQueue'] = [];
@@ -188,6 +193,11 @@ function createFakeCtx(cwd: string): FakeCtx {
 		model: { provider: 'test', id: 'test-model', contextWindow: 200_000 },
 		mode: 'tui',
 		isIdle: () => idle.value,
+		// Like pi's ExtensionContext.abort: abort the current run.
+		abort: () => {
+			abortCalls.value += 1;
+			runAbortController.abort();
+		},
 		// The run's abort signal, like pi's ExtensionContext.signal.
 		signal: runAbortController.signal,
 		getContextUsage: () => ({
@@ -204,7 +214,9 @@ function createFakeCtx(cwd: string): FakeCtx {
 		},
 		sessionManager: {
 			getBranch: () => branchEntries,
-			getSessionFile: () => join(cwd, 'session.jsonl')
+			getSessionFile: () => join(cwd, 'session.jsonl'),
+			getSessionId: () => 'test-session',
+			getSessionName: () => undefined
 		},
 		ui: {
 			setWidget: (id: string, widget: unknown) => {
@@ -245,6 +257,7 @@ function createFakeCtx(cwd: string): FakeCtx {
 		notifications,
 		usagePercent,
 		abortRun: () => runAbortController.abort(),
+		abortCalls,
 		idle,
 		customFactories,
 		customOptions,
@@ -287,9 +300,16 @@ function statusLine(widgets: Map<string, unknown>): string {
 const flush = () => new Promise((resolve) => setTimeout(resolve, 25));
 
 let dir: string;
+/** The fake global agent directory (getAgentDir via PI_CODING_AGENT_DIR). */
+let agentDir: string;
+/** The auto mode's per-session state file in the fake agent directory. */
+const autoFile = () => join(agentDir, 'ralph', 'test-session.ralph');
 
 beforeEach(async () => {
 	dir = await mkdtemp(join(tmpdir(), 'ralph-loop-test-'));
+	agentDir = await mkdtemp(join(tmpdir(), 'ralph-loop-agent-'));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	await mkdir(join(agentDir, 'ralph'), { recursive: true });
 	await writeFile(join(dir, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
 	await mkdir(join(dir, '.pi'), { recursive: true });
 	await writeFile(
@@ -299,7 +319,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	delete process.env.PI_CODING_AGENT_DIR;
 	await rm(dir, { recursive: true, force: true });
+	await rm(agentDir, { recursive: true, force: true });
 });
 
 async function startLoop(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx) {
@@ -763,6 +785,107 @@ describe('ralph-loop extension', () => {
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
 		expect(fake.userMessages.length).toBe(2); // iteration prompt + checkpoint prompt only
+	});
+
+	test('stop --force: stops a paused loop with a pending rotation immediately', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// A rotation is queued (over-budget settle) and the recording turn is
+		// aborted (Escape): the loop is paused with the rotation still pending.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
+
+		// A normal stop can never complete while paused (the settle handler
+		// returns before processing stopRequested); force stops it now.
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('stop --force', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop stopped (forced)');
+		expect(fakeCtx.abortCalls.value).toBe(0); // idle: nothing to abort
+
+		// The aborted recording turn's settle must not restart the loop.
+		const count = fake.userMessages.length;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fake.userMessages.length).toBe(count);
+	});
+
+	test('stop --force: aborts the in-flight run and stops immediately', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// The loop is running a turn when the user force-stops.
+		fakeCtx.idle.value = false;
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('stop --force', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop stopped (forced)');
+		expect(fakeCtx.abortCalls.value).toBe(1);
+
+		// The aborted run settles: no recording turn, no fresh iteration.
+		fakeCtx.idle.value = true;
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fake.userMessages.length).toBe(1); // the original iteration prompt only
+	});
+
+	test('stop --force: drops a pending rotation without a fresh iteration', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// A rotation is queued (over-budget settle); the recording turn has
+		// been sent but not settled yet.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(fake.userMessages.at(-1)?.text).toContain('durable checkpoint');
+
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('stop --force', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+
+		// The recording turn settles: the loop stays off, no fresh iteration.
+		const count = fake.userMessages.length;
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fake.userMessages.length).toBe(count);
+	});
+
+	test('stop rejects unknown arguments', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('stop --bogus', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Usage: /ralph stop [--force]');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('Ralph: off');
+		await ralph.handler('stop --force extra', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Usage: /ralph stop [--force]');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('Ralph: off');
 	});
 
 	test('stops the loop when a context-limit rotation would exceed the maximum iterations', async () => {
@@ -3828,7 +3951,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
 	});
 
-	test('auto mode start creates _auto_.ralph with a session category and sends the auto prompt', async () => {
+	test('auto mode start creates the per-session auto file with a session category and sends the auto prompt', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3839,15 +3962,15 @@ describe('ralph-loop extension (auto mode)', () => {
 		const prompt = fake.userMessages[0]!.text;
 		expect(prompt).toContain('Run the Ralph auto loop');
 		expect(prompt).toContain('only through the ralph_auto tool');
-		expect(prompt).toContain('Session-');
+		expect(prompt).toContain('General');
 		// The state file is created in ralph format with the auto-created session category.
-		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		const file = await readFile(autoFile(), 'utf8');
 		expect(file.startsWith('# ralph v2')).toBe(true);
-		expect(file).toContain('M list "Session-');
+		expect(file).toContain('M list "General"');
 		// Status bar: the auto label and the session category.
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
-		expect(status).toContain('category: Session-');
+		expect(status).toContain('category: General');
 		// Only the dedicated tool is activated — not the full ralph tool set.
 		expect(fake.activeTools).toContain('ralph_auto');
 		expect(fake.activeTools).not.toContain('ralph_todo');
@@ -3872,7 +3995,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
 	});
 
-	test('auto mode start reuses _auto_.ralph and creates a new session category per loop', async () => {
+	test('auto mode start reuses the per-session auto file and continues the same category on restart', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3882,9 +4005,28 @@ describe('ralph-loop extension (auto mode)', () => {
 		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
 		await startLoop(fake, fakeCtx);
 
-		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
-		// Two loops, two session categories (the same-minute collision gets a suffix).
-		expect(file.match(/M list "Session-/g)).toHaveLength(2);
+		const file = await readFile(autoFile(), 'utf8');
+		// The restart continues the session's category: one list, no suffixed twin.
+		expect(file.match(/M list "General"/g)).toHaveLength(1);
+		expect(fake.userMessages.at(-1)!.text).toContain('your category "General"');
+	});
+
+	test('auto mode start names the session category after the named session', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		fakeCtx.ctx.sessionManager.getSessionName = () => 'Fix login flow';
+
+		await startLoop(fake, fakeCtx);
+
+		// The category carries the session name (spaces become dashes: list
+		// names cannot contain spaces).
+		const file = await readFile(autoFile(), 'utf8');
+		expect(file).toContain('M list "Fix-login-flow"');
+		expect(file).not.toContain('M list "General"');
+		expect(fake.userMessages[0]!.text).toContain('your category "Fix-login-flow"');
+		expect(statusLine(fakeCtx.widgets)).toContain('category: Fix-login-flow');
 	});
 
 	test('auto mode refuses a custom backlog or category', async () => {
@@ -3903,7 +4045,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
 		let missing = false;
 		try {
-			await readFile(join(dir, '_auto_.ralph'), 'utf8');
+			await readFile(autoFile(), 'utf8');
 		} catch {
 			missing = true;
 		}
@@ -3929,7 +4071,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(prompt).toContain('iteration 1 of 10');
 		expect(prompt).toContain('ralph_auto');
 		expect(prompt).toContain('action "add"');
-		expect(prompt).toContain('Session-');
+		expect(prompt).toContain('General');
 
 		// The finish-up turn settles; the fresh iteration starts from the backlog.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -4040,7 +4182,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		const tool = autoTool(fake);
 		const added = await tool.execute('t', { action: 'add', title: 'Continue the rewrite', body: '- finish the parser' }, undefined, undefined, fakeCtx.ctx);
 		expect(added.content[0]!.text).toContain('Recorded todo 1');
-		let file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		let file = await readFile(autoFile(), 'utf8');
 		expect(file).toContain('Continue the rewrite');
 
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
@@ -4048,9 +4190,34 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'rewrote the parser' }, undefined, undefined, fakeCtx.ctx);
 		expect(done.content[0]!.text).toContain('Marked task 1');
-		file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		file = await readFile(autoFile(), 'utf8');
 		expect(file).toContain('D 1');
 		expect(file).toContain('rewrote the parser');
+	});
+
+	test('ralph_auto add with a category creates it and records there; the default stays the session category', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		const added = await tool.execute('t', { action: 'add', title: 'Research the API', category: 'Research' }, undefined, undefined, fakeCtx.ctx);
+		expect(added.content[0]!.text).toContain('Recorded todo 1');
+		expect(added.content[0]!.text).toContain('category "Research"');
+
+		const defaultAdded = await tool.execute('t', { action: 'add', title: 'Session todo' }, undefined, undefined, fakeCtx.ctx);
+		expect(defaultAdded.content[0]!.text).toContain('Recorded todo 2');
+		expect(defaultAdded.content[0]!.text).toContain('category "General"');
+
+		const file = await readFile(autoFile(), 'utf8');
+		expect(file).toContain('M list "Research"');
+		expect(file).toContain('T 1 Research "Research the API"');
+		expect(file).toContain('T 2 General "Session todo"');
+		// next works through both categories (one global numbering).
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('Research the API');
 	});
 
 	test('ralph_auto add and complete require an active auto loop when auto mode is off; next and list work without one', async () => {
@@ -4058,7 +4225,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-		await writeFile(join(dir, '_auto_.ralph'), '# ralph v2\n\n');
+		await writeFile(autoFile(), '# ralph v2\n\n');
 
 		const tool = autoTool(fake);
 		await expect(tool.execute('t', { action: 'add', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
@@ -4092,7 +4259,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 
 		// The todo landed in the auto-created session category of the auto backlog.
-		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		const file = await readFile(autoFile(), 'utf8');
 		expect(file).toContain('First step');
 
 		// next/complete now work scoped to the session category.
@@ -4125,7 +4292,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(armed).toHaveLength(1);
 
 		// The file still parses and both todos are in the session category.
-		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
+		const file = await readFile(autoFile(), 'utf8');
 		expect(() => Backlog.parse(file)).not.toThrow();
 		const list = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
 		expect(list.content[0]!.text).toContain('2 open');
@@ -4298,22 +4465,23 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
-	test('auto mode scopes the session category: other lists stay out of next', async () => {
+	test('auto mode iterates over all lists: next returns tasks from other lists too', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 
-		// An existing auto backlog with a todo from an earlier session category.
+		// An existing auto backlog with a todo from another list (e.g. added by the user).
 		await writeFile(
-			join(dir, '_auto_.ralph'),
-			'# ralph v2\n\nM list "Session-Old"\n\nT 1 Session-Old "Old todo"\n\n'
+			autoFile(),
+			'# ralph v2\n\nM list "Old"\n\nT 1 Old "Old todo"\n\n'
 		);
 		await startLoop(fake, fakeCtx);
 
 		const tool = autoTool(fake);
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
-		expect(next.content[0]!.text).toContain('No open tasks remain');
+		expect(next.content[0]!.text).toContain('Old todo');
+		expect(next.content[0]!.text).toContain('list: Old');
 	});
 
 	test('auto mode stops at the maximum iterations', async () => {
@@ -4410,7 +4578,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
 		let missing = false;
 		try {
-			await readFile(join(dir, '_auto_.ralph'), 'utf8');
+			await readFile(autoFile(), 'utf8');
 		} catch {
 			missing = true;
 		}
@@ -4430,8 +4598,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
 		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
 		expect(fake.userMessages.at(-1)!.text).toContain('action "add"');
-		const file = await readFile(join(dir, '_auto_.ralph'), 'utf8');
-		expect(file).toContain('M list "Session-');
+		const file = await readFile(autoFile(), 'utf8');
+		expect(file).toContain('M list "General"');
 
 		// The finish-up turn settles; the fresh iteration continues from the backlog.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -4485,8 +4653,12 @@ describe('ralph-loop extension (auto mode)', () => {
 		// Further streaming updates do not arm a second loop or queue a second rotation.
 		await fake.fire('message_update', fakeCtx.ctx);
 		await flush();
-		const files = await readdir(dir);
-		expect(files.filter((name) => name === '_auto_.ralph')).toHaveLength(1);
+		// One auto file for the session, and only one session category in it
+		// (a second armed loop would have created another).
+		const files = await readdir(join(agentDir, 'ralph'));
+		expect(files).toEqual(['test-session.ralph']);
+		const file = await readFile(autoFile(), 'utf8');
+		expect(file.match(/M list "General/g)).toHaveLength(1);
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 	});
 
@@ -4504,6 +4676,31 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		// No re-arm: the explicit stop wins over the auto mode.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('auto mode "on": stop --force turns the persisted auto mode off', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop stopped (forced); auto mode is now off');
+
+		// The setting change is persisted: session audit trail and project file.
+		const configEntry = fake.entries.filter((entry) => entry.customType === 'ralph-loop-config').at(-1);
+		expect(configEntry?.data).toMatchObject({ autoMode: 'off' });
+		await flush();
+		const file = JSON.parse(await readFile(join(dir, '.pi', 'ralph-loop.json'), 'utf8')) as { autoMode: string };
+		expect(file.autoMode).toBe('off');
+
+		// And the intercept stays off even above the budget.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
