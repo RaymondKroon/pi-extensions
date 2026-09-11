@@ -180,6 +180,12 @@ mode is "on" and no loop is active yet. Requires `title`; `body` is optional
 markdown bullets. Each entry should be self-contained for a fresh session:
 what remains, why, relevant paths, and the exact next step.
 
+### update
+Changes an existing todo's `title` and/or `body` (`task` number required;
+`body` replaces the whole body, an empty string clears it). Use it when a
+recorded todo is stale or wrong instead of adding a duplicate. Starts the
+auto loop first when auto mode is "on" and no loop is active yet.
+
 ### complete
 Marks the task (`task` number) done. Starts the auto loop first when auto
 mode is "on" and no loop is active yet. With `note` it also

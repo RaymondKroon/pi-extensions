@@ -861,7 +861,7 @@ function autoFinishPrompt(state: RalphState): string {
 	return `${AUTOMATED_PREFIX}The current Ralph auto iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog. This is iteration ${state.iteration} of ${state.maxIterations}.
 
 1. Wrap up what you are doing. Finishing this handoff matters more than a clean state: it is OK to leave the code in a bad state (half-applied edits, failing builds, untested changes) — the next iteration will re-establish the facts and fix it. Mark any finished task complete with ralph_auto (action "complete", with a concise note). If completed work is not committed locally yet, commit it with a concise message. Do not push, and do not commit broken or half-done work.
-2. Record the remaining work for the next iteration: call ralph_auto with action "add" (title, optional body) for each todo entry in category "${state.category}". Each entry must be self-contained for a fresh session that has none of this conversation: what remains, why, relevant paths, the current state of the code (including anything broken or half-done), the debugging findings that bear on it (root causes found, approaches tried that failed, current build/test state), and the exact next step.
+2. Record the remaining work for the next iteration: call ralph_auto with action "add" (title, optional body) for each todo entry in category "${state.category}". Each entry must be self-contained for a fresh session that has none of this conversation: what remains, why, relevant paths, the current state of the code (including anything broken or half-done), the debugging findings that bear on it (root causes found, approaches tried that failed, current build/test state), and the exact next step. If a todo recorded by an earlier iteration is stale or wrong, fix it with action "update" (task, title and/or body) instead of adding a duplicate.
 3. Log the important findings for the next iteration: call ralph_auto with action "add" (title "Findings: <short summary>", body as markdown bullets) for what this iteration learned that a fresh session would otherwise have to rediscover from scratch: root causes, approaches tried that failed and why, environment or tooling quirks, and key code locations with their current state. One entry per coherent cluster of findings; skip trivialities. Findings entries are reference notes, not work items. Findings of lasting value beyond the next iteration also belong in the repository: append them to DEBUG.md at the project root (create it if missing, organized by topic), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed.
 ${bigPicture}
 Finally: do not start new work after recording the todos.
@@ -1475,8 +1475,8 @@ export default function (pi: ExtensionAPI) {
 	let compactionGateNotified = false;
 	// Auto mode: once the auto loop is stopped in this session, the automatic
 	// context-budget intercept must not re-arm it (an explicit stop wins). An
-	// explicit ralph_auto add/complete still re-arms the loop: the new request
-	// supersedes the stop.
+	// explicit ralph_auto add/update/complete still re-arms the loop: the new
+	// request supersedes the stop.
 	let autoInterceptSuspended = false;
 	// In-flight auto-arm setup; the promise cache keeps a burst of streaming
 	// updates from arming two loops (two session categories).
@@ -2244,17 +2244,18 @@ export default function (pi: ExtensionAPI) {
 		name: AUTO_TOOL_NAME,
 		label: 'Ralph auto session',
 		description:
-			`Read/update the Ralph auto-loop session todos (ralph format). The loop works through every category in the auto backlog; add records to the loop's session category, or to the given category (created when missing). Actions: next (first open task), list (open tasks + counts), add (record a todo entry for the next iteration; title + optional body + optional category), complete (mark done; note also records the completion log). add and complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog by any other means (no file tools, no grep/cat/sed).`,
+			`Read/update the Ralph auto-loop session todos (ralph format). The loop works through every category in the auto backlog; add records to the loop's session category, or to the given category (created when missing). Actions: next (first open task), list (open tasks + counts), add (record a todo entry for the next iteration; title + optional body + optional category), update (change an existing todo's title and/or body; needs task — use it instead of adding a duplicate), complete (mark done; note also records the completion log). add, update, and complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog by any other means (no file tools, no grep/cat/sed).`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('next'),
 				Type.Literal('list'),
 				Type.Literal('add'),
+				Type.Literal('update'),
 				Type.Literal('complete')
 			]),
-			task: Type.Optional(Type.String({ description: 'Task number as shown by list/next (complete).' })),
-			title: Type.Optional(Type.String({ description: 'Todo title (add).' })),
-			body: Type.Optional(Type.String({ description: 'Todo detail as markdown bullets (add).' })),
+			task: Type.Optional(Type.String({ description: 'Task number as shown by list/next (complete, update).' })),
+			title: Type.Optional(Type.String({ description: 'Todo title (add; with update: replaces the title).' })),
+			body: Type.Optional(Type.String({ description: 'Todo detail as markdown bullets (add; with update: replaces the body, empty string clears it).' })),
 			note: Type.Optional(Type.String({ description: 'Completion summary (complete).' })),
 			category: Type.Optional(Type.String({ description: 'Target category (add; defaults to the loop\'s session category, created when missing).' })),
 			verbose: Type.Optional(Type.Boolean())
@@ -2273,7 +2274,7 @@ export default function (pi: ExtensionAPI) {
 			if (
 				!autoLoop &&
 				!state?.enabled &&
-				(params.action === 'add' || params.action === 'complete') &&
+				(params.action === 'add' || params.action === 'update' || params.action === 'complete') &&
 				config.autoMode === 'on'
 			) {
 				autoLoop = await armAutoLoop(ctx);
@@ -2325,6 +2326,24 @@ export default function (pi: ExtensionAPI) {
 						// Global position number: the same address next/complete use.
 						const number = backlog.taskNumbers().get(task.id) ?? task.id;
 						output = `Recorded todo ${number} "${task.title}" for the next iteration in category "${category}".${armedNow ? ' The Ralph auto loop was started (iteration 1).' : ''}`;
+						break;
+					}
+					case 'update': {
+						if (!autoLoop)
+							throw new Error(
+								'update requires an active Ralph auto loop (set auto mode to "on" in /ralph config, or start one with /ralph start).'
+							);
+						if (!params.task) throw new Error('update requires the task number.');
+						if (params.title === undefined && params.body === undefined) {
+							throw new Error('update requires a title and/or body.');
+						}
+						const changes: { title?: string; body?: string | null } = {};
+						if (params.title !== undefined) changes.title = params.title;
+						if (params.body !== undefined) changes.body = params.body;
+						const task = backlog.updateTask(params.task, changes);
+						mutated = true;
+						const number = backlog.taskNumbers().get(task.id) ?? task.id;
+						output = `Updated todo ${number} "${task.title}".`;
 						break;
 					}
 					case 'complete': {

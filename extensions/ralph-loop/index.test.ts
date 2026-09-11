@@ -4254,6 +4254,44 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(next.content[0]!.text).toContain('Research the API');
 	});
 
+	test('ralph_auto update changes a todo title and body instead of adding a duplicate', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'Continue the rewrite', body: '- finish the parser' }, undefined, undefined, fakeCtx.ctx);
+
+		const updated = await tool.execute(
+			't',
+			{ action: 'update', task: '1', title: 'Finish the parser rewrite', body: '- finish the parser\n- add tests' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		expect(updated.content[0]!.text).toContain('Updated todo 1 "Finish the parser rewrite"');
+		let file = await readFile(autoFile(), 'utf8');
+		expect(file).toContain('Finish the parser rewrite');
+		expect(file).toContain('- add tests');
+		// The old title is gone: no duplicate was created.
+		expect(file).not.toContain('Continue the rewrite');
+
+		// body alone replaces the body; an empty body clears it.
+		await tool.execute('t', { action: 'update', task: '1', body: '' }, undefined, undefined, fakeCtx.ctx);
+		file = await readFile(autoFile(), 'utf8');
+		expect(file).not.toContain('- add tests');
+
+		// Validation: task number and at least one field are required.
+		await expect(tool.execute('t', { action: 'update', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			/update requires the task number/
+		);
+		await expect(tool.execute('t', { action: 'update', task: '1' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			/update requires a title and\/or body/
+		);
+	});
+
 	test('ralph_auto add and complete require an active auto loop when auto mode is off; next and list work without one', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4266,6 +4304,9 @@ describe('ralph-loop extension (auto mode)', () => {
 			/requires an active Ralph auto loop/
 		);
 		await expect(tool.execute('t', { action: 'complete', task: '1' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			/requires an active Ralph auto loop/
+		);
+		await expect(tool.execute('t', { action: 'update', task: '1', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
 			/requires an active Ralph auto loop/
 		);
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
