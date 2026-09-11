@@ -79,6 +79,19 @@ describe('text format round-trip', () => {
 		expect(log[0]).toMatchObject({ taskId: 1, date: '2026-08-10', note: 'Replaced the starter README. Verified: bun test.' });
 	});
 
+	test('D record with a completion timestamp round-trips; legacy D stays undated', () => {
+		const text = '# ralph v2\n\nT 1 - "Done task."\nD 1 2026-08-10T12:34:56Z\n\nT 2 - "Legacy done."\nD 2\n';
+		const backlog = Backlog.parse(text);
+		expect(backlog.findTaskByNumber('1')?.completedAt).toBe('2026-08-10T12:34:56Z');
+		expect(backlog.findTaskByNumber('2')?.completedAt).toBeNull();
+		const rendered = backlog.render();
+		expect(rendered).toContain('D 1 2026-08-10T12:34:56Z');
+		expect(rendered).toContain('\nD 2\n');
+		const reloaded = Backlog.parse(rendered);
+		expect(reloaded.findTaskByNumber('1')?.completedAt).toBe('2026-08-10T12:34:56Z');
+		expect(reloaded.findTaskByNumber('2')?.completedAt).toBeNull();
+	});
+
 	test('escapes quotes and backslashes in titles', () => {
 		const text = '# ralph v2\n\nT 1 - "Say \\\"hi\\\" \\\\ there"\n';
 		const backlog = Backlog.parse(text);
@@ -386,6 +399,10 @@ describe('text format parse errors', () => {
 		expect(() => parse('# ralph v2\n\nT 1 - "t"\nD 1\nD 1\n')).toThrow(/already marked done/);
 	});
 
+	test('invalid completion timestamp', () => {
+		expect(() => parse('# ralph v2\n\nT 1 - "t"\nD 1 2026-08-10T12:34\n')).toThrow(/invalid completion timestamp/);
+	});
+
 	test('v2 rejects legacy T fields, section records, and key or "-" log references', () => {
 		expect(() => parse('# ralph v2\n\nT 1 2 - "x"\n')).toThrow(/task record is/);
 		expect(() => parse('# ralph v2\n\nS 1 backlog "x"\n\nT 1 - "x"\n')).toThrow(/section records are v1-only/);
@@ -475,6 +492,16 @@ describe('mutations', () => {
 		expect(task).toMatchObject({ done: true, checkpoint: null, checkpointIteration: null });
 	});
 
+	test('complete records a completion timestamp; reopening clears it', () => {
+		const backlog = Backlog.parse(SAMPLE);
+		const done = backlog.complete('2');
+		expect(done.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+		const reopened = backlog.setDone('2', false);
+		expect(reopened).toMatchObject({ done: false, completedAt: null });
+		const reloaded = Backlog.parse(backlog.render());
+		expect(reloaded.findTaskByNumber('2')?.completedAt).toBeNull();
+	});
+
 	test('complete with an unknown number lists the known numbers', () => {
 		const backlog = Backlog.parse(SAMPLE);
 		expect(() => backlog.complete('9')).toThrow(/no task 9 \(tasks: 1, 2, 3, 4, 5\)/);
@@ -556,11 +583,11 @@ L 1 1 2026-08-13 maybe
 		).toThrow(BacklogParseError);
 	});
 
-	test('formatBacklog marks reopen entries with a cross', () => {
+	test('formatTaskDetail marks reopen entries with a cross', () => {
 		const backlog = Backlog.parse(SAMPLE);
 		backlog.addLogEntry({ task: '2', date: '2026-08-12', note: 'Shipped.' });
 		backlog.addLogEntry({ task: '2', date: '2026-08-13', note: 'Blocked.', kind: 'reopen' });
-		const out = formatBacklog(backlog, undefined, { verbose: true });
+		const out = formatTaskDetail(backlog, backlog.findTaskByNumber('2')!);
 		expect(out).toContain('✓ 2026-08-12 Shipped.');
 		expect(out).toContain('✗ 2026-08-13 Blocked.');
 	});
@@ -1043,14 +1070,15 @@ describe('formatBacklog', () => {
 		expect(text).toContain('- [x] 1 Establish a clean local developer contract. [dossier]');
 	});
 
-	test('verbose view renders markers, numbers, categories, checkpoints, and log', () => {
+	test('verbose view renders markers, numbers, categories, and checkpoints without log entries', () => {
 		const text = formatBacklog(Backlog.parse(SAMPLE), undefined, { verbose: true });
 		expect(text).toContain('Backlog: 4 open / 5 total (1 done)');
 		expect(text).toContain('- [x] 1 Establish a clean local developer contract. [dossier]');
 		expect(text).toContain('- [ ] 2 Remove starter/demo surfaces. [dossier]');
 		expect(text).toContain('checkpoint (iteration 3): Completed: schema removal. Next step: add the migration.');
 		expect(text).toContain('- [ ] 4 Sub-task of P0.3');
-		expect(text).toContain('  ✓ 2026-08-10 Replaced the starter README. Verified: bun test.');
+		// Completion log entries stay out of the list view (single-task detail and search cover them).
+		expect(text).not.toContain('Replaced the starter README. Verified: bun test.');
 	});
 
 	test('shows the category subset in the summary', () => {
@@ -1058,9 +1086,49 @@ describe('formatBacklog', () => {
 		expect(text).toContain('category "dossier": 1 open / 2 total (1 done)');
 		expect(text).not.toContain('Add sign-in.');
 	});
+
+	test('verbose view windows completed tasks to the most recent and counts the rest', () => {
+		// 12 completed tasks; task 2 finished last even though it is early in the list.
+		const lines = ['# ralph v2', ''];
+		for (let i = 1; i <= 12; i++) {
+			const day = i === 2 ? '20' : String(i).padStart(2, '0');
+			lines.push(`T ${i} - "Task ${i}."`, `D ${i} 2026-08-${day}T00:00:00Z`, '');
+		}
+		lines.push('T 13 - "Still open."', '');
+		const text = formatBacklog(Backlog.parse(lines.join('\n')), undefined, { verbose: true });
+		// Open task and the 10 most recent completions (task 2 plus 4-12) are listed.
+		expect(text).toContain('- [ ] 13 Still open.');
+		expect(text).toContain('- [x] 2 Task 2.');
+		expect(text).toContain('- [x] 12 Task 12.');
+		// The two oldest completions collapse into a counter line with number ranges.
+		expect(text).not.toContain('- [x] 1 Task 1.');
+		expect(text).not.toContain('- [x] 3 Task 3.');
+		expect(text).toContain('+ 2 older completed tasks (numbers 1, 3)');
+	});
+
+	test('verbose view treats undated completions as oldest', () => {
+		// 10 dated completions plus one undated: the undated one must be the one
+		// that falls out of the window, regardless of its position in the list.
+		const lines = ['# ralph v2', '', 'T 1 - "Old undated."', 'D 1', ''];
+		for (let i = 2; i <= 11; i++) {
+			lines.push(`T ${i} - "Task ${i}."`, `D ${i} 2026-08-${String(i - 1).padStart(2, '0')}T00:00:00Z`, '');
+		}
+		const out = formatBacklog(Backlog.parse(lines.join('\n')), undefined, { verbose: true });
+		expect(out).toContain('- [x] 2 Task 2.');
+		expect(out).toContain('- [x] 11 Task 11.');
+		expect(out).not.toContain('- [x] 1 Old undated.');
+		expect(out).toContain('+ 1 older completed task (number 1)');
+	});
 });
 
 describe('formatTaskDetail', () => {
+	test('shows the completion timestamp for dated completions', () => {
+		const text = '# ralph v2\n\nT 1 - "Done."\nD 1 2026-08-10T12:34:56Z\n';
+		const backlog = Backlog.parse(text);
+		const detail = formatTaskDetail(backlog, backlog.findTaskByNumber('1')!);
+		expect(detail).toContain('completed: 2026-08-10T12:34:56Z');
+	});
+
 	test('shows one task with body, checkpoint, and completion log', () => {
 		const backlog = Backlog.parse(SAMPLE);
 		const withCheckpoint = formatTaskDetail(backlog, backlog.findTaskByNumber('2')!);

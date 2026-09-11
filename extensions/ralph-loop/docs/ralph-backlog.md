@@ -24,10 +24,13 @@ the next task.
 ### list
 Compact by default: counts, per-list counts, and open tasks.
 - `category` — filter to one list (must exist).
-- `task` — show a single task's detail (body, checkpoint, completion log)
-  instead of the whole backlog.
-- `verbose: true` — also include completed tasks, checkpoints, and completion
-  log entries.
+- `task` — show a single task's detail (completion time, body, checkpoint,
+  completion log) instead of the whole backlog.
+- `verbose: true` — also include completed tasks (the 10 most recent by
+  completion time, plus a counter with the number ranges of the older ones)
+  and checkpoints. Completion log entries are never listed (they grow
+  unbounded in long sessions); read them with `task` (single-task detail) or
+  `search`.
 
 ### search
 Case-insensitive substring match over task titles, bodies, checkpoints, and
@@ -166,7 +169,9 @@ result says so and lists them.
 
 ### list
 Counts and open tasks of the session category. `verbose: true` also includes
-completed tasks and completion log entries.
+the 10 most recently completed tasks (plus a counter with the number ranges
+of the older ones) and checkpoints. Completion log entries are never listed;
+read them with `task` (single-task detail) or `search`.
 
 ### add
 Records a todo entry for the next iteration in the session

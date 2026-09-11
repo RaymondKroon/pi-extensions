@@ -20,7 +20,10 @@
 //   GC <iteration>                    goal checkpoint block
 //   T <id> <category|-> "<title>"
 //   B <id>                             task; optional body block
-//   D <id>                             task is done
+//   D <id> [<completedAt>]            task is done; completedAt is the
+//                                       ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)
+//                                       recorded when the task was completed.
+//                                       Absent in legacy files and after imports.
 //   C <id> <iteration>                 task context checkpoint block
 //   L <id> <taskId> <date|-> <kind|->  completion log entry; note block.
 //                                       kind is 'done' (default) or
@@ -81,6 +84,8 @@ export interface Task {
 	/** The single most recent context checkpoint (replaced, never stacked). */
 	checkpoint: string | null;
 	checkpointIteration: number | null;
+	/** ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ) when the task was completed; null when open, legacy, or imported. */
+	completedAt: string | null;
 	position: number;
 }
 
@@ -137,6 +142,7 @@ CREATE TABLE tasks (
 	title TEXT NOT NULL,
 	body TEXT,
 	done INTEGER NOT NULL DEFAULT 0,
+	completed_at TEXT,
 	checkpoint TEXT,
 	checkpoint_iteration INTEGER,
 	position INTEGER NOT NULL
@@ -177,6 +183,13 @@ function newDatabase(): SqliteDb {
 
 function quote(value: string): string {
 	return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/** ISO-8601 UTC with second precision, as stored in D records. */
+const COMPLETED_AT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+
+function nowCompletedAt(): string {
+	return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
 function indentBlock(text: string): string[] {
@@ -399,14 +412,19 @@ export class Backlog {
 				if (task.body !== null) fail(`task ${id} already has a body block`);
 				block = { kind: 'task-body', id, lines: [] };
 			} else if (tag === 'D') {
-				if (tokens.length !== 2) fail('done record is: D <id>');
+				if (tokens.length !== 2 && tokens.length !== 3) fail('done record is: D <id> [<completedAt>]');
 				const id = intField(tokens[1], 'task id');
+				let completedAt: string | null = null;
+				if (tokens.length === 3) {
+					if (!COMPLETED_AT_RE.test(tokens[2])) fail(`invalid completion timestamp "${tokens[2]}" (expected YYYY-MM-DDTHH:MM:SSZ)`);
+					completedAt = tokens[2];
+				}
 				const task = db.prepare('SELECT id, done FROM tasks WHERE id = ?').get(id) as
 					| { id: number; done: number }
 					| undefined;
 				if (!task) throw new BacklogParseError(lineNo, `unknown task id ${id}`);
 				if (task.done) fail(`task ${id} is already marked done`);
-				db.prepare('UPDATE tasks SET done = 1 WHERE id = ?').run(id);
+				db.prepare('UPDATE tasks SET done = 1, completed_at = ? WHERE id = ?').run(completedAt, id);
 			} else if (tag === 'C') {
 				if (tokens.length !== 3) fail('checkpoint record is: C <id> <iteration>');
 				const id = intField(tokens[1], 'task id');
@@ -483,6 +501,7 @@ export class Backlog {
 			title: row.title as string,
 			body: (row.body as string | null) ?? null,
 			done: (row.done as number) === 1,
+			completedAt: (row.completed_at as string | null) ?? null,
 			checkpoint: (row.checkpoint as string | null) ?? null,
 			checkpointIteration: (row.checkpoint_iteration as number | null) ?? null,
 			position: row.position as number
@@ -706,11 +725,12 @@ export class Backlog {
 		return this.goal()!;
 	}
 
-	/** Mark the task with the given position number done. Clears the context checkpoint (it described in-progress work). Throws when unknown. */
+	/** Mark the task with the given position number done. Records the completion timestamp and clears the context checkpoint (it described in-progress work). Throws when unknown. */
 	complete(number: string, category?: string): Task {
 		const task = this.requireTask(number, category);
-		this.db.prepare('UPDATE tasks SET done = 1, checkpoint = NULL, checkpoint_iteration = NULL WHERE id = ?').run(task.id);
-		return { ...task, done: true, checkpoint: null, checkpointIteration: null };
+		const completedAt = nowCompletedAt();
+		this.db.prepare('UPDATE tasks SET done = 1, completed_at = ?, checkpoint = NULL, checkpoint_iteration = NULL WHERE id = ?').run(completedAt, task.id);
+		return { ...task, done: true, completedAt, checkpoint: null, checkpointIteration: null };
 	}
 
 	/** Replace the single context checkpoint of the task with the given number. */
@@ -773,14 +793,15 @@ export class Backlog {
 		return renamed.length;
 	}
 
-	/** Mark the task with the given id done or open again. Completing clears the context checkpoint (it described in-progress work). */
+	/** Mark the task with the given id done or open again. Completing records the completion timestamp and clears the context checkpoint (it described in-progress work); reopening clears the timestamp. */
 	setDoneById(id: number, done: boolean): Task {
 		const task = this.listTasks().find((t) => t.id === id);
 		if (!task) throw new Error(`no task with id ${id}`);
+		const completedAt = done ? nowCompletedAt() : null;
 		this.db
-			.prepare('UPDATE tasks SET done = ?, checkpoint = ?, checkpoint_iteration = ? WHERE id = ?')
-			.run(done ? 1 : 0, done ? null : task.checkpoint, done ? null : task.checkpointIteration, id);
-		return { ...task, done, checkpoint: done ? null : task.checkpoint, checkpointIteration: done ? null : task.checkpointIteration };
+			.prepare('UPDATE tasks SET done = ?, completed_at = ?, checkpoint = ?, checkpoint_iteration = ? WHERE id = ?')
+			.run(done ? 1 : 0, completedAt, done ? null : task.checkpoint, done ? null : task.checkpointIteration, id);
+		return { ...task, done, completedAt, checkpoint: done ? null : task.checkpoint, checkpointIteration: done ? null : task.checkpointIteration };
 	}
 
 	/** Mark the task with the given position number done or open again. */
@@ -976,7 +997,7 @@ export class Backlog {
 				out.push(`B ${task.id}`);
 				out.push(...indentBlock(task.body));
 			}
-			if (task.done) out.push(`D ${task.id}`);
+			if (task.done) out.push(task.completedAt !== null ? `D ${task.id} ${task.completedAt}` : `D ${task.id}`);
 			if (task.checkpoint !== null) {
 				out.push(`C ${task.id} ${task.checkpointIteration ?? 1}`);
 				out.push(...indentBlock(task.checkpoint));
@@ -1237,18 +1258,49 @@ function parseMdTaskLine(text: string, done: boolean): { task: MdTask; rest: str
 /** View options for formatBacklog. */
 export interface BacklogViewOptions {
 	/**
-	 * Full view: every task with checkpoints and completion log entries.
-	 * The default compact view shows only open tasks plus completed tasks
-	 * that still lack a completion log entry, so a routine list call stays small.
+	 * Full view: every open task with checkpoints, plus the most recently
+	 * completed tasks (see RECENT_COMPLETED_WINDOW); older completed tasks
+	 * collapse into a counter line with their number ranges. The default
+	 * compact view shows only open tasks plus completed tasks that still lack
+	 * a completion log entry, so a routine list call stays small. Completion
+	 * log entries are never part of the list view (they grow unbounded in
+	 * long sessions); use the single-task detail view or search to read them.
 	 */
 	verbose?: boolean;
+}
+
+/**
+ * How many recently completed tasks the verbose list view shows. The window
+ * is fixed (not a parameter) so long sessions keep the list bounded; older
+ * completions are one `task: <n>` lookup or `search` away.
+ */
+export const RECENT_COMPLETED_WINDOW = 10;
+
+/** "1-18, 21-57": collapse sorted position numbers into ranges. */
+function numberRanges(values: number[]): string {
+	const sorted = [...values].sort((a, b) => a - b);
+	const parts: string[] = [];
+	let start = sorted[0]!;
+	let prev = start;
+	for (const value of sorted.slice(1)) {
+		if (value === prev + 1) {
+			prev = value;
+			continue;
+		}
+		parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+		start = prev = value;
+	}
+	parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+	return parts.join(', ');
 }
 
 /**
  * Render the backlog as readable text for the ralph_todo tool. Compact by
  * default (counts, per-list counts, open tasks, unrecorded completions) so
  * the model does not load the whole history into context; pass verbose for
- * the full backlog with checkpoints and completion log entries.
+ * open tasks with checkpoints plus the most recent completions. Completion
+ * log entries stay out of the list view: read them with the single-task
+ * detail view or search.
  */
 export function formatBacklog(backlog: Backlog, category?: string, options: BacklogViewOptions = {}): string {
 	const verbose = options.verbose === true;
@@ -1274,27 +1326,51 @@ export function formatBacklog(backlog: Backlog, category?: string, options: Back
 	lines.push('');
 	const tasks = backlog.listTasks(category);
 	const numbers = backlog.taskNumbers(category);
+	// Verbose view: completed tasks are windowed to the most recent
+	// completions (by completion timestamp; undated ones count as oldest), so
+	// the list stays bounded in long sessions. Older ones collapse into a
+	// counter line whose number ranges point at task: <n> / search.
+	let recentDoneIds: Set<number> | null = null;
+	let olderDone: Task[] = [];
+	if (verbose) {
+		const done = tasks.filter((task) => task.done);
+		const recent = done
+			.slice()
+			.sort((a, b) => {
+				if (a.completedAt !== b.completedAt) {
+					if (a.completedAt === null) return 1;
+					if (b.completedAt === null) return -1;
+					return a.completedAt < b.completedAt ? 1 : -1;
+				}
+				return b.position - a.position;
+			})
+			.slice(0, RECENT_COMPLETED_WINDOW);
+		recentDoneIds = new Set(recent.map((task) => task.id));
+		olderDone = done.filter((task) => !recentDoneIds.has(task.id));
+	}
 	for (const task of tasks) {
 		const entries = backlog.listLogEntriesForTask(task.id);
 		if (!verbose && task.done && entries.length > 0) continue;
+		if (verbose && task.done && !recentDoneIds!.has(task.id)) continue;
 		const marker = task.done ? '[x]' : '[ ]';
 		const number = `${numbers.get(task.id) ?? '?'} `;
 		const cat = task.category ? ` [${task.category}]` : '';
 		lines.push(`- ${marker} ${number}${task.title}${cat}`);
-		if (verbose) {
-			if (task.checkpoint !== null) {
-				lines.push(`  checkpoint (iteration ${task.checkpointIteration ?? '?'}): ${task.checkpoint}`);
-			}
-			for (const entry of entries) {
-				const date = entry.date ? `${entry.date} ` : '';
-				const entryMarker = entry.kind === 'reopen' ? '✗' : '✓';
-				lines.push(`  ${entryMarker} ${date}${entry.note}`);
-			}
+		if (verbose && task.checkpoint !== null) {
+			lines.push(`  checkpoint (iteration ${task.checkpointIteration ?? '?'}): ${task.checkpoint}`);
 		}
+	}
+	if (verbose && olderDone.length > 0) {
+		const range = numberRanges(olderDone.map((task) => numbers.get(task.id) ?? task.id));
+		lines.push(
+			olderDone.length === 1
+				? `+ 1 older completed task (number ${range})`
+				: `+ ${olderDone.length} older completed tasks (numbers ${range})`
+		);
 	}
 	if (!verbose) {
 		lines.push('');
-		lines.push('Compact view: open tasks plus completed tasks without a completion log entry. Pass verbose: true for the full backlog with checkpoints and log entries.');
+		lines.push('Compact view: open tasks plus completed tasks without a completion log entry. Pass verbose: true for checkpoints and the most recent completions.');
 	}
 	return lines.join('\n');
 }
@@ -1352,6 +1428,7 @@ export function formatTaskDetail(backlog: Backlog, task: Task, category?: string
 	lines.push(`Task ${number}: ${task.title} ${task.done ? '[x]' : '[ ]'}`);
 	const meta: string[] = [];
 	if (task.category) meta.push(`list: ${task.category}`);
+	if (task.done && task.completedAt !== null) meta.push(`completed: ${task.completedAt}`);
 	if (meta.length > 0) lines.push(meta.join(' · '));
 	if (task.body !== null) {
 		lines.push('', 'Task body:', task.body);

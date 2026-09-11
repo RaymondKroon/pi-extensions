@@ -1178,6 +1178,40 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('task: 4/5 (iteration 1)');
 	});
 
+	test('status counter marks the current task done when no open tasks remain', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await importTodo(fake, fakeCtx, 'import TODO.md');
+
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start --todo TODO.ralph', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('task: 2/3 (iteration 1)');
+
+		// Complete the two open tasks; the counter must flip to (done), not stay 3/3.
+		const tool = fake.tools.get('ralph_todo') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<unknown>;
+		};
+		for (const task of ['1', '2']) {
+			await tool.execute('t', { action: 'complete', task }, undefined, undefined, fakeCtx.ctx);
+			fakeCtx.usagePercent.value = 10;
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			if (task === '2') {
+				// While the loop winds down (recording the last completion) the
+				// counter says done instead of a misleading 3/3.
+				expect(statusLine(fakeCtx.widgets)).toMatch(/task: 3\/3 \(done\) \(iteration \d+\)/);
+			}
+			await flush();
+		}
+	});
+
 	test('start --category scopes the backlog and rejects unknown categories', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1238,10 +1272,10 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(scoped.content[0]!.text).toContain('category "General"');
 		await expect(run({ action: 'list', category: 'nope' })).rejects.toThrow(/no list named "nope"/);
 
-		// verbose: true restores the full backlog with the completion log.
+		// verbose: true restores the full backlog (with checkpoints); completion
+		// log entries stay out of the list view to keep long sessions small.
 		const full = await run({ action: 'list', verbose: true });
-		// The completion entry shows under its task, not in a separate log section.
-		expect(full.content[0]!.text).toContain('✓ 2026-08-10 Built the sign-in route. Verified: bun test.');
+		expect(full.content[0]!.text).not.toContain('✓ 2026-08-10 Built the sign-in route. Verified: bun test.');
 
 		// task narrows the list to one task's details, including its completion log.
 		const one = await run({ action: 'list', task: '3' });

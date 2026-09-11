@@ -392,9 +392,9 @@ function projectConfigPath(cwd: string): string {
  * completed + 1, so the counter tracks work order even when tasks are
  * completed out of order or reference entries are interleaved.
  */
-function countTodoTasks(todo: string, category?: string): { current: number; total: number } {
+function countTodoTasks(todo: string, category?: string): { current: number; total: number; done: boolean } {
 	const { open, total } = todoCounts(todo, category);
-	return { current: open > 0 ? total - open + 1 : total, total };
+	return { current: open > 0 ? total - open + 1 : total, total, done: open === 0 && total > 0 };
 }
 
 /**
@@ -1450,7 +1450,7 @@ export default function (pi: ExtensionAPI) {
 	// Cached from the TODO file at each refresh point (start, settle, rotation) so
 	// the status widget can show the current task number without reading the file
 	// on every streamed message update.
-	let taskCount: { current: number; total: number } | undefined;
+	let taskCount: { current: number; total: number; done: boolean } | undefined;
 	// Cached from the TODO file at each refresh point (start, settle, rotation) so
 	// the status widget can show the current goal state without reading the file
 	// on every streamed message update.
@@ -1574,7 +1574,7 @@ export default function (pi: ExtensionAPI) {
 		const idleContext = idleState !== 'off' ? ` · context: ${contextUsageLabel(ctx, contextThresholdFor(config, ctx))}` : '';
 		const status = !state?.enabled
 			? `${label}: ${idleState}${modifierSuffix}${idleContext}`
-			: `${label}: ${mode}${modifierSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			: `${label}: ${mode}${modifierSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -3714,7 +3714,7 @@ export default function (pi: ExtensionAPI) {
 										? `${loopName} will stop after the current iteration`
 										: state.rotationQueued
 											? `${loopName} is starting a fresh iteration`
-											: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}`,
+											: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}`,
 					'info'
 				);
 				return;
