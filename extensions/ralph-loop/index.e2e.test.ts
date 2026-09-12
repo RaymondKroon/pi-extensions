@@ -24,8 +24,8 @@ import { join, resolve } from 'node:path';
  * Every rotation first runs a dedicated progress-recording turn (finish-up
  * or completion record) before the fresh iteration starts. An
  * aborted run (Escape) always pauses the loop immediately — no re-sent
- * recording prompt, no queued rotation, no fresh iteration — until
- * `/ralph resume` continues it.
+ * recording prompt, no queued rotation, no fresh iteration — until the next
+ * typed user message resumes it (as extra info for the loop).
  */
 
 const RALPH_EXTENSION = resolve(import.meta.dirname, 'index.ts');
@@ -565,7 +565,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'escape: aborting an over-budget turn pauses the loop; /ralph resume continues it',
+		'escape: aborting an over-budget turn pauses the loop; a typed message resumes it',
 		{ timeout: 60000 },
 		async () => {
 			const scratchPath = join(projectDir, 'scratch.txt');
@@ -576,7 +576,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				const text = lastUserText(body);
 				if (text.includes('Finish up now')) return textResponder('Finished up; todos recorded.')(body);
 				if (text.includes('Run the Ralph loop')) return textResponder('Continuing from the checkpoint.')(body);
-				if (text.includes('was paused and is now resumed')) return textResponder('Continuing the interrupted iteration.')(body);
+				if (text.includes('was interrupted and is now resumed')) return textResponder('Continuing the interrupted iteration.')(body);
 				return endlessWork(body);
 			};
 			endpoint = startMockEndpoint(
@@ -607,18 +607,18 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// message history, so only the last user message counts.)
 			await new Promise((r) => setTimeout(r, 2000));
 			const afterAbort = endpoint!.requests.slice(countAtAbort);
-			const continuationTexts = ['Run the Ralph loop', 'Finish up now', 'was paused and is now resumed'];
+			const continuationTexts = ['Run the Ralph loop', 'Finish up now', 'was interrupted and is now resumed'];
 			expect(afterAbort.every((r) => continuationTexts.every((t) => !lastUserText(r.body).includes(t)))).toBe(true);
 
-			// /ralph resume continues: a post-abort request is triggered by the
-			// pending recording prompt (mid-turn steer had queued the rotation)
-			// or the resume-continue prompt (no rotation was pending).
-			await sess.prompt('/ralph resume');
+			// A typed message resumes the loop: a post-abort request is triggered
+			// by the pending recording prompt (mid-turn steer had queued the
+			// rotation) or the resume-continue prompt (no rotation was pending).
+			await sess.prompt('extra info: keep going');
 			await waitFor(
 				() =>
 					endpoint!.requests
 						.slice(countAtAbort)
-						.some((r) => lastUserText(r.body).includes('Finish up now') || lastUserText(r.body).includes('was paused and is now resumed')),
+						.some((r) => lastUserText(r.body).includes('Finish up now') || lastUserText(r.body).includes('was interrupted and is now resumed')),
 				'post-resume request',
 				30000
 			);

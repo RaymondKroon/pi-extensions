@@ -166,7 +166,7 @@ interface RalphState {
 	rotationCheckpointing: boolean;
 	/** A stop was requested while the current iteration is still running. */
 	stopRequested: boolean;
-	/** The loop is paused (e.g. the user pressed Escape) and waits for /ralph resume. */
+	/** The loop is paused (e.g. the user pressed Escape) and waits for the next user message, which resumes it. */
 	paused: boolean;
 	/** A decision requested through this session is awaiting the user's answer. */
 	blocked: boolean;
@@ -894,15 +894,34 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
 }
 
 /**
- * Sent when a paused loop is resumed without a pending rotation: the current
- * iteration continues from the durable state instead of starting over.
+ * Sent when a paused loop is resumed by a typed user message without a pending
+ * rotation: the current iteration continues from the durable state instead of
+ * starting over, and the user's message is extra info for the loop.
  */
-function resumePrompt(state: RalphState): string {
-	const sourceOfTruth =
-		state.mode === 'auto'
-			? 'Re-read the backlog with ralph_todo (action "list") and the repository as the source of truth'
-			: `Re-read ${state.todoPath} and the repository as the source of truth`;
-	return `${AUTOMATED_PREFIX}The Ralph loop was paused and is now resumed. Continue the current iteration exactly where the interrupted turn left off. ${sourceOfTruth}, verify what is already done, and proceed with the remaining work of the current task.`;
+function resumeWithExtraInfoPrompt(extraInfo: string): string {
+	return `${AUTOMATED_PREFIX}The Ralph loop was interrupted and is now resumed by the user's message. The user has extra info for the loop — take it into account. Continue the current iteration exactly where the interrupted turn left off.\n\nUser's extra info:\n${extraInfo}`;
+}
+
+/**
+ * The progress-recording prompt for a queued rotation: the finish-up
+ * (context budget / goal phase change) or the completion record plus local
+ * commit (completed-task, plan-updated). Ralph-format loops finish up with the
+ * merged finish-up prompt; goal planning / re-evaluation iterations checkpoint
+ * the goal instead (no task to finish up), and Markdown backlogs keep the
+ * item-note checkpoint.
+ */
+function recordingPromptFor(state: RalphState): string {
+	return state.rotationReason === 'completed-task'
+		? completionRecordingPrompt(state)
+		: state.rotationReason === 'plan-updated'
+			? planRecordingPrompt(state)
+			: state.rotationReason === 'phase-changed'
+				? finishUpPrompt(state, 'phase-changed')
+				: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
+					? contextCheckpointPrompt(state)
+					: isRalphBacklog(state.baselineTodo)
+						? finishUpPrompt(state, 'context-limit')
+						: contextCheckpointPrompt(state);
 }
 
 function contextCheckpointPrompt(state: RalphState): string {
@@ -1698,12 +1717,12 @@ export default function (pi: ExtensionAPI) {
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
-		// bar alone does not say how to resume or stop. Typed messages are extra
-		// instructions for the model and do NOT resume the loop.
+		// bar alone does not say how to resume or stop. A typed message resumes
+		// the loop and is extra info for it.
 		ctx.ui.setWidget(
 			'ralph-paused',
 			state?.enabled && state.paused
-				? ['Ralph loop is paused — /ralph resume to continue · /ralph stop to stop (typed messages are extra instructions)']
+				? ['Ralph loop is paused — type a message to resume it with extra info · /ralph stop to stop']
 				: undefined
 		);
 		ctx.ui.setStatus('ralph-loop', undefined);
@@ -2812,26 +2831,10 @@ export default function (pi: ExtensionAPI) {
 
 	const sendRecordingPrompt = (ctx: ExtensionContext, options?: { midTurn?: boolean }) => {
 		if (!state) return;
-		// Every rotation first records progress in a dedicated turn — the
-		// finish-up (context budget / goal phase change) or the completion
-		// record plus local commit (completed-task, plan-updated). That turn's
-		// settled event starts the clean context that continues from the
-		// recorded state instead of the old conversation. Ralph-format loops
-		// finish up with the merged finish-up prompt; goal planning /
-		// re-evaluation iterations checkpoint the goal instead (no task to
-		// finish up), and Markdown backlogs keep the item-note checkpoint.
-		const prompt =
-			state.rotationReason === 'completed-task'
-				? completionRecordingPrompt(state)
-				: state.rotationReason === 'plan-updated'
-					? planRecordingPrompt(state)
-					: state.rotationReason === 'phase-changed'
-						? finishUpPrompt(state, 'phase-changed')
-						: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
-							? contextCheckpointPrompt(state)
-							: isRalphBacklog(state.baselineTodo)
-								? finishUpPrompt(state, 'context-limit')
-								: contextCheckpointPrompt(state);
+		// Every rotation first records progress in a dedicated turn. That
+		// turn's settled event starts the clean context that continues from the
+		// recorded state instead of the old conversation.
+		const prompt = recordingPromptFor(state);
 		// When the budget is crossed mid-turn, steer the instruction into the
 		// running turn so the model stops at the next tool boundary instead of
 		// the turn running on until it settles on its own.
@@ -2870,23 +2873,6 @@ export default function (pi: ExtensionAPI) {
 		// running turn so the model stops at the next tool boundary instead of the
 		// turn running on until it settles on its own.
 		sendRecordingPrompt(ctx, options);
-	};
-
-	// Continue a paused loop: re-run the interrupted progress-recording turn
-	// when a rotation was pending, otherwise continue the interrupted
-	// iteration. Shared by /ralph resume and the paused-input dialog.
-	const resumeLoop = (ctx: ExtensionContext) => {
-		if (!state?.enabled || !state.paused) return;
-		persistState({ ...state, paused: false });
-		updateStatus(ctx);
-		if (state.rotationQueued && state.rotationCheckpointing) {
-			// The progress-recording turn was interrupted; run it again
-			// before the fresh iteration starts.
-			sendRecordingPrompt(ctx);
-		} else {
-			// No rotation was pending: continue the interrupted iteration.
-			pi.sendUserMessage(resumePrompt(state), { deliverAs: 'followUp' });
-		}
 	};
 
 	// Dynamic tool loading (pi "defer_loading"): the four ralph tools stay
@@ -3106,7 +3092,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on('input', (event) => {
+	pi.on('input', (event, ctx) => {
 		if (!state?.enabled || event.source === 'extension') return;
 
 		if (state.blocked) {
@@ -3117,15 +3103,25 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 
-		// A paused loop keeps the model out of the loop: without this note the
-		// last prompt the model saw is the iteration prompt, so a typed message
-		// can be misread as “continue the Ralph loop” instead of a normal chat
-		// instruction. Extension commands (e.g. /ralph resume) never reach this
-		// handler, so resuming is unaffected.
+		// A typed message resumes a paused loop: the user's text is extra info
+		// for the loop, not a side conversation. Extension commands (e.g.
+		// /ralph stop) never reach this handler.
 		if (state.paused) {
+			persistState({ ...state, paused: false });
+			updateStatus(ctx);
+			if (state.rotationQueued && state.rotationCheckpointing) {
+				// The progress-recording turn was interrupted: re-run it, carrying
+				// the user's extra info into the recorded state.
+				return {
+					action: 'transform',
+					text: `${recordingPromptFor(state)}\n\nThe user provided this extra info while the loop was paused — take it into account and record it in the durable state so the next iteration sees it:\n${event.text}`
+				};
+			}
+			// No rotation was pending: continue the interrupted iteration with
+			// the user's extra info.
 			return {
 				action: 'transform',
-				text: `The Ralph loop is temporarily paused in this session: you are NOT currently running the Ralph loop. The user message below is a normal instruction or question — not a Ralph iteration, not a resume, and not an answer to a pending decision. Do not start or continue Ralph work: do not select or modify TODO items, implement, checkpoint, commit, or call ralph_resolve_decision. Answer the user's message directly. The loop resumes only when the user runs /ralph resume.\n\nUser message:\n${event.text}`
+				text: resumeWithExtraInfoPrompt(event.text)
 			};
 		}
 	});
@@ -3156,14 +3152,14 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
-		// A paused loop stays paused: user chat turns and any other settles must
-		// not queue rotations or fresh iterations until /ralph resume.
+		// A paused loop stays paused: settles must not queue rotations or fresh
+		// iterations (a typed message resumes the loop before its turn runs).
 		if (state.paused) return;
 		if (userAborted) {
 			if (state.stopRequested) {
 				stopLoop(ctx, 'Ralph loop stopped after the current iteration');
 			} else {
-				pauseLoop(ctx, 'Ralph loop paused (Escape) — /ralph resume to continue');
+				pauseLoop(ctx, 'Ralph loop paused (Escape) — type a message to resume it with extra info');
 			}
 			return;
 		}
@@ -3765,7 +3761,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand('ralph', {
-		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|resume|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
@@ -3776,7 +3772,6 @@ export default function (pi: ExtensionAPI) {
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into TODO.ralph, merging into an existing backlog. Each source file is only imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md> [--todo <backlog>]. The first non-empty line (optionally an H1 heading) is the title, the rest is the body. Targets the active loop’s backlog or TODO.ralph. Replaces an open goal; a claimed or done goal must be resolved first.' },
 				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the rotation/finish-up boundary.' },
-				{ value: 'resume', label: 'resume', description: 'Resume a paused loop (Escape pauses it).' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
 				{ value: 'config', label: 'config', description: 'Configure fresh-context rotation and decision approval.' }
 			];
@@ -3830,23 +3825,6 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			if (command === 'resume') {
-				if (!state?.enabled) {
-					ctx.ui.notify('Ralph loop is not active', 'info');
-					return;
-				}
-				if (!state.paused) {
-					ctx.ui.notify('Ralph loop is not paused', 'info');
-					return;
-				}
-				if (!ctx.isIdle()) {
-					ctx.ui.notify('Wait for the current agent run to finish before resuming Ralph', 'warning');
-					return;
-				}
-				resumeLoop(ctx);
-				ctx.ui.notify('Ralph loop resumed', 'info');
-				return;
-			}
 			if (command === 'config') {
 				await openConfig(ctx);
 				return;
@@ -3860,7 +3838,7 @@ export default function (pi: ExtensionAPI) {
 						: state.blocked
 							? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
 							: state.paused
-								? `${loopName} is paused — /ralph resume to continue`
+								? `${loopName} is paused — type a message to resume it with extra info`
 				: state.rotationCheckpointing
 					? state.rotationReason === 'completed-task'
 						? `${loopName} is recording the completed task’s progress`
@@ -3878,12 +3856,12 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'resume', 'status', 'config'];
+			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'status', 'config'];
 			if (command !== '' && !knownCommands.includes(command)) {
 				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
 					ctx.ui.notify(
-						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|resume|status|config]`,
+						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|status|config]`,
 						'error'
 					);
 					return;
@@ -3893,7 +3871,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === '') {
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|resume|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
+					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
 					return;
 				}
 				await openHome(ctx);

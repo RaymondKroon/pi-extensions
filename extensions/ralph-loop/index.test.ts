@@ -506,7 +506,7 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.length).toBe(queued);
 	});
 
-	test('aborted turn: Escape pauses the loop immediately, even mid-rotation; resume continues', async () => {
+	test('aborted turn: Escape pauses the loop immediately, even mid-rotation; a typed message resumes it', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -534,15 +534,20 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.length).toBe(queuedCount);
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
 
-		// /ralph resume re-sends the interrupted recording prompt.
-		const ralph = fake.commands.get('ralph')!;
-		await ralph.handler('resume', fakeCtx.ctx);
-		expect(fake.userMessages.length).toBe(queuedCount + 1);
-		expect(fake.userMessages.at(-1)?.text).toContain('completion log');
+		// A typed message resumes: it re-sends the interrupted recording prompt
+		// (as the transform) with the user's extra info.
+		const transform = (await fake.fire('input', fakeCtx.ctx, {
+			text: 'use bun test',
+			source: 'interactive'
+		})) as { action: string; text: string } | undefined;
+		expect(fake.userMessages.length).toBe(queuedCount);
+		expect(transform?.action).toBe('transform');
+		expect(transform?.text).toContain('completion log');
+		expect(transform?.text).toContain('use bun test');
 		expect(statusLine(fakeCtx.widgets)).toContain('recording');
 	});
 
-	test('aborted tool call: Escape during a tool call pauses the loop; resume continues the iteration', async () => {
+	test('aborted tool call: Escape during a tool call pauses the loop; a typed message resumes the iteration', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -565,11 +570,16 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.length).toBe(1);
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
 
-		// Resume without a pending rotation continues the current iteration.
-		const ralph = fake.commands.get('ralph')!;
-		await ralph.handler('resume', fakeCtx.ctx);
-		expect(fake.userMessages.length).toBe(2);
-		expect(fake.userMessages.at(-1)?.text).toContain('was paused and is now resumed');
+		// A typed message resumes without a pending rotation: the transform
+		// continues the current iteration with the user's extra info.
+		const transform = (await fake.fire('input', fakeCtx.ctx, {
+			text: 'focus on the parser first',
+			source: 'interactive'
+		})) as { action: string; text: string } | undefined;
+		expect(fake.userMessages.length).toBe(1);
+		expect(transform?.action).toBe('transform');
+		expect(transform?.text).toContain('was interrupted and is now resumed');
+		expect(transform?.text).toContain('focus on the parser first');
 	});
 
 	test('failing tool whose output mentions "abort" does not pause the loop on a clean finish', async () => {
@@ -598,7 +608,7 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.length).toBe(1);
 	});
 
-	test('typing while paused stays paused: the message is an extra instruction', async () => {
+	test('typing while paused resumes the loop: the message is extra info', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -613,35 +623,28 @@ describe('ralph-loop extension', () => {
 		// A persistent hint widget offers the explicit alternatives.
 		expect(fakeCtx.widgets.get('ralph-paused')).toBeDefined();
 
-		// The user types an instruction: it runs as normal chat and the loop
-		// stays paused — no loop prompt is sent.
+		// The user types a message: it resumes the loop as extra info — no
+		// separate loop prompt is sent, the typed message carries it.
 		const before = fake.userMessages.length;
 		const transform = (await fake.fire('input', fakeCtx.ctx, {
 			text: 'add a test for the parser',
 			source: 'interactive'
 		})) as { action: string; text: string } | undefined;
 		expect(fake.userMessages.length).toBe(before);
-		// The typed message is framed as a normal instruction, not loop work.
 		expect(transform?.action).toBe('transform');
-		expect(transform?.text).toContain('temporarily paused');
-		expect(transform?.text).toContain('NOT currently running the Ralph loop');
+		expect(transform?.text).toContain('was interrupted and is now resumed');
 		expect(transform?.text).toContain('add a test for the parser');
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
+		// The loop is unpaused: the hint widget is gone.
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+		expect(fakeCtx.widgets.get('ralph-paused')).toBeUndefined();
 
-		// The instruction turn settles: still paused, nothing queued.
+		// The resumed turn settles: the loop keeps running (no rotation was
+		// due, so nothing extra is queued).
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 		expect(fake.userMessages.length).toBe(before);
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
-
-		// /ralph resume is the only way back.
-		const ralph = fake.commands.get('ralph')!;
-		await ralph.handler('resume', fakeCtx.ctx);
-		expect(fake.userMessages.length).toBe(before + 1);
-		expect(fake.userMessages.at(-1)?.text).toContain('was paused and is now resumed');
 		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
-		expect(fakeCtx.widgets.get('ralph-paused')).toBeUndefined();
 	});
 
 	test('typing while the loop is running passes through untransformed', async () => {
@@ -659,7 +662,7 @@ describe('ralph-loop extension', () => {
 		expect(transform).toBeUndefined();
 	});
 
-	test('typing while paused with a pending rotation stays paused; resume re-sends the recording prompt', async () => {
+	test('typing while paused with a pending rotation resumes; the recording prompt carries the extra info', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -678,22 +681,16 @@ describe('ralph-loop extension', () => {
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
 
-		// Typing an instruction does not touch the pending rotation.
+		// Typing resumes the loop: the interrupted recording turn is re-sent
+		// (as the transform) with the user's extra info.
 		const transform = (await fake.fire('input', fakeCtx.ctx, {
 			text: 'note: use bun test',
 			source: 'interactive'
 		})) as { action: string; text: string } | undefined;
 		expect(fake.userMessages.length).toBe(queuedCount);
 		expect(transform?.action).toBe('transform');
-		expect(transform?.text).toContain('temporarily paused');
+		expect(transform?.text).toContain('completion log');
 		expect(transform?.text).toContain('note: use bun test');
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
-
-		// /ralph resume re-sends the interrupted recording turn first.
-		const ralph = fake.commands.get('ralph')!;
-		await ralph.handler('resume', fakeCtx.ctx);
-		expect(fake.userMessages.length).toBe(queuedCount + 1);
-		expect(fake.userMessages.at(-1)?.text).toContain('completion log');
 		expect(statusLine(fakeCtx.widgets)).toContain('recording');
 	});
 
@@ -3034,7 +3031,6 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			'import',
 			'set-goal',
 			'stop',
-			'resume',
 			'status',
 			'config'
 		]);
