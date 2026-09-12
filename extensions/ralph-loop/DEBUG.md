@@ -27,3 +27,19 @@
 - **Environment:** the e2e suite (`index.e2e.test.ts`, mocked LLM endpoint)
   is fast in this environment — the full `bun test` (364+ tests, 5 files)
   finishes in ~10 s, not the 30 s+/test the backlog entry feared.
+
+## 2026-07-11 — auto loop big picture moved from "Goal: " tasks to the backlog's goal
+
+- Design decision: the auto loop's big-picture layer is now the per-session
+  backlog's **goal** entry (ralph_goal `set`/`checkpoint`/`show`), replacing
+  the `Goal: ` tracking-task convention. The "goal is the user's contract,
+  title/body read-only" invariant is relaxed **only for the auto loop** (the
+  auto goal is model-maintained and lives in the per-session file); `set` is
+  refused in task/goal loops.
+- Consequence: `isReferenceTaskTitle` now matches `Findings: ` only — a
+  `Goal: ` task title is ordinary work again (project backlogs and old
+  session backlogs may still contain such tasks; they are picked up as work
+  and can be completed normally).
+- Cache-neutrality: the auto tool set is `ralph_todo` + `ralph_goal`, both
+  pre-activated at session start when auto mode is "on" (same prefix-cache
+  rationale as before — arming must not change the tool set).

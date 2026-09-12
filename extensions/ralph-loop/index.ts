@@ -90,8 +90,11 @@ function rotateOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): 'tas
 }
 /** Tools activated additively (defer_loading) by ralph_enable or /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
 const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision'];
-/** The backlog tool name (also the only ralph tool an active auto loop activates). With auto mode "on" it is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
+/** The backlog tool name. With auto mode "on" the auto tool set is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
 const TODO_TOOL_NAME = 'ralph_todo';
+const GOAL_TOOL_NAME = 'ralph_goal';
+/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool plus the goal tool — the auto loop's big-picture layer is the backlog's goal. */
+const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, GOAL_TOOL_NAME];
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
@@ -468,13 +471,14 @@ function isBacklogFinished(todo: string, category?: string): boolean {
 }
 
 /**
- * The auto mode's reference entries: "Goal: " big-picture tracking tasks and
- * "Findings: " notes from earlier iterations are not work items. ralph_todo
- * "next" skips them on the session backlog so an iteration never stalls on a
- * reference entry.
+ * The auto mode's reference entries: "Findings: " notes from earlier
+ * iterations are not work items. ralph_todo "next" skips them on the session
+ * backlog so an iteration never stalls on a reference entry. (The big-picture
+ * layer is the backlog's goal, maintained via ralph_goal — not "Goal: "
+ * tasks.)
  */
 function isReferenceTaskTitle(title: string): boolean {
-	return title.startsWith('Goal: ') || title.startsWith('Findings: ');
+	return title.startsWith('Findings: ');
 }
 
 /**
@@ -544,6 +548,16 @@ function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefi
 		if (counts.total === 0) return { phase: 'planning', goal };
 		if (counts.open === 0) return { phase: 're-evaluation', goal };
 		return { phase: 'execution', goal };
+	} catch {
+		return undefined;
+	}
+}
+
+/** The goal of the state's baseline backlog (undefined when absent or unparseable). */
+function baselineGoal(state: RalphState): Goal | undefined {
+	if (!isRalphBacklog(state.baselineTodo)) return undefined;
+	try {
+		return Backlog.parse(state.baselineTodo).goal();
 	} catch {
 		return undefined;
 	}
@@ -662,17 +676,22 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. The backlog also carries "Findings: " entries with what the previous iteration learned, and DEBUG.md at the project root may carry durable debug findings — read them before starting work instead of rediscovering what they already establish.'
 			: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
 		// From the second iteration on, the backlog also carries the big-picture
-		// layer ("Goal: " tracking tasks) and the findings layer ("Findings: "
-		// reference notes from earlier iterations).
+		// layer (the backlog's goal, maintained via ralph_goal) and the findings
+		// layer ("Findings: " reference notes from earlier iterations).
 		const referenceTaskNote =
 			state.iteration > 1
-				? ' Tasks whose title starts with "Goal: " or "Findings: " are not work items, and "next" skips them: Goal tasks are big-picture tracking tasks (complete one only when its objective is actually met, with evidence), and Findings entries are reference notes from earlier iterations. Read the open Findings entries before starting work, then mark each one done with ralph_todo (action "complete") so the backlog does not accumulate open reference entries.'
+				? ' Tasks whose title starts with "Findings: " are not work items, and "next" skips them: they are reference notes from earlier iterations. Read the open Findings entries before starting work, then mark each one done with ralph_todo (action "complete") so the backlog does not accumulate open reference entries.'
 				: '';
 		const bigGoalMaintenance =
 			state.iteration > 1
 				? `
-Keep the big picture in the backlog: if no open task in your category starts with "Goal: ", add the larger remaining objectives this work serves with ralph_todo (action "add", title "Goal: <objective>", body with the acceptance evidence to look for).`
+Keep the big picture in the backlog's goal: it is the larger objective this work serves, not the immediate next step. Check it with ralph_goal (action "show"); if it is missing or no longer describes the objective, replace it with ralph_goal (action "set", title, body with the acceptance evidence to look for).`
 				: '';
+		// The big picture: the backlog's goal, carried into every fresh iteration.
+		const goal = baselineGoal(state);
+		const goalSection = goal
+			? `\n\nBig picture — the backlog's goal (maintain it with ralph_goal):\n${goalBlock(goal)}`
+			: '';
 		// Closing step per rotation policy: under "task" the commit ends the
 		// iteration (the loop rotates and starts a fresh one); under "budget"
 		// the model keeps working task after task until the context budget.
@@ -680,7 +699,7 @@ Keep the big picture in the backlog: if no open task in your category starts wit
 			state.rotateOn === 'task'
 				? '5. This is the last step of the iteration: stop working when the commit is made.'
 				: '5. After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.';
-		return `Run the Ralph auto loop for this repository. ${contextNote}
+		return `Run the Ralph auto loop for this repository. ${contextNote}${goalSection}
 
 The backlog (ralph format) is read and updated only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands). The backlog may contain several categories and the loop works through all of them; new todos you record go to your category "${state.category}".
 
@@ -931,8 +950,8 @@ Report the checkpoint path and the next step succinctly.`;
  * the next iteration; completed work gets its completion log entry and its
  * local commit (broken or half-done work does not). The auto loop adds the
  * findings layer ("Findings: " reference notes) and, from the second
- * iteration on, keeps the big-picture ("Goal: ") tracking tasks in the
- * backlog. The settled turn starts the fresh iteration.
+ * iteration on, keeps the big picture in the backlog's goal (maintained via
+ * ralph_goal). The settled turn starts the fresh iteration.
  */
 function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-changed'): string {
 	const isAuto = state.mode === 'auto';
@@ -948,10 +967,10 @@ function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-chan
 			: '';
 	// From the second iteration on, the auto handoff also refreshes the
 	// big-picture layer: the first round establishes what the work is about,
-	// the later rounds keep the larger objectives visible in the backlog.
+	// the later rounds keep the larger objective visible as the backlog's goal.
 	const bigPicture =
 		isAuto && state.iteration > 1
-			? `5. Keep the big picture in the backlog: for each larger remaining objective this work serves (not the immediate next step), check whether an open task whose title starts with "Goal: " covers it; if it is missing, add it with ralph_todo (action "add", title "Goal: <objective>", body with the acceptance evidence to look for). Big-picture tasks are tracking tasks, not next steps.
+			? `5. Keep the big picture in the backlog's goal: it is the larger objective this work serves (not the immediate next step). Check it with ralph_goal (action "show"); if it is missing or no longer describes the objective, replace it with ralph_goal (action "set", title, body with the acceptance evidence to look for). Record what advanced toward it in this iteration with ralph_goal (action "checkpoint", a concise note).
 `
 			: '';
 	const opening =
@@ -1616,9 +1635,10 @@ export default function (pi: ExtensionAPI) {
 	// deactivation only happens on session start with no active loop — once
 	// in context, the tools stay in context for the rest of the session
 	// (loop stop does not remove them, which would break the cached prefix).
-	// An active auto loop activates only the backlog tool; the task/goal loops
+	// An active auto loop activates the auto tool set (backlog + goal — the
+	// big picture is the backlog's goal); the task/goal loops
 	// activate the full ralph tool set.
-	// With auto mode "on", ralph_todo is pre-activated at session start: the
+	// With auto mode "on", the auto tool set is pre-activated at session start: the
 	// tool definitions are part of every request (vLLM inlines them into the
 	// rendered prompt), so adding the tool when the loop arms at the context
 	// budget would invalidate the prefix cache at the largest context of the
@@ -1630,11 +1650,11 @@ export default function (pi: ExtensionAPI) {
 		const active = pi.getActiveTools();
 		const next = active.filter((name) => !RALPH_TOOL_NAMES.includes(name));
 		if (state?.enabled) {
-			const names = state.mode === 'auto' ? [TODO_TOOL_NAME] : RALPH_TOOL_NAMES;
+			const names = state.mode === 'auto' ? AUTO_TOOL_NAMES : RALPH_TOOL_NAMES;
 			for (const name of names) if (!next.includes(name)) next.push(name);
-		} else if (config.autoMode === 'on' && !next.includes(TODO_TOOL_NAME)) {
-			// Pre-activate the backlog tool so arming the loop is cache-neutral.
-			next.push(TODO_TOOL_NAME);
+		} else if (config.autoMode === 'on') {
+			// Pre-activate the auto tool set so arming the loop is cache-neutral.
+			for (const name of AUTO_TOOL_NAMES) if (!next.includes(name)) next.push(name);
 		}
 		if (next.length !== active.length) pi.setActiveTools(next);
 	};
@@ -2291,19 +2311,30 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_goal',
 		label: 'Ralph goal',
 		description:
-			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else TODO.ralph). The goal is the user\'s contract: its title/body are read-only; change only its state via this tool. Actions: show, checkpoint, complete, confirm, withdraw (all but show require the active goal loop). complete requires a full verification run of every SPEC.md command with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
+			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else TODO.ralph). In the goal loop the goal is the user\'s contract: its title/body are read-only; change only its state via this tool. In the auto loop the goal is the model-maintained big picture: set creates or replaces it, checkpoint records progress toward it. Actions: show, set (auto loop only), checkpoint (goal or auto loop), complete, confirm, withdraw (the last three require the active goal loop). complete requires a full verification run of every SPEC.md command with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('show'),
+				Type.Literal('set'),
 				Type.Literal('checkpoint'),
 				Type.Literal('complete'),
 				Type.Literal('confirm'),
 				Type.Literal('withdraw')
 			]),
+			title: Type.Optional(
+				Type.String({
+					description: 'The goal\'s title (set, auto loop only).'
+				})
+			),
+			body: Type.Optional(
+				Type.String({
+					description: 'The goal\'s body as markdown bullets (set, auto loop only); an empty string clears it.'
+				})
+			),
 			note: Type.Optional(
 				Type.String({
 					description:
-						'Checkpoint note (checkpoint), completion evidence (complete), or withdrawal note describing what is missing (withdraw).'
+					'Checkpoint note (checkpoint), completion evidence (complete), or withdrawal note describing what is missing (withdraw).'
 				})
 			)
 		}),
@@ -2331,14 +2362,31 @@ export default function (pi: ExtensionAPI) {
 						output = formatGoal(goal);
 						break;
 					}
+					case 'set': {
+						if (!state?.enabled) throw new Error('set requires an active Ralph loop (start one with /ralph start).');
+						if (state.mode !== 'auto') {
+							throw new Error('set is not available in the goal loop: the goal is the user\'s contract (set it with /ralph set-goal or the /ralph home view).');
+						}
+						if (!params.title?.trim()) throw new Error('set requires a title.');
+						const updated = backlog.setGoal({ title: params.title.trim(), body: params.body });
+						mutated = true;
+						syncGoalState();
+						output = `Goal "${updated.title}" ${goal ? 'updated' : 'created'} in ${todoPath}.`;
+						break;
+					}
 					case 'checkpoint': {
 						if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
-						if (state.mode !== 'goal') {
-							throw new Error('checkpoint requires an active goal loop (start one with /ralph start --goal).');
+						if (state.mode !== 'goal' && state.mode !== 'auto') {
+							throw new Error('checkpoint requires an active goal or auto loop (start one with /ralph start).');
 						}
 						if (!params.note) throw new Error('checkpoint requires a note.');
+						if (!goal) throw new Error(`no goal in ${todoPath}`);
 						const updated = backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
 						mutated = true;
+						if (state.mode === 'auto') {
+							output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Continue working.`;
+							break;
+						}
 						output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
 						break;
 					}
