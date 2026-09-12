@@ -366,7 +366,7 @@ describe('ralph-loop extension', () => {
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop is already active — /ralph stop to end it first');
 	});
 
-	test('context-limit rotation checkpoints, then starts a fresh iteration with incremented counters', async () => {
+	test('context-limit rotation finishes up, then starts a fresh iteration with incremented counters', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -378,14 +378,14 @@ describe('ralph-loop extension', () => {
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
-		// The loop must queue a durable checkpoint and say so in the status bar.
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
-		expect(fake.userMessages.at(-1)?.text).toContain('durable checkpoint');
-		// The checkpoint label must carry the actual iteration number, not a placeholder.
+		// The loop must queue the finish-up turn and say so in the status bar.
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
+		// The finish-up label must carry the actual iteration number, not a placeholder.
 		expect(fake.userMessages.at(-1)?.text).toContain('iteration 1 of 10');
-		expect(fake.userMessages.at(-1)?.text).toContain('action "checkpoint"');
-		// Only one checkpoint per task: a new one replaces the previous.
-		expect(fake.userMessages.at(-1)?.text).toContain('keep only the single most recent one');
+		expect(fake.userMessages.at(-1)?.text).toContain('action "add"');
+		// Stale todos are fixed in place: no duplicates accumulate.
+		expect(fake.userMessages.at(-1)?.text).toContain('instead of adding a duplicate');
 
 		// The checkpoint turn settles; the fresh iteration starts from the TODO.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -493,12 +493,12 @@ describe('ralph-loop extension', () => {
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('message_update', fakeCtx.ctx);
 
-		// The checkpoint prompt is steered into the running turn and the bar
-		// shows "checkpointing" immediately, without waiting for the settle.
+		// The finish-up prompt is steered into the running turn and the bar
+		// shows "finishing" immediately, without waiting for the settle.
 		const last = fake.userMessages.at(-1)!;
-		expect(last.text).toContain('durable checkpoint');
+		expect(last.text).toContain('Finish up now');
 		expect(last.options).toEqual({ deliverAs: 'steer' });
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		// Further streaming updates do not queue a second rotation.
 		const queued = fake.userMessages.length;
@@ -746,9 +746,9 @@ describe('ralph-loop extension', () => {
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// A durable checkpoint is recorded before the loop ends.
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
-		expect(fake.userMessages.at(-1)?.text).toContain('durable checkpoint');
+		// The finish-up is recorded before the loop ends.
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
 		const count = fake.userMessages.length;
 
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
@@ -770,13 +770,13 @@ describe('ralph-loop extension', () => {
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		fakeCtx.idle.value = false;
 		const ralph = fake.commands.get('ralph')!;
 		await ralph.handler('stop', fakeCtx.ctx);
 		// The in-progress recording turn is still shown; the stop applies after it.
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		// The recording turn settles: the loop must stop, not start a fresh
 		// iteration (which would carry stopRequested over and auto-rotate forever).
@@ -799,7 +799,7 @@ describe('ralph-loop extension', () => {
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -857,8 +857,8 @@ describe('ralph-loop extension', () => {
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
-		expect(fake.userMessages.at(-1)?.text).toContain('durable checkpoint');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
 
 		const ralph = fake.commands.get('ralph')!;
 		await ralph.handler('stop --force', fakeCtx.ctx);
@@ -967,7 +967,7 @@ describe('ralph-loop extension', () => {
 
 		const expected = [
 			'iteration 1/10',
-			'checkpointing',
+			'finishing',
 			'iteration 2/10',
 			'recording',
 			'iteration 3/10'
@@ -1301,7 +1301,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// Creating a list is explicit; add to it after.
 		await run({ action: 'new-list', name: 'auth' });
 		const added = await run({ action: 'add', title: 'Add sign-out.', category: 'auth', body: '- Acceptance: sessions expire.' });
-		expect(added.content[0]!.text).toContain('Added task 1 "Add sign-out."');
+		expect(added.content[0]!.text).toContain('Added task 4 "Add sign-out." in category "auth"');
 		expect(await file()).toContain('T 4 auth "Add sign-out."');
 
 		// Unknown numbers report the known numbers.
@@ -2083,15 +2083,15 @@ D 2
 		expect(prompt).not.toContain('ralph_todo');
 	});
 
-	test('goal execution iterations still checkpoint the task via ralph_todo', async () => {
+	test('goal execution iterations finish up at the context budget', async () => {
 		const { fake, fakeCtx } = await startGoalLoop(GOAL_EXECUTION);
 
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
 		const prompt = fake.userMessages.at(-1)!.text;
-		expect(prompt).toContain('durable checkpoint');
-		expect(prompt).toContain('ralph_todo with action "checkpoint"');
+		expect(prompt).toContain('Finish up now');
+		expect(prompt).toContain('ralph_todo (action "complete"');
 		expect(prompt).not.toContain('ralph_goal');
 	});
 
@@ -2620,7 +2620,7 @@ T 2 - "Port the state."
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
-		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		// The recording turn completes the remaining tasks and claims the goal:
 		// the loop blocks pending the user's approval.
@@ -3910,8 +3910,8 @@ describe('ralph-loop extension (auto mode)', () => {
 			)}\n`
 		);
 
-	const autoTool = (fake: ReturnType<typeof createFakePi>) =>
-		fake.tools.get('ralph_auto') as {
+	const autoTool = (fake: ReturnType<typeof createFakePi>) => {
+		const tool = fake.tools.get('ralph_todo') as {
 			execute: (
 				id: string,
 				params: Record<string, unknown>,
@@ -3920,6 +3920,13 @@ describe('ralph-loop extension (auto mode)', () => {
 				ctx: unknown
 			) => Promise<{ content: Array<{ type: string; text: string }> }>;
 		};
+		// The merged backlog tool: the auto tests target the per-session auto
+		// backlog explicitly.
+		return {
+			execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) =>
+				tool.execute(id, { ...params, backlog: 'session' }, signal, onUpdate, ctx)
+		};
+	};
 
 	const stateEntries = (fake: ReturnType<typeof createFakePi>) =>
 		fake.entries.filter((entry) => entry.customType === 'ralph-loop-state');
@@ -3945,7 +3952,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('context: 10% / 50%');
 	});
 
-	test('auto mode pre-activates ralph_auto at session start so arming is cache-neutral', async () => {
+	test('auto mode pre-activates ralph_todo at session start so arming is cache-neutral', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3955,8 +3962,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		// The dedicated tool is in context before the loop arms; the full
 		// ralph tool set stays out.
-		expect(fake.activeTools).toContain('ralph_auto');
-		expect(fake.activeTools).not.toContain('ralph_todo');
+		expect(fake.activeTools).toContain('ralph_todo');
 		expect(fake.activeTools).not.toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
@@ -3981,7 +3987,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		expect(fake.userMessages[0]!.text).toContain('Run the Ralph loop');
 		expect(fake.activeTools).toContain('ralph_todo');
-		expect(fake.activeTools).not.toContain('ralph_auto');
+		expect(fake.activeTools).toContain('ralph_goal');
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
 	});
 
@@ -3995,7 +4001,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		const prompt = fake.userMessages[0]!.text;
 		expect(prompt).toContain('Run the Ralph auto loop');
-		expect(prompt).toContain('only through the ralph_auto tool');
+		expect(prompt).toContain('only through the ralph_todo tool');
 		expect(prompt).toContain('General');
 		// The state file is created in ralph format with the auto-created session category.
 		const file = await readFile(autoFile(), 'utf8');
@@ -4005,9 +4011,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
 		expect(status).toContain('category: General');
-		// Only the dedicated tool is activated — not the full ralph tool set.
-		expect(fake.activeTools).toContain('ralph_auto');
-		expect(fake.activeTools).not.toContain('ralph_todo');
+		// Only the backlog tool is activated — not the full ralph tool set.
+		expect(fake.activeTools).toContain('ralph_todo');
 		expect(fake.activeTools).not.toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
@@ -4103,7 +4108,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		const prompt = fake.userMessages.at(-1)!.text;
 		expect(prompt).toContain('Finish up now');
 		expect(prompt).toContain('iteration 1 of 10');
-		expect(prompt).toContain('ralph_auto');
+		expect(prompt).toContain('ralph_todo');
 		expect(prompt).toContain('action "add"');
 		expect(prompt).toContain('General');
 
@@ -4206,7 +4211,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(next.content[0]!.text).toContain('Finish the parser');
 	});
 
-	test('ralph_auto add records a todo in the session category; complete marks it done with a log entry', async () => {
+	test('ralph_todo add records a todo in the session category; complete marks it done with a log entry', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4215,7 +4220,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		const tool = autoTool(fake);
 		const added = await tool.execute('t', { action: 'add', title: 'Continue the rewrite', body: '- finish the parser' }, undefined, undefined, fakeCtx.ctx);
-		expect(added.content[0]!.text).toContain('Recorded todo 1');
+		expect(added.content[0]!.text).toContain('Added task 1');
 		let file = await readFile(autoFile(), 'utf8');
 		expect(file).toContain('Continue the rewrite');
 
@@ -4229,7 +4234,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(file).toContain('rewrote the parser');
 	});
 
-	test('ralph_auto add with a category creates it and records there; the default stays the session category', async () => {
+	test('ralph_todo add with a category creates it and records there; the default stays the session category', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4238,11 +4243,11 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		const tool = autoTool(fake);
 		const added = await tool.execute('t', { action: 'add', title: 'Research the API', category: 'Research' }, undefined, undefined, fakeCtx.ctx);
-		expect(added.content[0]!.text).toContain('Recorded todo 1');
+		expect(added.content[0]!.text).toContain('Added task 1');
 		expect(added.content[0]!.text).toContain('category "Research"');
 
 		const defaultAdded = await tool.execute('t', { action: 'add', title: 'Session todo' }, undefined, undefined, fakeCtx.ctx);
-		expect(defaultAdded.content[0]!.text).toContain('Recorded todo 2');
+		expect(defaultAdded.content[0]!.text).toContain('Added task 2');
 		expect(defaultAdded.content[0]!.text).toContain('category "General"');
 
 		const file = await readFile(autoFile(), 'utf8');
@@ -4254,7 +4259,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(next.content[0]!.text).toContain('Research the API');
 	});
 
-	test('ralph_auto update changes a todo title and body instead of adding a duplicate', async () => {
+	test('ralph_todo update changes a todo title and body instead of adding a duplicate', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4271,7 +4276,7 @@ describe('ralph-loop extension (auto mode)', () => {
 			undefined,
 			fakeCtx.ctx
 		);
-		expect(updated.content[0]!.text).toContain('Updated todo 1 "Finish the parser rewrite"');
+		expect(updated.content[0]!.text).toContain('Updated task 1 "Finish the parser rewrite"');
 		let file = await readFile(autoFile(), 'utf8');
 		expect(file).toContain('Finish the parser rewrite');
 		expect(file).toContain('- add tests');
@@ -4292,7 +4297,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		);
 	});
 
-	test('ralph_auto add and complete require an active auto loop when auto mode is off; next and list work without one', async () => {
+	test('ralph_todo mutations on the session backlog work without a loop when auto mode is off (no arming)', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -4300,22 +4305,21 @@ describe('ralph-loop extension (auto mode)', () => {
 		await writeFile(autoFile(), '# ralph v2\n\n');
 
 		const tool = autoTool(fake);
-		await expect(tool.execute('t', { action: 'add', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			/requires an active Ralph auto loop/
-		);
-		await expect(tool.execute('t', { action: 'complete', task: '1' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			/requires an active Ralph auto loop/
-		);
-		await expect(tool.execute('t', { action: 'update', task: '1', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			/requires an active Ralph auto loop/
-		);
+		const added = await tool.execute('t', { action: 'add', title: 'x' }, undefined, undefined, fakeCtx.ctx);
+		expect(added.content[0]!.text).toContain('Added task 1');
+		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'ok' }, undefined, undefined, fakeCtx.ctx);
+		expect(done.content[0]!.text).toContain('Marked task 1');
+		const updated = await tool.execute('t', { action: 'update', task: '1', title: 'y' }, undefined, undefined, fakeCtx.ctx);
+		expect(updated.content[0]!.text).toContain('Updated task 1');
+		// Auto mode is off: no loop was started by the mutations.
+		expect(stateEntries(fake).length).toBe(0);
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
-		expect(next.content[0]!.text).toContain('No open tasks remain');
+		expect(next.content[0]!.text).toContain('No open work tasks remain');
 		const list = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
 		expect(list.content[0]!.text).toContain('0 open');
 	});
 
-	test('ralph_auto add starts the auto loop when auto mode is on and no loop is active', async () => {
+	test('ralph_todo add starts the auto loop when auto mode is on and no loop is active', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4325,7 +4329,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		const tool = autoTool(fake);
 		const added = await tool.execute('t', { action: 'add', title: 'First step', body: '- do it' }, undefined, undefined, fakeCtx.ctx);
-		expect(added.content[0]!.text).toContain('Recorded todo 1');
+		expect(added.content[0]!.text).toContain('Added task 1');
 		expect(added.content[0]!.text).toContain('The Ralph auto loop was started');
 
 		// The loop is active now: state persisted, status bar switched to on.
@@ -4344,7 +4348,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(done.content[0]!.text).toContain('Marked task 1');
 	});
 
-	test('concurrent ralph_auto adds arm the auto loop once and both todos survive (no torn file)', async () => {
+	test('concurrent ralph_todo adds arm the auto loop once and both todos survive (no torn file)', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4359,8 +4363,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		// Both sibling calls succeed against one armed loop (the armAutoLoop
 		// promise cache), and the per-file lock serializes their
 		// load → mutate → write cycles: no lost todo, no torn file.
-		expect(first.content[0]!.text).toContain('Recorded todo 1');
-		expect(second.content[0]!.text).toContain('Recorded todo 2');
+		expect(first.content[0]!.text).toContain('Added task 1');
+		expect(second.content[0]!.text).toContain('Added task 2');
 		expect(first.content[0]!.text).toContain('The Ralph auto loop was started');
 		expect(second.content[0]!.text).toContain('The Ralph auto loop was started');
 		const armed = stateEntries(fake).filter((entry) => (entry.data as { enabled?: boolean }).enabled === true);
@@ -4373,7 +4377,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(list.content[0]!.text).toContain('2 open');
 	});
 
-	test('ralph_auto add re-arms the auto loop after an explicit stop', async () => {
+	test('ralph_todo add re-arms the auto loop after an explicit stop', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4386,7 +4390,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		// so the todo is recorded and the auto loop starts again.
 		const tool = autoTool(fake);
 		const added = await tool.execute('t', { action: 'add', title: 'x' }, undefined, undefined, fakeCtx.ctx);
-		expect(added.content[0]!.text).toContain('Recorded todo');
+		expect(added.content[0]!.text).toContain('Added task');
 		expect(added.content[0]!.text).toContain('The Ralph auto loop was started');
 		expect(stateEntries(fake).at(-1)!.data).toMatchObject({ enabled: true, mode: 'auto' });
 	});
@@ -4459,8 +4463,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		await flush();
 
 		expect(fake.userMessages).toHaveLength(2);
-		expect(fake.userMessages[1]!.text).toContain('Continue the Ralph auto loop');
-		expect(fake.userMessages[1]!.text).toContain('ralph_auto');
+		expect(fake.userMessages[1]!.text).toContain('Continue the Ralph loop');
+		expect(fake.userMessages[1]!.text).toContain('ralph_todo');
 		expect(fake.userMessages[1]!.text).toContain('"next"');
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
@@ -4489,7 +4493,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 	});
 
-	test('ralph_auto next skips Goal/Findings reference entries', async () => {
+	test('ralph_todo next skips Goal/Findings reference entries', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4793,5 +4797,299 @@ describe('ralph-loop extension (auto mode)', () => {
 			expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
 			expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
 		}
+	});
+});
+
+describe('ralph-loop extension (rotateOn policy and merged tool decisions)', () => {
+	const RALPH_SINGLE = `# ralph v2
+
+T 1 - "Only task"
+`;
+
+	const GOAL_PLANNING_WITH_LIST = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+
+M list "Plan"
+`;
+
+	type Tool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
+	};
+
+	const writeConfig = (extra: Record<string, unknown> = {}) =>
+		writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, ...extra }, null, '\t')}\n`
+		);
+
+	const writeAutoConfig = (extra: Record<string, unknown> = {}) => writeConfig({ autoMode: 'on', ...extra });
+
+	const todoTool = (fake: ReturnType<typeof createFakePi>) => fake.tools.get('ralph_todo') as Tool;
+
+	// The merged backlog tool targeting the per-session auto backlog.
+	const autoTool = (fake: ReturnType<typeof createFakePi>) => {
+		const tool = todoTool(fake);
+		return {
+			execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) =>
+				tool.execute(id, { ...params, backlog: 'session' }, signal, onUpdate, ctx)
+		};
+	};
+
+	const stateEntries = (fake: ReturnType<typeof createFakePi>) =>
+		fake.entries.filter((entry) => entry.customType === 'ralph-loop-state');
+
+	beforeEach(async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_V1);
+	});
+
+	test('rotateOn is captured into the loop state at start (per-mode default when unset)', async () => {
+		// Unset: the task loop captures "task"…
+		{
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+		}
+		// …an explicit config value wins for the task loop…
+		{
+			await writeConfig({ rotateOn: 'budget' });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+		}
+		// …and the auto loop defaults to "budget".
+		{
+			await writeAutoConfig();
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+		}
+	});
+
+	test('task loop under rotateOn "budget": completing a task does not rotate; the nudge starts the next task', async () => {
+		await writeConfig({ rotateOn: 'budget' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = todoTool(fake);
+		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+		// Budget policy: the completion is progress, not a boundary.
+		expect(done.content[0]!.text).toContain('Continue with the next open task.');
+		expect(done.content[0]!.text).not.toContain('Stop working now');
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// No rotation: the same iteration continues…
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		// …and the budget nudge keeps the loop moving to the next open task.
+		expect(fake.userMessages.at(-1)!.text).toContain('Continue the Ralph loop');
+		expect(fake.userMessages.at(-1)!.text).toContain('action "next"');
+	});
+
+	test('task loop under rotateOn "budget": an exhausted backlog still stops the loop at settle', async () => {
+		await writeFile(join(dir, 'TODO.ralph'), RALPH_SINGLE);
+		await writeConfig({ rotateOn: 'budget' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = todoTool(fake);
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// Stop-on-empty is policy-independent: no nudge (no work left), loop off.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('all TODO items are complete');
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('auto loop under rotateOn "task": completing a todo rotates with a recording turn', async () => {
+		await writeAutoConfig({ rotateOn: 'task' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'Small step' }, undefined, undefined, fakeCtx.ctx);
+		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+		// Task policy: the completion ends the iteration.
+		expect(done.content[0]!.text).toContain('Stop working now');
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		// The completed todo is a rotation boundary: the recording turn is queued.
+		expect(statusLine(fakeCtx.widgets)).toContain('recording');
+		expect(fake.userMessages.at(-1)!.text).toContain('A Ralph TODO task was just completed');
+
+		// The recording turn settles; the fresh iteration starts per todo.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+		// The task-policy iteration ends at the commit.
+		expect(fake.userMessages.at(-1)!.text).toContain('stop working when the commit is made');
+	});
+
+	test('goal loop under rotateOn "budget": phase changes rotate (planning → execution → re-evaluation), completions do not', async () => {
+		await writeConfig({ rotateOn: 'budget' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(join(dir, 'GOAL.ralph'), GOAL_PLANNING_WITH_LIST);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --todo GOAL.ralph --goal', fakeCtx.ctx);
+		const tool = todoTool(fake);
+
+		// The planning iteration records the plan: the phase changes
+		// planning → execution, which rotates under the budget policy.
+		await tool.execute(
+			't',
+			{ action: 'add-many', category: 'Plan', tasks: [{ title: 'Port the routes.' }] },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		const finishUp = fake.userMessages.at(-1)!.text;
+		expect(finishUp).toContain('The goal phase changed');
+		expect(finishUp).toContain('Finish up now');
+		// Not the task-policy plan recording turn.
+		expect(finishUp).not.toContain('The Ralph plan was just updated');
+
+		// The fresh iteration is the execution iteration.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fake.userMessages.at(-1)!.text).toContain('You are executing the goal');
+
+		// Completing the last task changes the phase execution → re-evaluation:
+		// without this rotation the finished plan with context headroom would
+		// never reach the re-evaluation prompt (the stall the policy fixes).
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fake.userMessages.at(-1)!.text).toContain('This is a re-evaluation iteration');
+	});
+
+	test('D1: update rewrites a planned task in the task loop (title and body)', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = todoTool(fake);
+		const updated = await tool.execute(
+			't',
+			{ action: 'update', task: '1', title: 'Task one (revised)', body: '- replanned' },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		expect(updated.content[0]!.text).toContain('Updated task 1 "Task one (revised)"');
+		const file = await readFile(join(dir, 'TODO.ralph'), 'utf8');
+		expect(file).toContain('Task one (revised)');
+		expect(file).toContain('- replanned');
+		// The old title is gone: no duplicate was created.
+		expect(file).not.toContain('"Task one"');
+	});
+
+	test('D2: add-many records a batch in the auto loop', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		const added = await tool.execute(
+			't',
+			{ action: 'add-many', category: 'General', tasks: [{ title: 'First step' }, { title: 'Second step' }] },
+			undefined,
+			undefined,
+			fakeCtx.ctx
+		);
+		expect(added.content[0]!.text).toContain('Added 2 tasks');
+		const file = await readFile(autoFile(), 'utf8');
+		expect(file).toContain('First step');
+		expect(file).toContain('Second step');
+	});
+
+	test('D3: move reorders tasks in the auto loop', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
+		const moved = await tool.execute('t', { action: 'move', task: '2', direction: 'up' }, undefined, undefined, fakeCtx.ctx);
+		expect(moved.content[0]!.text).toContain('Moved task');
+		const file = await readFile(autoFile(), 'utf8');
+		expect(file.indexOf('Second step')).toBeLessThan(file.indexOf('First step'));
+	});
+
+	test('D4: next does not skip Goal/Findings titles on the project backlog (A-only convention)', async () => {
+		await writeFile(
+			join(dir, 'TODO.ralph'),
+			'# ralph v2\n\nT 1 - "Goal: track the big picture"\n\nT 2 - "Real work"\n'
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const tool = todoTool(fake);
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		// Project backlogs may legitimately carry such titles: they are work.
+		expect(next.content[0]!.text).toContain('Goal: track the big picture');
+	});
+
+	test('D5: idle reads default to the project backlog; backlog "session" targets the session file', async () => {
+		await writeFile(
+			autoFile(),
+			'# ralph v2\n\nM list "General"\n\nT 1 General "Session only"\n'
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const tool = todoTool(fake);
+		const project = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
+		expect(project.content[0]!.text).toContain('Task one');
+		expect(project.content[0]!.text).not.toContain('Session only');
+
+		const session = await tool.execute('t', { action: 'list', backlog: 'session' }, undefined, undefined, fakeCtx.ctx);
+		expect(session.content[0]!.text).toContain('Session only');
+		expect(session.content[0]!.text).not.toContain('Task one');
 	});
 });

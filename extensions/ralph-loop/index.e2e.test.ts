@@ -19,10 +19,10 @@ import { join, resolve } from 'node:path';
  * request log is the source of truth for what the model actually received.
  *
  * Note on trigger semantics: the extension evaluates the context threshold on
- * `message_update` (mid-turn — it steers the checkpoint into the running turn)
- * and on `agent_settled` (end of turn — it queues the checkpoint as a follow-up).
- * Every rotation first runs a dedicated progress-recording turn (context
- * checkpoint or completion record) before the fresh iteration starts. An
+ * `message_update` (mid-turn — it steers the finish-up into the running turn)
+ * and on `agent_settled` (end of turn — it queues the finish-up as a follow-up).
+ * Every rotation first runs a dedicated progress-recording turn (finish-up
+ * or completion record) before the fresh iteration starts. An
  * aborted run (Escape) always pauses the loop immediately — no re-sent
  * recording prompt, no queued rotation, no fresh iteration — until
  * `/ralph resume` continues it.
@@ -362,7 +362,7 @@ async function waitForRequestContaining(text: string, timeoutMs = 30000): Promis
 
 describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	test(
-		'context-limit: work turn above threshold checkpoints, then a fresh iteration runs with a clean context',
+		'context-limit: work turn above threshold finishes up, then a fresh iteration runs with a clean context',
 		{ timeout: 60000 },
 		async () => {
 			// pi derives the context-usage percent from the last assistant response's
@@ -370,8 +370,8 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// 20k window is 11.5%, above the 10% threshold.
 			endpoint = startMockEndpoint([
 				textResponder(`${BLOB_MARKER} work output. `.repeat(400), { prompt_tokens: 1500, completion_tokens: 800 }),
-				textResponder('Checkpoint recorded in TODO.ralph.'),
-				textResponder('Continuing from the checkpoint.')
+				textResponder('Finished up; todos recorded.'),
+				textResponder('Continuing from the recorded todos.')
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
@@ -386,11 +386,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(requestText(endpoint!.requests[0]!)).toContain('Run the Ralph loop');
 
 			// The turn settles above the threshold: the extension must deliver the
-			// durable-checkpoint prompt as the next model request.
+			// finish-up prompt as the next model request.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
-			expect(requestText(endpoint!.requests[1]!)).toContain('durable checkpoint');
+			expect(requestText(endpoint!.requests[1]!)).toContain('Finish up now');
 
-			// The checkpoint turn settles: a fresh iteration starts, and the
+			// The finish-up turn settles: a fresh iteration starts, and the
 			// context-boundary filter must keep the old work turn out of the
 			// model's context.
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
@@ -530,7 +530,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'mid-turn: crossing the threshold during a long turn steers the checkpoint in without waiting for settle',
+		'mid-turn: crossing the threshold during a long turn steers the finish-up in without waiting for settle',
 		{ timeout: 60000 },
 		async () => {
 			const scratchPath = join(projectDir, 'scratch.txt');
@@ -540,9 +540,9 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				// next response streams, i.e. mid-turn.
 				writeToolCallResponder(scratchPath, `${BLOB_MARKER} second step`, { prompt_tokens: 1500, completion_tokens: 800 }),
 				writeToolCallResponder(scratchPath, 'third step'),
-				// The model complies with the steered checkpoint and ends the turn.
-				textResponder('Checkpoint recorded in TODO.ralph.'),
-				textResponder('Continuing from the checkpoint.')
+				// The model complies with the steered finish-up and ends the turn.
+				textResponder('Finished up; todos recorded.'),
+				textResponder('Continuing from the recorded todos.')
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
@@ -552,11 +552,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 
 			await sess.prompt('/ralph start');
 
-			// The checkpoint instruction is steered into the STILL-RUNNING turn: the
+			// The finish-up instruction is steered into the STILL-RUNNING turn: the
 			// request that carries it also carries the tool result, proving it was
 			// injected mid-run rather than sent as a separate turn after settle.
-			const midTurnCheckpoint = await waitForRequestContaining('durable checkpoint');
-			expect(midTurnCheckpoint).toContain('"role":"tool"');
+			const midTurnFinishUp = await waitForRequestContaining('Finish up now');
+			expect(midTurnFinishUp).toContain('"role":"tool"');
 
 			// After the turn settles, the fresh iteration runs with a clean context.
 			const freshRequest = await waitForRequestContaining('Re-establish facts from the repository');
@@ -574,7 +574,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// iteration prompt get plain text answers so the session settles.
 			const smartFallback: ScriptedResponder = (body) => {
 				const text = lastUserText(body);
-				if (text.includes('Create a durable checkpoint now')) return textResponder('Checkpoint recorded in TODO.ralph.')(body);
+				if (text.includes('Finish up now')) return textResponder('Finished up; todos recorded.')(body);
 				if (text.includes('Run the Ralph loop')) return textResponder('Continuing from the checkpoint.')(body);
 				if (text.includes('was paused and is now resumed')) return textResponder('Continuing the interrupted iteration.')(body);
 				return endlessWork(body);
@@ -607,7 +607,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// message history, so only the last user message counts.)
 			await new Promise((r) => setTimeout(r, 2000));
 			const afterAbort = endpoint!.requests.slice(countAtAbort);
-			const continuationTexts = ['Run the Ralph loop', 'Create a durable checkpoint now', 'was paused and is now resumed'];
+			const continuationTexts = ['Run the Ralph loop', 'Finish up now', 'was paused and is now resumed'];
 			expect(afterAbort.every((r) => continuationTexts.every((t) => !lastUserText(r.body).includes(t)))).toBe(true);
 
 			// /ralph resume continues: a post-abort request is triggered by the
@@ -618,7 +618,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				() =>
 					endpoint!.requests
 						.slice(countAtAbort)
-						.some((r) => lastUserText(r.body).includes('Create a durable checkpoint now') || lastUserText(r.body).includes('was paused and is now resumed')),
+						.some((r) => lastUserText(r.body).includes('Finish up now') || lastUserText(r.body).includes('was paused and is now resumed')),
 				'post-resume request',
 				30000
 			);
@@ -790,7 +790,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
 			const finishRequest = endpoint!.requests[1]!;
 			expect(requestText(finishRequest)).toContain('Finish up now');
-			expect(requestText(finishRequest)).toContain('ralph_auto');
+			expect(requestText(finishRequest)).toContain('ralph_todo');
 
 			// The finish-up turn settles: a fresh iteration starts, and the
 			// context-boundary filter keeps the old work turn out of the model's

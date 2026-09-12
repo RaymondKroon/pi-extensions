@@ -241,3 +241,40 @@ in one deterministic step — when **compaction mode** is enabled (config
   (`fromHook`, `details.source`); with compaction mode off, no compaction is
   attempted and the finished iteration stays visible; the first iteration is
   never compacted; a gated or aborted compaction never stalls the loop.
+
+## 12. Loop consolidation: one backlog tool, one rotation policy
+
+The detailed spec is `docs/consolidation-spec.md`; the user-facing reference
+is `docs/ralph-backlog.md`. The consolidation collapsed the parallel
+task/goal/auto code paths to one loop with two orthogonal axes.
+
+- **One backlog tool: `ralph_todo`.** `ralph_auto` is deleted; the auto loop
+  uses `ralph_todo` with `backlog: "session"` (the per-session auto backlog).
+  Target resolution: omitted → active loop's backlog, else `TODO.ralph`;
+  `backlog: "project"` / `"session"` make the target explicit. Scope for
+  task-numbered actions: the active loop's category — except the auto loop,
+  which is unscoped (all lists, one global numbering). Arming rule: idle +
+  `autoMode: "on"` + session target + mutating action (`add`, `add-many`,
+  `update`, `complete`) → `setupAutoLoop()` first, then execute. `ralph_todo`
+  is pre-activated at session start when auto mode is "on" (cache-neutral
+  arming). `next` skips `Goal: `/`Findings: ` reference entries on the
+  session backlog only.
+- **One rotation policy: `rotateOn`.** Config value `"task"` | `"budget"`
+  (defaults: `"task"` for task/goal loops, `"budget"` for auto), captured
+  into `RalphState` at loop start. `"task"`: rotate after every completed
+  task (goal: also on plan growth). `"budget"`: work task after task; rotate
+  only at the context budget — plus, for the goal loop, on a **phase change**
+  (planning → execution → re-evaluation) so a finished plan with headroom
+  reaches the re-evaluation prompt instead of stalling. Stop conditions are
+  policy-independent (task: empty backlog; goal: goal done; auto: never on an
+  empty backlog). Under `"budget"` a completion that leaves open work sends a
+  continue nudge instead of rotating.
+- **Recording turns.** Two, not four: `completed-task`/`plan-updated` (task
+  policy) send the completion/plan recording prompt; `context-limit`/
+  `phase-changed` send one merged finish-up prompt (wrap up, completion log
+  entries, local commit of finished work only, record remaining work as
+  todos; the auto loop adds the findings and big-picture layers). The old
+  mid-task `contextCheckpointPrompt` is kept only for task-less goal
+  iterations (planning/re-evaluation checkpoint the goal via
+  `ralph_goal checkpoint`) and Markdown backlogs.
+- Quality bar unchanged: `bun test` in full (all suites).
