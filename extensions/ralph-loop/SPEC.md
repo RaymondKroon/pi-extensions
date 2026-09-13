@@ -335,10 +335,12 @@ with `reload: true` — reload the pi extensions at that boundary.
   boundary reload. The handler treats the reload as terminal (code after
   `await ctx.reload()` still runs from the pre-reload version).
 - **No active loop.** The tool fails with a `/ralph start` pointer — except
-  the auto-mode case: `autoMode: "on"` with open tasks in the session
-  backlog's session category arms the auto loop first (`armAutoLoop`, the
-  same explicit-action-supersedes-stop semantics as a `ralph_todo` mutation),
-  then rotates. No open tasks → clean error, nothing persisted.
+  the auto-mode case: `autoMode: "on"` arms the auto loop first (`armAutoLoop`,
+  the same explicit-action-supersedes-stop semantics as a `ralph_todo`
+  mutation), then rotates. No open tasks are required: the rotation note
+  carries the reason the fresh iteration moves on, and the recording turn
+  can record tasks for it. A corrupt backlog fails the arming (nothing
+  persisted).
 - **Guards.** A pending rotation (`rotationQueued`) or a requested stop
   (`stopRequested`) refuses the call. Each rotation costs a recording turn
   and one iteration of `maxIterations` (the tool warns on the final one).

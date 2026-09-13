@@ -221,8 +221,9 @@ recorded in the checkpoint and shown to the fresh iteration.
 Each rotation costs a recording turn and one iteration of `maxIterations`; do
 not rotate to avoid work. A pending rotation or a requested stop refuses the
 call. With no active loop it arms the auto loop first when auto mode is "on"
-and the session backlog has open tasks; otherwise it fails (start a loop with
-`/ralph start`). After calling it, stop working — the recording turn follows.
+(no open tasks required — the note carries the reason the fresh iteration
+moves on); otherwise it fails (start a loop with `/ralph start`). After
+calling it, stop working — the recording turn follows.
 
 `/ralph reload` runs the same reload flow manually (the loop state is restored
 from the session; a pending model-requested rotation continues on the

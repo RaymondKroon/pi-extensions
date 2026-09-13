@@ -1750,7 +1750,7 @@ export default function (pi: ExtensionAPI) {
 		name: ROTATE_TOOL_NAME,
 		label: 'Rotate Ralph iteration',
 		description:
-			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the rotation boundary, after the context cut. This is also how you extend yourself: extension files you write this iteration (project .pi/extensions/ in a trusted project, or the global agent directory) are loaded by that reload, so their tools and commands are available in the fresh iteration; your own tool list stays stale until the context cut, so say in note what the new capability is and how to verify it there — and (2) when you notice you are looping: repeating the same failing approach without progress. Each rotation costs a recording turn and one iteration of the maxIterations budget; do not rotate to avoid work or to stage a tool you do not need yet. With no active loop it arms the auto loop first when auto mode is "on" and the session backlog has open tasks. After calling it, stop working; the recording turn follows.',
+			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the rotation boundary, after the context cut. This is also how you extend yourself: extension files you write this iteration (project .pi/extensions/ in a trusted project, or the global agent directory) are loaded by that reload, so their tools and commands are available in the fresh iteration; your own tool list stays stale until the context cut, so say in note what the new capability is and how to verify it there — and (2) when you notice you are looping: repeating the same failing approach without progress. Each rotation costs a recording turn and one iteration of the maxIterations budget; do not rotate to avoid work or to stage a tool you do not need yet. With no active loop it arms the auto loop first when auto mode is "on" (no open tasks required: the note carries the reason the fresh iteration moves on, and the recording turn can record tasks for it). After calling it, stop working; the recording turn follows.',
 		parameters: Type.Object({
 			note: Type.String({
 				description:
@@ -1776,19 +1776,11 @@ export default function (pi: ExtensionAPI) {
 				if (config.autoMode !== 'on') {
 					throw new Error('No active Ralph loop — start one with /ralph start.');
 				}
-				const todoPath = autoTodoPath(ctx);
-				const category = autoCategoryName(ctx.sessionManager.getSessionName());
-				let open = 0;
-				try {
-					open = todoCounts(Backlog.open(todoPath).render(), category).open;
-				} catch (error) {
-					// A missing backlog has no open tasks; a corrupt or non-ralph
-					// file is surfaced (arming would fail on it anyway).
-					if (!isMissingFileError(error)) throw error;
-				}
-				if (open === 0) {
-					throw new Error(`No open tasks in the session backlog's "${category}" category — nothing to loop on.`);
-				}
+				// No open-task requirement: the rotation note carries the reason
+				// the fresh iteration should move on (e.g. verifying a new
+				// extension), and the recording turn can record tasks for it.
+				// A corrupt or non-ralph backlog is surfaced by arming (it fails
+				// on one anyway).
 				const armed = await armAutoLoop(ctx);
 				if (!armed) throw new Error('Could not arm the Ralph auto loop.');
 			}

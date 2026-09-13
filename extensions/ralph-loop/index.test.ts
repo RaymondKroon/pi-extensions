@@ -5412,22 +5412,28 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		expect(fake.userMessages.at(-1)!.text).toContain('You requested a fresh Ralph iteration because: checkpoint before a long task');
 	});
 
-	test('refuses to arm the auto loop when the session backlog has no open tasks', async () => {
+	test('arms the auto loop even when the session backlog has no open tasks: the note carries the reason', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
-		// No session backlog at all: nothing to loop on.
+		// No session backlog at all: the rotation note is what the fresh
+		// iteration moves on.
 		await rm(autoFile(), { force: true });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		await expect(rotateTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			'No open tasks in the session backlog'
-		);
-		expect(stateEntries(fake).length).toBe(0);
+		const result = await rotateTool(fake).execute('t', { note: 'verify the new extension' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Rotation queued');
+
+		const state = lastState(fake);
+		expect(state.enabled).toBe(true);
+		expect(state.mode).toBe('auto');
+		expect(state.rotationQueued).toBe(true);
+		expect(state.rotationReason).toBe('model-requested');
+		expect(fake.userMessages.at(-1)!.text).toContain('You requested a fresh Ralph iteration because: verify the new extension');
 	});
 
 	test('self-heals when the reload dispatch is a no-op: the next settle continues the rotation', async () => {
