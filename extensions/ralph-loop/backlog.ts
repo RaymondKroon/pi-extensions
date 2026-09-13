@@ -20,8 +20,11 @@
 //
 //   M <key> "<value>"                meta record (e.g. M source "TODO.md"
 //                                       tracks which files were imported)
-//   G "<title>" <status>             goal record (at most one per file);
-//                                       status is open, claimed, or done
+//   G <status>                       goal record (at most one per file);
+//                                       status is open, claimed, or done.
+//                                       (The legacy 3-token form
+//                                       G "<title>" <status> is still
+//                                       parsed; the title is dropped.)
 //   GB                               goal body block
 //   GE "<evidence>"                   goal completion evidence
 //   GC <iteration>                    goal checkpoint block
@@ -88,7 +91,8 @@ export const LEGACY_RALPH_HEADER = '# ralph v1';
 
 /** The ralph_schema marker row: identifies a SQLite file as a ralph backlog. */
 const RALPH_SCHEMA_NAME = 'ralph';
-const RALPH_SCHEMA_VERSION = 1;
+/** v1 databases carry a legacy goal title column; open() migrates them (the title becomes the body when the goal has none). */
+const RALPH_SCHEMA_VERSION = 2;
 
 /** The SQLite file header (magic) every .db file starts with. */
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0');
@@ -148,7 +152,6 @@ export type GoalStatus = 'open' | 'claimed' | 'done';
 
 /** The single goal of a goal-mode backlog (the `## Goal` section). */
 export interface Goal {
-	title: string;
 	status: GoalStatus;
 	body: string | null;
 	/** Completion evidence recorded when the goal was claimed. */
@@ -204,7 +207,6 @@ CREATE TABLE meta (
 );
 CREATE TABLE goal (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
-	title TEXT NOT NULL,
 	status TEXT NOT NULL DEFAULT 'open',
 	body TEXT,
 	evidence TEXT,
@@ -283,7 +285,19 @@ export class Backlog {
 		copyTable('tasks', ['id', 'category', 'title', 'body', 'done', 'completed_at', 'checkpoint', 'checkpoint_iteration', 'position']);
 		copyTable('completion_entries', ['id', 'task_id', 'date', 'note', 'kind', 'position']);
 		copyTable('meta', ['id', 'key', 'value', 'position']);
-		copyTable('goal', ['id', 'title', 'status', 'body', 'evidence', 'checkpoint', 'checkpoint_iteration']);
+		copyTable('goal', ['id', 'status', 'body', 'evidence', 'checkpoint', 'checkpoint_iteration']);
+		// v1 → v2: the goal's title column is dropped; a title-only goal
+		// keeps its text as the body.
+		try {
+			const legacyGoal = fileDb.prepare('SELECT title, body FROM goal WHERE id = 1').get() as
+				| { title: string; body: string | null }
+				| undefined;
+			if (legacyGoal && legacyGoal.body === null && legacyGoal.title) {
+				db.prepare('UPDATE goal SET body = ? WHERE id = 1').run(legacyGoal.title);
+			}
+		} catch {
+			// no title column (already v2)
+		}
 		return new Backlog(db);
 	}
 
@@ -517,13 +531,15 @@ export class Backlog {
 				}
 				block = { kind: 'log-note', id, ref, date, logKind, lines: [] };
 			} else if (tag === 'G') {
-				if (tokens.length !== 3) fail('goal record is: G "<title>" <status>');
-				const status = tokens[2];
+				// The legacy 3-token form (G "<title>" <status>) is still
+				// parsed; the title is dropped.
+				if (tokens.length !== 2 && tokens.length !== 3) fail('goal record is: G <status>');
+				const status = tokens[tokens.length - 1]!;
 				if (status !== 'open' && status !== 'claimed' && status !== 'done') {
 					fail(`invalid goal status "${status}" (expected open, claimed, or done)`);
 				}
 				if (db.prepare('SELECT id FROM goal WHERE id = 1').get()) fail('duplicate goal record');
-				db.prepare('INSERT INTO goal (id, title, status) VALUES (1, ?, ?)').run(tokens[1], status);
+				db.prepare('INSERT INTO goal (id, status) VALUES (1, ?)').run(status);
 			} else if (tag === 'GB') {
 				if (tokens.length !== 1) fail('goal body record is: GB');
 				const goal = db.prepare('SELECT body FROM goal WHERE id = 1').get() as { body: string | null } | undefined;
@@ -603,19 +619,28 @@ export class Backlog {
 				} catch {
 					marker = undefined; // no ralph_schema table: a foreign SQLite file
 				}
-				if (!marker || marker.version !== RALPH_SCHEMA_VERSION) {
+				if (!marker) {
 					throw new NotRalphBacklogError(path, 'no ralph schema marker');
 				}
+				if (marker.version > RALPH_SCHEMA_VERSION) {
+					throw new NotRalphBacklogError(path, `unsupported ralph schema version ${marker.version}`);
+				}
 				const backlog = Backlog.copyIntoMemory(fileDb);
-				if (file.endsWith('.ralph')) {
-					// A SQLite database under the legacy text name: move it to
-					// the .db name (best effort; the sibling fallback keeps it
-					// reachable either way).
+				if (file.endsWith('.ralph') || marker.version < RALPH_SCHEMA_VERSION) {
+					// A SQLite database under the legacy text name is moved to
+					// the .db name; an older-schema database is re-saved in
+					// place (the copy drops the legacy goal title). Best
+					// effort: on failure the file stays and is migrated on a
+					// later open.
 					try {
-						const target = Backlog.formatSibling(file);
-						if (!existsSync(target)) {
-							backlog.save(target);
-							unlinkSync(file);
+						if (marker.version < RALPH_SCHEMA_VERSION) {
+							backlog.save(file);
+						} else {
+							const target = Backlog.formatSibling(file);
+							if (!existsSync(target)) {
+								backlog.save(target);
+								unlinkSync(file);
+							}
 						}
 					} catch {
 						// keep it where it is
@@ -779,7 +804,6 @@ export class Backlog {
 		const row = this.db.prepare('SELECT * FROM goal WHERE id = 1').get() as Record<string, unknown> | undefined;
 		if (!row) return undefined;
 		return {
-			title: row.title as string,
 			status: row.status as GoalStatus,
 			body: (row.body as string | null) ?? null,
 			evidence: (row.evidence as string | null) ?? null,
@@ -826,15 +850,14 @@ export class Backlog {
 	 * status to 'open'; updating preserves the existing status, evidence,
 	 * and checkpoint (goal state changes go through the state machine).
 	 */
-	setGoal(options: { title: string; body?: string }): Goal {
-		const title = options.title.trim();
-		if (!title) throw new Error('a goal title is required');
-		const body = options.body?.trim() || null;
+	setGoal(body: string): Goal {
+		const text = body.trim();
+		if (!text) throw new Error('a goal body is required');
 		const existing = this.goal();
 		if (existing) {
-			this.db.prepare('UPDATE goal SET title = ?, body = ? WHERE id = 1').run(title, body);
+			this.db.prepare('UPDATE goal SET body = ? WHERE id = 1').run(text);
 		} else {
-			this.db.prepare('INSERT INTO goal (id, title, status, body) VALUES (?, ?, ?, ?)').run(1, title, 'open', body);
+			this.db.prepare('INSERT INTO goal (id, status, body) VALUES (1, ?, ?)').run('open', text);
 		}
 		return this.goal()!;
 	}
@@ -1160,7 +1183,7 @@ export class Backlog {
 		}
 		const goal = this.goal();
 		if (goal) {
-			out.push(`G ${quote(goal.title)} ${goal.status}`);
+			out.push(`G ${goal.status}`);
 			if (goal.body !== null && goal.body !== '') {
 				out.push('GB');
 				out.push(...indentBlock(goal.body));
@@ -1581,12 +1604,12 @@ export function formatNextTask(backlog: Backlog, task: Task, category?: string):
 }
 
 /**
- * Readable goal view for the ralph_goal "show" action: the goal's title,
+ * Readable goal view for the ralph_goal "show" action: the goal's
  * status, body, completion evidence, and checkpoint.
  */
 export function formatGoal(goal: Goal): string {
 	const lines: string[] = [];
-	lines.push(`Goal: "${goal.title}" (status: ${goal.status})`);
+	lines.push(`Goal (status: ${goal.status})`);
 	if (goal.body) {
 		lines.push('', 'Body:', goal.body.trim());
 	}

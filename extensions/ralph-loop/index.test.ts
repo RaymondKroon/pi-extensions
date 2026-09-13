@@ -450,7 +450,7 @@ describe('ralph-loop extension', () => {
 		status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph: on');
 		expect(fake.userMessages.at(-1)?.text).toContain('previous TODO item was completed');
-		expect(fake.userMessages.at(-1)?.text).toContain('only through the ralph_todo tool');
+		expect(fake.userMessages.at(-1)?.text).toContain('The backlog is accessible with the ralph_todo tool.');
 	});
 
 	test('completed-task rotation names the completed task in the recording prompt (ralph format)', async () => {
@@ -1216,7 +1216,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 
 		expect(fake.userMessages.length).toBe(1);
 		expect(fake.userMessages[0].text).toContain('ralph_todo');
-		expect(fake.userMessages[0].text).toContain('SQLite-backed');
+		expect(fake.userMessages[0].text).toContain('The backlog is accessible with the ralph_todo tool.');
 		// The counter is completed + 1: task 3 is done, so the current task is 2 of 3.
 		expect(statusLine(fakeCtx.widgets)).toContain('task: 2/3 (iteration 1)');
 	});
@@ -2099,7 +2099,7 @@ D 2
 		const { fake } = await startGoalLoop(GOAL_PLANNING);
 		const prompt = fake.userMessages[0].text;
 		expect(prompt).toContain('Run the Ralph goal loop');
-		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
+		expect(prompt).toContain('The goal (status: open):');
 		expect(prompt).toContain('Port the routes.');
 		expect(prompt).toContain('Port the state.');
 		expect(prompt).toContain('This is a planning iteration: the goal is open and the backlog has no tasks yet.');
@@ -2114,7 +2114,7 @@ D 2
 		const { fake } = await startGoalLoop(GOAL_EXECUTION);
 		const prompt = fake.userMessages[0].text;
 		expect(prompt).toContain('Run the Ralph goal loop');
-		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
+		expect(prompt).toContain('The goal (status: open):');
 		expect(prompt).toContain('You are executing the goal');
 		expect(prompt).toContain('keep the plan honest');
 		expect(prompt).toContain("add or adjust tasks to the plan's list");
@@ -2256,7 +2256,7 @@ GE "All routes render."
 
 		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
 		const shown = await run({ action: 'show' });
-		expect(shown.content[0]!.text).toContain('Goal: "Rewrite the app" (status: open)');
+		expect(shown.content[0]!.text).toContain('Goal (status: open)');
 		expect(shown.content[0]!.text).toContain('Port the routes.');
 		expect(shown.content[0]!.text).toContain('Port the state.');
 		expect(shown.content[0]!.text).not.toContain('Evidence');
@@ -2321,7 +2321,7 @@ GE "All routes render."
 		const file = () => readBacklog();
 
 		const first = await run({ action: 'checkpoint', note: 'Plan drafted; next: review the routes.' });
-		expect(first.content[0]!.text).toContain('Checkpoint recorded for the goal "Rewrite the app" (iteration 1)');
+		expect(first.content[0]!.text).toContain('Checkpoint recorded for the goal (iteration 1)');
 		let goal = file().goal()!;
 		expect(goal.checkpoint).toBe('Plan drafted; next: review the routes.');
 		expect(goal.checkpointIteration).toBe(1);
@@ -2410,7 +2410,7 @@ GE "All routes render."
 		// terminated turn.
 		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
 		expect(result.terminate).toBeUndefined();
-		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approver: auto-approved)');
+		expect(result.content[0]!.text).toContain('The goal is done (approver: auto-approved)');
 
 		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('done');
@@ -2443,7 +2443,7 @@ GE "All routes render."
 
 		const result = await run({ action: 'confirm' });
 		expect(result.terminate).toBeUndefined();
-		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approved)');
+		expect(result.content[0]!.text).toContain('The goal is done (approved)');
 
 		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('done');
@@ -3150,7 +3150,7 @@ describe('ralph-loop extension (set-goal command)', () => {
 		await fake.commands.get('ralph')!.handler(args, fakeCtx.ctx);
 	}
 
-	test('sets the goal from a file with an H1 title into the session ralph file', async () => {
+	test('sets the goal from a file; a leading H1 marker is stripped', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3158,17 +3158,16 @@ describe('ralph-loop extension (set-goal command)', () => {
 		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
 
 		const backlog = readBacklog();
-		expect(backlog.goal()?.title).toBe('Port the complete app');
 		expect(backlog.goal()?.status).toBe('open');
-		expect(backlog.goal()?.body).toBe('Port the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
+		expect(backlog.goal()?.body).toBe('Port the complete app\n\nPort the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
 		// The existing tasks are untouched.
 		expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
 		const notification = fakeCtx.notifications.at(-1)?.message ?? '';
-		expect(notification).toContain('Set goal "Port the complete app" in');
+		expect(notification).toContain('Set the goal in');
 		expect(notification).toContain('Start the goal loop with: /ralph start --goal');
 	});
 
-	test('uses the first line as the title without an H1; the body excludes the title', async () => {
+	test('the whole file is the goal without an H1', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3177,8 +3176,7 @@ describe('ralph-loop extension (set-goal command)', () => {
 		await setGoal(fake, fakeCtx, 'set-goal PLAIN.md');
 
 		const backlog = readBacklog();
-		expect(backlog.goal()?.title).toBe('Ship the thing');
-		expect(backlog.goal()?.body).toBe('Criterion one holds.\nCriterion two holds.');
+		expect(backlog.goal()?.body).toBe('Ship the thing\nCriterion one holds.\nCriterion two holds.');
 	});
 
 	test('replaces an existing open goal', async () => {
@@ -3192,8 +3190,7 @@ describe('ralph-loop extension (set-goal command)', () => {
 		await fake.commands.get('ralph')!.handler('set-goal SECOND.md', fakeCtx.ctx);
 
 		const backlog = readBacklog();
-		expect(backlog.goal()?.title).toBe('Second goal');
-		expect(backlog.goal()?.body).toBe('Second body.');
+		expect(backlog.goal()?.body).toBe('Second goal\nSecond body.');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Replaced the goal in');
 	});
 
@@ -3250,7 +3247,7 @@ D 1
 		await fake.commands.get('ralph')!.handler('set-goal GOAL.md', fakeCtx.ctx);
 
 		const backlog = readBacklog();
-		expect(backlog.goal()?.title).toBe('Port the complete app');
+		expect(backlog.goal()?.body).toBe('Port the complete app\n\nPort the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('The active task loop is unaffected.');
 	});
 

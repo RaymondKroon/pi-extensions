@@ -135,7 +135,7 @@ describe('goal', () => {
 
 M source "TODO.md"
 
-G "Rewrite the app in the new framework" open
+G open
 GB
   - Port the routes.
   - Port the state.
@@ -149,7 +149,6 @@ T 1 - "Port the routes."
 	test('round-trips a goal and render is idempotent', () => {
 		const first = Backlog.parse(GOAL_SAMPLE);
 		expect(first.goal()).toEqual({
-			title: 'Rewrite the app in the new framework',
 			status: 'open',
 			body: '- Port the routes.\n- Port the state.',
 			evidence: 'All routes render; bun test green.',
@@ -160,10 +159,19 @@ T 1 - "Port the routes."
 		expect(Backlog.parse(rendered).render()).toBe(rendered);
 		// The goal block sits between the meta records and the first task.
 		const lines = rendered.split('\n');
-		expect(lines.indexOf('G "Rewrite the app in the new framework" open'))
-			.toBeGreaterThan(lines.indexOf('M source "TODO.md"'));
-		expect(lines.indexOf('G "Rewrite the app in the new framework" open'))
-			.toBeLessThan(lines.findIndex((line) => line.startsWith('T 1 ')));
+		expect(lines.indexOf('G open')).toBeGreaterThan(lines.indexOf('M source "TODO.md"'));
+		expect(lines.indexOf('G open')).toBeLessThan(lines.findIndex((line) => line.startsWith('T 1 ')));
+	});
+
+	test('the legacy G "<title>" <status> record still parses; the title is dropped', () => {
+		const backlog = Backlog.parse('# ralph v2\n\nG "Rewrite the app" open\n');
+		expect(backlog.goal()).toEqual({
+			status: 'open',
+			body: null,
+			evidence: null,
+			checkpoint: null,
+			checkpointIteration: null
+		});
 	});
 
 	test('a file without a goal parses as before and renders no G line', () => {
@@ -174,9 +182,8 @@ T 1 - "Port the routes."
 
 	test('setGoal creates a goal with status open', () => {
 		const backlog = Backlog.parse(SAMPLE);
-		const goal = backlog.setGoal({ title: 'Ship the rewrite', body: '- Step one.' });
+		const goal = backlog.setGoal('- Step one.');
 		expect(goal).toEqual({
-			title: 'Ship the rewrite',
 			status: 'open',
 			body: '- Step one.',
 			evidence: null,
@@ -186,13 +193,12 @@ T 1 - "Port the routes."
 		expect(backlog.goal()).toEqual(goal);
 	});
 
-	test('setGoal updates title and body but preserves status, evidence, and checkpoint', () => {
+	test('setGoal updates the body but preserves status, evidence, and checkpoint', () => {
 		const backlog = Backlog.parse(GOAL_SAMPLE);
 		// Simulate a claimed goal with evidence and a checkpoint.
 		backlog.db.prepare("UPDATE goal SET status = 'claimed', evidence = 'criteria met' WHERE id = 1").run();
-		const updated = backlog.setGoal({ title: 'Ship the rewrite (v2)', body: '- Step two.' });
+		const updated = backlog.setGoal('- Step two.');
 		expect(updated).toMatchObject({
-			title: 'Ship the rewrite (v2)',
 			status: 'claimed',
 			body: '- Step two.',
 			evidence: 'criteria met',
@@ -201,9 +207,9 @@ T 1 - "Port the routes."
 		});
 	});
 
-	test('setGoal requires a non-empty title', () => {
+	test('setGoal requires a non-empty body', () => {
 		const backlog = Backlog.empty();
-		expect(() => backlog.setGoal({ title: '   ' })).toThrow(/goal title is required/);
+		expect(() => backlog.setGoal('   ')).toThrow(/goal body is required/);
 	});
 
 	test('deleteGoal removes the goal', () => {
@@ -213,12 +219,11 @@ T 1 - "Port the routes."
 		expect(backlog.render().split('\n').some((line) => /^G( |$)/.test(line))).toBe(false);
 	});
 
-	test('escapes quotes and backslashes in the goal title', () => {
+	test('round-trips a goal body with quotes and backslashes', () => {
 		const backlog = Backlog.empty();
-		backlog.setGoal({ title: 'Say "hi" \\ there' });
+		backlog.setGoal('Say "hi" \\ there');
 		const rendered = backlog.render();
-		expect(rendered).toContain('G "Say \\"hi\\" \\\\ there" open');
-		expect(Backlog.parse(rendered).goal()?.title).toBe('Say "hi" \\ there');
+		expect(Backlog.parse(rendered).goal()?.body).toBe('Say "hi" \\ there');
 	});
 
 	test('rejects goal parse errors', () => {
@@ -231,21 +236,22 @@ T 1 - "Port the routes."
 			}
 			throw new Error('expected a parse error');
 		};
-		expect(() => parse('# ralph v2\n\nG "a" open\nG "b" open\n')).toThrow(/duplicate goal record/);
-		expect(() => parse('# ralph v2\n\nG "a" pending\n')).toThrow(/invalid goal status/);
+		expect(() => parse('# ralph v2\n\nG open\nG open\n')).toThrow(/duplicate goal record/);
+		expect(() => parse('# ralph v2\n\nG pending\n')).toThrow(/invalid goal status/);
+		expect(() => parse('# ralph v2\n\nG open a b\n')).toThrow(/goal record/);
 		expect(() => parse('# ralph v2\n\nGB\n  body\n')).toThrow(/goal body before goal record/);
 		expect(() => parse('# ralph v2\n\nGE "evidence"\n')).toThrow(/goal evidence before goal record/);
 		expect(() => parse('# ralph v2\n\nGC 1\n  note\n')).toThrow(/goal checkpoint before goal record/);
-		expect(() => parse('# ralph v2\n\nG "a" open\nGB\n  one\nGB\n  two\n')).toThrow(/already has a body block/);
-		expect(() => parse('# ralph v2\n\nG "a" open\nGE "one"\nGE "two"\n')).toThrow(/already has evidence/);
-		expect(() => parse('# ralph v2\n\nG "a" open\nGC 1\n  one\nGC 2\n  two\n')).toThrow(/already has a checkpoint block/);
+		expect(() => parse('# ralph v2\n\nG open\nGB\n  one\nGB\n  two\n')).toThrow(/already has a body block/);
+		expect(() => parse('# ralph v2\n\nG open\nGE "one"\nGE "two"\n')).toThrow(/already has evidence/);
+		expect(() => parse('# ralph v2\n\nG open\nGC 1\n  one\nGC 2\n  two\n')).toThrow(/already has a checkpoint block/);
 	});
 });
 
 describe('goal state transitions', () => {
 	const withGoal = (status: 'open' | 'claimed' | 'done' = 'open'): Backlog => {
 		const backlog = Backlog.empty();
-		backlog.setGoal({ title: 'Ship the rewrite', body: '- Step one.' });
+		backlog.setGoal('Ship the rewrite.');
 		if (status !== 'open') {
 			backlog.db.prepare(`UPDATE goal SET status = '${status}' WHERE id = 1`).run();
 		}
@@ -299,11 +305,11 @@ describe('goal state transitions', () => {
 		const backlog = withGoal('open');
 		backlog.claimGoal('criteria met');
 		const rendered = backlog.render();
-		expect(rendered).toContain('G "Ship the rewrite" claimed');
+		expect(rendered).toContain('G claimed');
 		expect(rendered).toContain('GE "criteria met"');
 		const reloaded = Backlog.parse(rendered);
 		reloaded.withdrawGoal('missing piece');
-		expect(reloaded.render()).toContain('G "Ship the rewrite" open');
+		expect(reloaded.render()).toContain('G open');
 		expect(reloaded.render()).toContain('  missing piece');
 		expect(reloaded.render()).not.toContain('GE ');
 		reloaded.claimGoal('criteria met again');
@@ -1234,7 +1240,7 @@ describe('file persistence (open/save)', () => {
 
 	const populated = (): Backlog => {
 		const backlog = Backlog.parse(SAMPLE);
-		backlog.setGoal({ title: 'Ship the dossier', body: 'All criteria met.' });
+		backlog.setGoal('Ship the dossier.');
 		backlog.addSource('TODO.md');
 		return backlog;
 	};
@@ -1245,7 +1251,7 @@ describe('file persistence (open/save)', () => {
 		populated().save(path);
 		const reopened = Backlog.open(path);
 		expect(reopened.render()).toBe(populated().render());
-		expect(reopened.goal()?.title).toBe('Ship the dossier');
+		expect(reopened.goal()?.body).toBe('Ship the dossier.');
 		expect(reopened.sources()).toEqual(['TODO.md']);
 		expect(reopened.counts()).toEqual({ open: 4, total: 5, completed: 1 });
 		rmSync(dir, { recursive: true, force: true });
@@ -1397,6 +1403,69 @@ describe('file persistence (open/save)', () => {
 		const reopened = Backlog.open(dbPath);
 		expect(reopened.listTasks().map((t) => t.title)).toContain('one more');
 		expect(reopened.counts().total).toBe(6);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open migrates a v1 database: the goal title becomes the body, the title column is dropped', () => {
+		beforeEach();
+		const { Database } = require('bun:sqlite');
+		const path = join(dir, 'session.db');
+		const db = new Database(path);
+		db.exec(`
+			CREATE TABLE ralph_schema (name TEXT NOT NULL, version INTEGER NOT NULL);
+			INSERT INTO ralph_schema (name, version) VALUES ('ralph', 1);
+			CREATE TABLE tasks (
+				id INTEGER PRIMARY KEY,
+				category TEXT,
+				title TEXT NOT NULL,
+				body TEXT,
+				done INTEGER NOT NULL DEFAULT 0,
+				completed_at TEXT,
+				checkpoint TEXT,
+				checkpoint_iteration INTEGER,
+				position INTEGER NOT NULL
+			);
+			CREATE TABLE completion_entries (
+				id INTEGER PRIMARY KEY,
+				task_id INTEGER NOT NULL REFERENCES tasks(id),
+				date TEXT,
+				note TEXT NOT NULL,
+				kind TEXT NOT NULL DEFAULT 'done',
+				position INTEGER NOT NULL
+			);
+			CREATE TABLE meta (
+				id INTEGER PRIMARY KEY,
+				key TEXT NOT NULL,
+				value TEXT NOT NULL,
+				position INTEGER NOT NULL
+			);
+			CREATE TABLE goal (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				title TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'open',
+				body TEXT,
+				evidence TEXT,
+				checkpoint TEXT,
+				checkpoint_iteration INTEGER
+			);
+		`);
+		db.prepare('INSERT INTO goal (id, title, status) VALUES (1, ?, ?)').run('Ship the v1 goal', 'open');
+		db.close();
+		const migrated = Backlog.open(path);
+		expect(migrated.goal()).toEqual({
+			status: 'open',
+			body: 'Ship the v1 goal',
+			evidence: null,
+			checkpoint: null,
+			checkpointIteration: null
+		});
+		// The file is re-saved in place with the current schema.
+		const check = new Database(path);
+		const marker = check.prepare("SELECT version FROM ralph_schema WHERE name = 'ralph'").get() as { version: number };
+		const columns = (check.prepare('PRAGMA table_info(goal)').all() as Array<{ name: string }>).map((c) => c.name);
+		check.close();
+		expect(marker.version).toBe(2);
+		expect(columns).not.toContain('title');
 		rmSync(dir, { recursive: true, force: true });
 	});
 });

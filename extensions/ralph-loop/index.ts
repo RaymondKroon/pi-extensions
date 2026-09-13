@@ -644,7 +644,7 @@ function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefi
 
 /** The goal contract shown to the model in every goal-loop prompt. */
 function goalBlock(goal: Goal): string {
-	const lines = [`The goal is "${goal.title}" (status: ${goal.status}).`];
+	const lines = [`The goal (status: ${goal.status}):`];
 	if (goal.body) lines.push(goal.body.trim());
 	if (goal.checkpoint) {
 		lines.push(`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${goal.checkpoint}`);
@@ -812,7 +812,7 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 	const goalInfo = goalPhase(state);
 	if (goalInfo) {
 		const { phase, goal } = goalInfo;
-		const backlogNote = `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`;
+		const backlogNote = `The backlog is accessible with the ralph_todo tool.`;
 		const categoryScope = state.category ? ` in category "${state.category}"` : '';
 
 		if (phase === 'planning') {
@@ -844,7 +844,7 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 	const categoryScope = state.category ? ` in category "${state.category}"` : '';
 	return renderPrompt('iteration-ralph', {
 		contextNote,
-		backlogNote: `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`,
+		backlogNote: 'The backlog is accessible with the ralph_todo tool.',
 		categoryScope,
 		ralphCloseStep,
 		decisionNote
@@ -910,7 +910,7 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
 	const goalCheckpoint = goal?.checkpoint ?? null;
 	if (goalCheckpoint !== null && goalCheckpoint !== baselineGoalCheckpoint) {
 		checkpointLines.push(
-			`Goal "${goal?.title ?? ''}": checkpoint${goal?.checkpointIteration ? ` (iteration ${goal.checkpointIteration})` : ''}: ${goalCheckpoint}`
+			`Goal: checkpoint${goal?.checkpointIteration ? ` (iteration ${goal.checkpointIteration})` : ''}: ${goalCheckpoint}`
 		);
 	}
 	if (completionLines.length === 0 && checkpointLines.length === 0) return undefined;
@@ -1124,22 +1124,19 @@ function parseSetGoalArgs(args: string[]): RalphSetGoalArgs | undefined {
 }
 
 /**
- * Derive the goal record of a set-goal file: the first non-empty line is the
- * title (a leading `# ` H1 marker is stripped), the remaining lines are the
- * body (omitted when empty). Unlike goalFromBrief the body does not repeat
- * the title line, which the G record already stores.
+ * The goal text of a set-goal file: the whole file, trimmed (a leading `# `
+ * H1 marker on the first line is stripped).
  */
-function goalFromFile(text: string): { title: string; body?: string } | undefined {
+function goalFromFile(text: string): string | undefined {
 	const trimmed = text.trim();
+	if (!trimmed) return undefined;
 	const lines = trimmed.split(/\r?\n/);
-	const firstIndex = lines.findIndex((line) => line.trim() !== '');
-	if (firstIndex === -1) return undefined;
-	const firstLine = lines[firstIndex]!.trim();
-	const h1 = firstLine.match(/^#\s+(.*)$/);
-	const title = (h1?.[1] ?? firstLine).trim();
-	if (!title) return undefined;
-	const body = lines.slice(firstIndex + 1).join('\n').trim();
-	return { title, body: body || undefined };
+	// A leading H1 heading marker is stripped; the text stays the goal's
+	// first line.
+	const h1 = lines[0]!.match(/^#\s+(.*)$/);
+	if (h1) lines[0] = h1[1]!;
+	const body = lines.join('\n').trim();
+	return body || undefined;
 }
 
 interface SetGoalOutcome {
@@ -1152,7 +1149,7 @@ interface SetGoalOutcome {
  * Set the single goal of a ralph-format backlog from a goal file. The target
  * backlog is the active loop's backlog, else the session's ralph file. An
  * existing goal must be open (a claimed or done goal must be resolved first);
- * setting replaces the title and body.
+ * setting replaces the goal's body.
  */
 async function setGoalFromFile(
 	cwd: string,
@@ -1176,7 +1173,7 @@ async function setGoalFromFile(
 		return {
 			ok: false,
 			level: 'error',
-			message: `No goal in ${args.goalFile}: the first non-empty line must be a title (optionally an H1 heading)`
+			message: `No goal in ${args.goalFile}: the file must not be empty`
 		};
 	}
 	let backlog: Backlog;
@@ -1197,7 +1194,7 @@ async function setGoalFromFile(
 		return {
 			ok: false,
 			level: 'warning',
-			message: `The goal "${existing.title}" is ${existing.status} — resolve it first (confirm or withdraw a claimed goal, delete a done goal), then set the new goal`
+			message: `The goal is ${existing.status} — resolve it first (confirm or withdraw a claimed goal, delete a done goal), then set the new goal`
 		};
 	}
 	backlog.setGoal(goal);
@@ -1207,8 +1204,8 @@ async function setGoalFromFile(
 		return { ok: false, level: 'error', message: `Could not write ${outName}: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	const set = existing
-		? `Replaced the goal in ${outName}: "${existing.title}" → "${goal.title}"`
-		: `Set goal "${goal.title}" in ${outName}`;
+		? `Replaced the goal in ${outName}`
+		: `Set the goal in ${outName}`;
 	if (loopState?.enabled && loopState.todoPath === todoPath) {
 		return {
 			ok: true,
@@ -1672,7 +1669,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_enable',
 		label: 'Enable Ralph tools',
 		description:
-			'Enable the ralph_todo, ralph_goal, ralph_rotate, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable.',
+			'Enable the ralph_todo, ralph_goal, ralph_rotate, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable. Changed extension code only takes effect after a reload: with an active loop, ralph_rotate (reload: true) reloads at the rotation boundary; without a loop there is no agent-side reload — tell the user to run /reload.',
 		promptSnippet: 'Enable the Ralph tools',
 		parameters: Type.Object({}),
 		async execute() {
@@ -2240,7 +2237,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_goal',
 		label: 'Ralph goal',
 		description:
-			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else the session\'s ralph file). The goal is the user\'s contract of the goal loop: its title/body are read-only; change only its state via this tool. Actions: show (anywhere), checkpoint, complete, confirm, withdraw (the last four require the active goal loop). complete requires a full verification run of every verification command required by the goal and the backlog, with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
+			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else the session\'s ralph file). The goal is the user\'s contract of the goal loop: its body is read-only; change only its state via this tool. Actions: show (anywhere), checkpoint, complete, confirm, withdraw (the last four require the active goal loop). complete requires a full verification run of every verification command required by the goal and the backlog, with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('show'),
@@ -2287,9 +2284,9 @@ export default function (pi: ExtensionAPI) {
 						}
 						if (!params.note) throw new Error('checkpoint requires a note.');
 						if (!goal) throw new Error(`no goal in ${todoPath}`);
-						const updated = backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
+						backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
 						mutated = true;
-						output = `Checkpoint recorded for the goal "${updated.title}" (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						output = `Checkpoint recorded for the goal (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
 						break;
 					}
 					case 'complete': {
@@ -2307,23 +2304,23 @@ export default function (pi: ExtensionAPI) {
 							throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
 						}
 						const evidence = params.note.trim();
-						const claimed = backlog.claimGoal(evidence);
+						backlog.claimGoal(evidence);
 						mutated = true;
 						syncGoalState();
 						if (state.autoApproveDecisions) {
 							// Delegated approval, consistent with the decision semantics:
 							// the claim is confirmed immediately.
-							const done = backlog.confirmGoal();
+							backlog.confirmGoal();
 							syncGoalState();
-							output = `Goal "${done.title}" is done (approver: auto-approved). Stop working now; the loop records the completion.`;
+							output = `The goal is done (approver: auto-approved). Stop working now; the loop records the completion.`;
 							break;
 						}
 						// User approval gate: the goal stays claimed and the loop pauses
 						// until the user answers (the ralph_request_decision pattern).
-						const question = `Approve completion of the goal "${claimed.title}"?`;
+						const question = `Approve completion of the goal?`;
 						blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
 						terminated = true;
-						output = `Goal "${claimed.title}" is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
+						output = `The goal is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
 						break;
 					}
 					case 'confirm': {
@@ -2332,10 +2329,10 @@ export default function (pi: ExtensionAPI) {
 							throw new Error('confirm requires an active goal loop (start one with /ralph start --goal).');
 						}
 						if (!goal) throw new Error(`no goal in ${todoPath}`);
-						const done = backlog.confirmGoal();
+						backlog.confirmGoal();
 						mutated = true;
 						syncGoalState();
-						output = `Goal "${done.title}" is done (approved). Stop working now; the loop records the completion.`;
+						output = `The goal is done (approved). Stop working now; the loop records the completion.`;
 						break;
 					}
 					case 'withdraw': {
@@ -2345,10 +2342,10 @@ export default function (pi: ExtensionAPI) {
 						}
 						if (!params.note) throw new Error('withdraw requires a note describing what is missing.');
 						if (!goal) throw new Error(`no goal in ${todoPath}`);
-						const withdrawn = backlog.withdrawGoal(params.note.trim());
+						backlog.withdrawGoal(params.note.trim());
 						mutated = true;
 						syncGoalState();
-						output = `Goal "${withdrawn.title}" is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
+						output = `The goal is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
 						break;
 					}
 				}
@@ -3643,7 +3640,7 @@ export default function (pi: ExtensionAPI) {
 					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into the session\'s ralph file, merging into an existing backlog. Each source file is only imported once.' },
-				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The first non-empty line (optionally an H1 heading) is the title, the rest is the body. Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
+				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
 			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the rotation/finish-up boundary.' },
 			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested rotation continues on the reloaded code.' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },

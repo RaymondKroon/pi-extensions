@@ -6,7 +6,7 @@
 // Enter on a list opens the task view for it (Escape there returns here).
 //
 // Key convention (SPEC §8): uppercase = goal ops, lowercase = list ops.
-// A add/edit goal (form popup: title + body), D delete goal (confirm),
+// A add/edit goal (form popup: body), D delete goal (confirm),
 // S start the goal loop (confirm), O goal detail; R renames the
 // highlighted list, enter opens it, r reloads, q quits.
 //
@@ -247,21 +247,18 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 		return ok;
 	};
 
-	/** Save the goal form: apply the fields to the backlog, staying open on failure. */
+	/** Save the goal form: apply the body to the backlog, staying open on failure. */
 	const saveGoalForm = (form: FormMode) => {
-		const values = {
-			title: form.fields[0]!.input.getValue().trim(),
-			body: form.body.join('\n')
-		};
-		if (!values.title) {
-			notice = 'a goal title is required';
+		const body = form.body.join('\n');
+		if (!body.trim()) {
+			notice = 'a goal body is required';
 			options.requestRender();
 			return;
 		}
 		void (async () => {
 			let ok = false;
 			try {
-				ok = await options.mutate!(backlog, (b) => b.setGoal({ title: values.title, body: values.body }));
+				ok = await options.mutate!(backlog, (b) => b.setGoal(body));
 			} catch {
 				ok = false;
 			}
@@ -324,11 +321,12 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 			color === 'bold'
 				? theme.bold(` (${goal.status})`)
 				: theme.fg(dimmed ? 'dim' : color, ` (${goal.status})`);
-		// Word-wrap the title instead of truncating it; continuation lines
-		// align under the title start. The status suffix stays on the first
-		// line, so the wrap budget leaves room for it.
+		// Word-wrap the goal's first line instead of truncating it; continuation
+		// lines align under the text start. The status suffix stays on the
+		// first line, so the wrap budget leaves room for it.
+		const goalText = goal.body?.trim().split('\n')[0] ?? '';
 		const titleIndent = ' '.repeat(visibleWidth(prefixText));
-		const titleText = dimmed ? theme.fg('dim', `Goal: ${goal.title}`) : `Goal: ${goal.title}`;
+		const titleText = dimmed ? theme.fg('dim', `Goal: ${goalText}`) : `Goal: ${goalText}`;
 		const lines = wrapTextWithAnsi(
 			titleText,
 			Math.max(1, width - titleIndent.length - visibleWidth(statusText))
@@ -565,10 +563,11 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 				if (goal) {
 					modes.beginForm({
 						title: 'Edit goal',
-						task: { title: goal.title, body: goal.body ?? '' }
+						task: { body: goal.body ?? '' },
+						withTitle: false
 					});
 				} else {
-					modes.beginForm({ title: 'New goal' });
+					modes.beginForm({ title: 'New goal', withTitle: false });
 				}
 			} else if (data === 'D') {
 				if (!options.mutate) return;
@@ -576,7 +575,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 				if (!goal) return;
 				modes.setMode({
 					kind: 'confirm',
-					message: `Delete the goal "${goal.title}"?`,
+					message: 'Delete the goal?',
 					onYes: () => {
 						void applyMutation((b) => b.deleteGoal());
 					},

@@ -105,11 +105,11 @@ Idempotent; refuses to overwrite a non-ralph file.
 
 `ralph_goal` manages the single goal of the same backlog (the session's
 ralph file — the active loop's backlog when a loop is running). The goal is
-the user's contract: its title/body
-are read-only; only its state changes, via this tool.
+the user's contract: its body is
+read-only; only its state changes, via this tool.
 
 ### show
-Prints the goal's title, status, body, evidence, and checkpoint. Works
+Prints the goal's status, body, evidence, and checkpoint. Works
 anywhere (no active loop needed).
 
 ### checkpoint

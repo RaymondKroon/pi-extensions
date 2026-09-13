@@ -30,12 +30,11 @@ repository; the pi core is untouched.
 ### In scope
 
 - A **goal** (objective + acceptance criteria) stored in a ralph-format
-  backlog: `## Goal` section with title, status, body, evidence, checkpoint.
+  backlog: goal record with status, body, evidence, checkpoint.
 - `/ralph start --goal`: the goal loop — planning → execution →
   re-evaluation → completion.
-- `/ralph set-goal <file>`: set the backlog's goal from a file (first
-  non-empty line, optionally an H1 heading, is the title; the rest is the
-  body). Targets the active loop's backlog or the session's ralph file;
+- `/ralph set-goal <file>`: set the backlog's goal from a file (the file's
+  content is the goal; a leading H1 heading marker is stripped). Targets the active loop's backlog or the session's ralph file;
   replaces an open goal, refuses claimed/done goals.
 - A `ralph_goal` tool: `show`, `checkpoint`, `complete`, `confirm`,
   `withdraw` — separate from `ralph_todo`.
@@ -78,7 +77,7 @@ Ralph decision workflow.
   extension remaps a persisted loop state's `todoPath` (and the `/ralph`
   home view's candidates) to the existing sibling, so loops started before
   the migration keep operating on the migrated file. File states:
-  `open` → `claimed` → `done`, plus `claimed` → `open` (withdraw). `Backlog` API: `goal()`, `setGoal({title, body})`,
+  `open` → `claimed` → `done`, plus `claimed` → `open` (withdraw). `Backlog` API: `goal()`, `setGoal(body)`,
   `deleteGoal()`, `claimGoal(evidence)`, `confirmGoal()`,
   `withdrawGoal(note)`, `setGoalCheckpoint(note, iteration)`.
 - **`ralph_goal` tool** targets the active loop's backlog, else the
@@ -108,7 +107,7 @@ Ralph decision workflow.
 - **Stall:** a goal-mode turn that ends with no plan growth, no completion,
   and the goal still open stops the loop with a clear notification.
 - The loop stops when the goal is `done` in the file.
-- The model is read-only on the goal title/body; it may only change goal
+- The model is read-only on the goal body; it may only change goal
   state through `ralph_goal` with its enforced preconditions.
 - Checkpoints: task iterations checkpoint the task (existing); task-less
   iterations (planning/re-evaluation) checkpoint the goal via

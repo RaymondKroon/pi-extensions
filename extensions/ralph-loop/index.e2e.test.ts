@@ -759,7 +759,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				['Plan', 'Task two.', true]
 			]);
 			const goal = todo.goal();
-			expect(goal?.title).toBe('Ship the thing');
+			expect(goal?.body).toBe('- Criterion one holds.\n- Criterion two holds.');
 			expect(goal?.status).toBe('done');
 			expect(goal?.evidence).toBe('All acceptance criteria verified: bun test passes (5 suites).');
 		}

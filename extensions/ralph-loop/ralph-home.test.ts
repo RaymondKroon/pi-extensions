@@ -110,7 +110,7 @@ describe('home view rendering', () => {
 		const text = rendered.join('\n');
 		expect(rendered[0]).toContain('Ralph home — TODO.ralph');
 		expect(rendered[0]).toContain('3 of 3 open (0 done)');
-		expect(text).toContain('> ● Goal: Rewrite the app in the new framework (open)');
+		expect(text).toContain('> ● Goal: - Port the routes. (open)');
 		expect(text).toContain('  (all) — 3 open / 3 total');
 		expect(text).toContain('  auth — 1 open / 1 total');
 		expect(text).toContain('  dossier — 1 open / 1 total');
@@ -282,42 +282,44 @@ describe('home view goal form', () => {
 		const popup = lines().join('\n');
 		expect(popup).toContain('┌');
 		expect(popup).toContain('New goal');
-		expect(popup).toContain('Title:');
+		expect(popup).not.toContain('Title:');
 		expect(popup).toContain('Body:');
-		view.handleInput('\r'); // enter starts editing
+		view.handleInput('\r'); // enter opens the body editor
 		for (const ch of 'Ship the rewrite') view.handleInput(ch);
-		view.handleInput('\x13'); // Ctrl+S
+		view.handleInput('\x13'); // Ctrl+S saves the body and returns to the form
+		view.handleInput('\x13'); // Ctrl+S saves the form
 		await flush();
 		expect(view.mode()).toBe('browse');
 		const text = lines().join('\n');
 		expect(text).toContain('> ● Goal: Ship the rewrite (open)');
 		expect(lastBacklog()!.goal()?.status).toBe('open');
+		expect(lastBacklog()!.goal()?.body).toBe('Ship the rewrite');
 	});
 
-	test('A with a goal opens the form prefilled; editing the title saves', async () => {
+	test('A with a goal opens the form prefilled; editing the body saves', async () => {
 		const { view, lines, lastBacklog } = createHome();
 		view.handleInput('A');
 		expect(view.mode()).toBe('form');
 		const form = lines().join('\n');
 		expect(form).toContain('Edit goal');
-		expect(form).toContain('Rewrite the app in the new framework');
-		view.handleInput('\r'); // enter starts editing
+		expect(form).toContain('- Port the routes.');
+		view.handleInput('\r'); // enter opens the body editor (cursor at the end)
 		for (const ch of ' (edited)') view.handleInput(ch);
-		view.handleInput('\x13'); // Ctrl+S
+		view.handleInput('\x13'); // Ctrl+S saves the body and returns to the form
+		view.handleInput('\x13'); // Ctrl+S saves the form
 		await flush();
-		expect(lines().join('\n')).toContain('Goal: Rewrite the app in the new framework (edited)');
+		expect(lastBacklog()!.goal()?.body).toBe('- Port the routes.\n- Port the state. (edited)');
 		// Editing preserves the status and the state machine fields.
 		expect(lastBacklog()!.goal()?.status).toBe('open');
 		expect(lastBacklog()!.goal()?.evidence).toBe('All routes render; bun test green.');
 	});
 
-	test('A with an empty title refuses to save and keeps the form open', async () => {
+	test('A with an empty body refuses to save and keeps the form open', async () => {
 		const { view, lines } = createHome({ backlog: Backlog.parse(NO_GOAL_SAMPLE) });
 		view.handleInput('A');
-		view.handleInput('\r');
-		view.handleInput('\x13'); // Ctrl+S with no title
+		view.handleInput('\x13'); // Ctrl+S with no body
 		expect(view.mode()).toBe('form');
-		expect(lines().join('\n')).toContain('a goal title is required');
+		expect(lines().join('\n')).toContain('a goal body is required');
 	});
 
 	test('Esc cancels the form without changing the goal', async () => {
@@ -334,7 +336,8 @@ describe('home view goal form', () => {
 		view.handleInput('A');
 		view.handleInput('\r');
 		for (const ch of 'Nope') view.handleInput(ch);
-		view.handleInput('\x13'); // Ctrl+S
+		view.handleInput('\x13'); // Ctrl+S saves the body and returns to the form
+		view.handleInput('\x13'); // Ctrl+S saves the form
 		await flush();
 		expect(lines().join('\n')).toContain('not saved');
 		expect(lines().join('\n')).not.toContain('Goal:');
@@ -346,7 +349,7 @@ describe('home view goal confirms', () => {
 		const { view, lines, lastBacklog } = createHome();
 		view.handleInput('D');
 		expect(view.mode()).toBe('confirm');
-		expect(lines().join('\n')).toContain('Delete the goal "Rewrite the app in the new framework"?');
+		expect(lines().join('\n')).toContain('Delete the goal?');
 		view.handleInput('y');
 		await flush();
 		expect(view.mode()).toBe('browse');

@@ -225,8 +225,10 @@ export function renderModeBody(width: number, mode: Mode, theme: RalphViewTheme,
 		const labelWidth = 10;
 		const innerWidth = popupInnerWidth(width);
 		const content: string[] = [];
-		const titleField = form.fields[0]!;
-		content.push(theme.fg('dim', 'Title:').padEnd(labelWidth) + titleField.input.getValue());
+		if (form.fields.length > 0) {
+			const titleField = form.fields[0]!;
+			content.push(theme.fg('dim', 'Title:').padEnd(labelWidth) + titleField.input.getValue());
+		}
 		content.push(theme.fg('dim', 'Body:').padEnd(labelWidth));
 		const bodyIndent = '   ';
 		const editorLines = mode.editor
@@ -247,6 +249,8 @@ export interface FormInit {
 	task?: { id?: number; title?: string; body?: string | null };
 	/** Fixed list the new task is added to (never editable in the form). */
 	category?: string;
+	/** Omit the single-line Title field (the goal form is body-only). */
+	withTitle?: boolean;
 }
 
 export interface ModeControllerOptions {
@@ -325,7 +329,7 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 		mode = {
 			kind: 'form',
 			title: init.title,
-			fields: [makeFormField('Title', task?.title ?? '')],
+			fields: init.withTitle === false ? [] : [makeFormField('Title', task?.title ?? '')],
 			body: (task?.body ?? '').split('\n'),
 			focus: 0,
 			editing: false,
