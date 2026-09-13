@@ -1,6 +1,6 @@
 ---
 name: ralph-backlog
-description: Full reference for the ralph_todo and ralph_goal actions and parameters. Read before using an action you are unsure about.
+description: Full reference for the ralph_todo, ralph_goal, and ralph_rotate tools and their parameters. Read before using an action you are unsure about.
 ---
 
 # Ralph backlog reference
@@ -156,7 +156,7 @@ shows its list) — while `add` records to the session's own list by default, so
 lists you add by hand are picked up automatically. It rotates on its context
 budget by default (see Rotation policy), tells the model to finish up and
 record todos for the next iteration, and activates the auto tool set
-(`ralph_todo` + `ralph_goal`, not the full ralph tool set). The loop itself
+(`ralph_todo` + `ralph_goal` + `ralph_rotate`, not the full ralph tool set). The loop itself
 only starts via `/ralph start`.
 
 - `off`: nothing automatic; a plain `/ralph start` runs the regular task loop.
@@ -216,3 +216,30 @@ when the goal is done, the auto loop never on an empty backlog. Under
 `"budget"` the goal loop additionally rotates on a **phase change**
 (planning → execution → re-evaluation) so a finished plan with context
 headroom still reaches the re-evaluation prompt instead of stalling.
+
+## ralph_rotate (model-requested rotation)
+
+`ralph_rotate { note, reload? }` forces the rotation boundary now: a
+progress-recording (finish-up) turn runs next, then the context is cut and a
+fresh iteration continues from the backlog. `note` (required) says why — it is
+recorded in the checkpoint and shown to the fresh iteration.
+
+- **Applying a runtime change:** after changing extension code, call it with
+  `reload: true`. The extensions reload at the rotation boundary — after the
+  context cut, before the fresh iteration's first request — so the reload
+  never re-sends the finished iteration's long context, and the fresh
+  iteration runs on the new code.
+- **Breaking a loop:** when you notice you are repeating the same failing
+  approach without progress, call it with a note describing the pattern. The
+  recording turn forces an honest checkpoint of what was tried; the fresh
+  context starts without the stuck pattern.
+
+Each rotation costs a recording turn and one iteration of `maxIterations`; do
+not rotate to avoid work. A pending rotation or a requested stop refuses the
+call. With no active loop it arms the auto loop first when auto mode is "on"
+and the session backlog has open tasks; otherwise it fails (start a loop with
+`/ralph start`). After calling it, stop working — the recording turn follows.
+
+`/ralph reload` runs the same reload flow manually (the loop state is restored
+from the session; a pending model-requested rotation continues on the
+reloaded code).

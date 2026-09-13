@@ -260,7 +260,7 @@ afterEach(async () => {
 	await rm(agentDir, { recursive: true, force: true });
 });
 
-async function createRalphSession(port: number, config: Record<string, unknown>) {
+async function createRalphSession(port: number, config: Record<string, unknown>, bindings?: Record<string, unknown>) {
 	await writeFile(join(projectDir, '.pi', 'ralph-loop.json'), `${JSON.stringify(config, null, '\t')}\n`);
 
 	const loader = new DefaultResourceLoader({
@@ -318,7 +318,7 @@ async function createRalphSession(port: number, config: Record<string, unknown>)
 	// Pi's interactive/rpc modes call this during startup; a bare SDK session must
 	// bind extensions itself or they never receive session_start (and the ralph
 	// extension would never load its .pi/ralph-loop.json config).
-	await created.session.bindExtensions({});
+	await created.session.bindExtensions(bindings ?? {});
 	session = created.session;
 	return created.session;
 }
@@ -808,6 +808,80 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// The state file was created with the auto-created session category.
 			const auto = Backlog.open(join(agentDir, 'ralph', `${session!.sessionManager.getSessionId()}.db`));
 			expect(auto.createdLists()).toEqual(['General']);
+		}
+	);
+
+	test(
+		'ralph_rotate with reload: the rotation reloads the extensions at the boundary, after the context cut',
+		{ timeout: 60000 },
+		async () => {
+			endpoint = startMockEndpoint([
+				// Iteration 1: the model changes "extension code" and requests a
+				// rotation with a boundary reload.
+				toolCallResponder('ralph_rotate', { note: 'applying extension changes', reload: true }),
+				// The model reacts to the tool result and ends the turn.
+				textResponder('Rotation queued; stopping now.'),
+				// The progress-recording turn.
+				textResponder('Finished up; todos recorded.'),
+				// The fresh iteration, running on the reloaded extension code.
+				textResponder('Continuing on the reloaded code.')
+			]);
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				// Bind the reload action like pi's interactive mode does, so the
+				// dispatched /ralph reload runs the real reload flow.
+				{
+					commandContextActions: {
+						reload: async () => {
+							await session!.reload();
+						}
+					}
+				}
+			);
+			const runnerBefore = sess.extensionRunner;
+
+			await sess.prompt('/ralph start');
+
+			// Iteration 1: the mock model calls the real ralph_rotate tool.
+			await waitFor(() => (endpoint!.requests.length >= 1), 'iteration 1 request');
+			expect(requestText(endpoint!.requests[0]!)).toContain('Run the Ralph loop');
+
+			// The model reacts to the tool result; the turn settles. The
+			// extension then dispatches /ralph reload (the session is idle at
+			// settle), which runs the real reload flow: a new extension runner.
+			await waitFor(() => endpoint!.requests.length >= 2, 30000);
+			expect(requestText(endpoint!.requests[1]!)).toContain('Rotation queued');
+
+			// The recording turn runs on the old code…
+			await waitFor(() => endpoint!.requests.length >= 3, 30000);
+			const recordingRequest = endpoint!.requests[2]!;
+			expect(requestText(recordingRequest)).toContain('You requested a fresh Ralph iteration because: applying extension changes');
+			expect(requestText(recordingRequest)).toContain('Finish up now');
+
+			// …settles, the reload runs, and the RELOADED instance continues the
+			// rotation: the fresh iteration starts on the new extension code with
+			// the context cut at the boundary (the reload never re-sends the
+			// finished iteration's context).
+			await waitFor(() => endpoint!.requests.length >= 4, 30000);
+			expect(sess.extensionRunner).not.toBe(runnerBefore);
+			const freshRequest = endpoint!.requests[3]!;
+			expect(requestText(freshRequest)).toContain('requested a fresh iteration because: applying extension changes');
+			expect(requestText(freshRequest)).not.toContain('call_mock_1');
+			expect(requestText(freshRequest)).not.toContain('Finished up; todos recorded.');
+
+			// The boundary marker is recorded in the session itself.
+			await waitFor(
+				() =>
+					sess.messages.some(
+						(message) => message.role === 'custom' && (message as { customType?: string }).customType === 'ralph-loop-context-boundary'
+					),
+				'context boundary message'
+			);
 		}
 	);
 });

@@ -3023,6 +3023,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			'import',
 			'set-goal',
 			'stop',
+			'reload',
 			'status',
 			'config'
 		]);
@@ -5255,5 +5256,306 @@ describe('ralph-loop extension (global config store)', () => {
 		const note = fakeCtx.notifications.find((n) => n.message.includes('legacy Ralph config'));
 		expect(note?.message).toContain(join(dir, '.pi', 'ralph-loop.json'));
 		expect(note?.type).toBe('warning');
+	});
+});
+
+describe('ralph-loop extension (ralph_rotate tool)', () => {
+	type RotateTool = {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: unknown,
+			onUpdate: unknown,
+			ctx: unknown
+		) => Promise<{ content: Array<{ type: string; text: string }>; details?: Record<string, unknown> }>;
+	};
+
+	const rotateTool = (fake: ReturnType<typeof createFakePi>): RotateTool => {
+		const tool = fake.tools.get('ralph_rotate') as RotateTool | undefined;
+		expect(tool).toBeDefined();
+		return tool!;
+	};
+
+	const stateEntries = (fake: ReturnType<typeof createFakePi>) =>
+		fake.entries.filter((entry) => entry.customType === 'ralph-loop-state');
+
+	const lastState = (fake: ReturnType<typeof createFakePi>) =>
+		stateEntries(fake).at(-1)!.data as Record<string, unknown>;
+
+	// Simulate the reloaded extension instance: a fresh fake whose session
+	// branch carries the state entries persisted by the pre-reload instance.
+	const reloadedInstance = (
+		fake: ReturnType<typeof createFakePi>,
+		carriedEntries: Array<{ type: string; customType: string; data: unknown }>
+	) => {
+		const next = createFakePi();
+		extension(next.pi as never);
+		const nextCtx = createFakeCtx(dir);
+		for (const entry of carriedEntries) {
+			if (entry.customType === 'ralph-loop-state' || entry.customType === 'ralph-loop-config') {
+				nextCtx.branchEntries.push(entry);
+			}
+		}
+		return { fake: next, fakeCtx: nextCtx };
+	};
+
+	beforeEach(async () => {
+		await writeFile(autoFile(), RALPH_V1);
+	});
+
+	test('queues a model-requested rotation with a finish-up recording prompt', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const result = await rotateTool(fake).execute('t', { note: 'stuck: repeating the same failing fix' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Rotation queued');
+		expect(result.content[0]!.text).toContain('Stop working now');
+
+		// The recording prompt is the finish-up, carrying the note.
+		const prompt = fake.userMessages.at(-1)!.text;
+		expect(prompt).toContain('You requested a fresh Ralph iteration because: stuck: repeating the same failing fix');
+		expect(prompt).toContain('Finish up now');
+		expect(prompt).toContain('iteration 1 of 10');
+
+		// The rotation state is durable with the note.
+		const state = lastState(fake);
+		expect(state.rotationQueued).toBe(true);
+		expect(state.rotationReason).toBe('model-requested');
+		expect(state.rotationCheckpointing).toBe(true);
+		expect(state.rotationNote).toBe('stuck: repeating the same failing fix');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+	});
+
+	test('requires a note', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await expect(rotateTool(fake).execute('t', { note: '  ' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'A rotation note is required'
+		);
+	});
+
+	test('refuses without an active loop when auto mode is off', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		await expect(rotateTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'No active Ralph loop — start one with /ralph start.'
+		);
+		// Nothing was persisted.
+		expect(stateEntries(fake).length).toBe(0);
+	});
+
+	test('refuses when a rotation is already pending', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// A context-limit rotation is pending (recording turn queued).
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(lastState(fake).rotationQueued).toBe(true);
+
+		await expect(rotateTool(fake).execute('t', { note: 'again' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'A rotation is already pending'
+		);
+	});
+
+	test('refuses when a stop is requested', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// A non-idle stop requests a stop after the current iteration.
+		fakeCtx.idle.value = false;
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		expect(lastState(fake).stopRequested).toBe(true);
+
+		await expect(rotateTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'stopping after the current iteration'
+		);
+	});
+
+	test('the recording turn settles into the fresh iteration without a reload when reload is not requested', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await rotateTool(fake).execute('t', { note: 'stuck pattern' }, undefined, undefined, fakeCtx.ctx);
+
+		// The recording turn settles: the fresh iteration starts directly.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.userMessages.some((m) => m.text === '/ralph reload')).toBe(false);
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+		const iteration = fake.userMessages.at(-1)!.text;
+		expect(iteration).toContain('requested a fresh iteration because: stuck pattern');
+		expect(iteration).toContain('do not repeat what the recorded checkpoint lists as already tried');
+		// The reload flag never leaked into the fresh iteration's state.
+		expect(lastState(fake).reloadRequested).toBeUndefined();
+	});
+
+	test('reload: the recording turn settles into a /ralph reload dispatch, and the reloaded instance continues the rotation', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const result = await rotateTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('extensions reload at the boundary');
+		expect(lastState(fake).reloadRequested).toBe(true);
+
+		// The recording turn settles: instead of starting the fresh iteration,
+		// the extension dispatches the reload command (the session is idle at
+		// settle) and leaves the durable "iteration pending" marker.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		const reloadMessage = fake.userMessages.at(-1)!;
+		expect(reloadMessage.text).toBe('/ralph reload');
+		expect(reloadMessage.options).toEqual({ expandPromptTemplates: true });
+		// No fresh iteration yet: no boundary marker, no iteration prompt.
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(false);
+		const pending = lastState(fake);
+		expect(pending.rotationQueued).toBe(true);
+		expect(pending.rotationCheckpointing).toBe(false);
+		expect(pending.reloadRequested).toBe(true);
+
+		// The reloaded instance restores the state and continues the rotation
+		// on the new code: compaction + boundary + fresh iteration prompt.
+		const { fake: reloaded, fakeCtx: reloadedCtx } = reloadedInstance(fake, fake.entries);
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'reload' });
+		await flush();
+
+		expect(reloaded.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+		const iteration = reloaded.userMessages.at(-1)!.text;
+		expect(iteration).toContain('requested a fresh iteration because: applying extension changes');
+		// The reload flag was consumed by this rotation.
+		expect(lastState(reloaded).reloadRequested).toBeUndefined();
+		expect(statusLine(reloadedCtx.widgets)).toContain('iteration 2/10');
+	});
+
+	test('arms the auto loop and rotates when auto mode is on and the session backlog has open tasks', async () => {
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+		);
+		await writeFile(autoFile(), '# ralph v2\n\nM list "General"\n\nT 1 General "Task one"\n');
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		// The rotate tool is pre-activated with the auto tool set.
+		expect(fake.activeTools).toContain('ralph_rotate');
+
+		const result = await rotateTool(fake).execute('t', { note: 'checkpoint before a long task' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Rotation queued');
+
+		// The auto loop is armed (session category, iteration 1) and the
+		// model-requested rotation is pending on top of it.
+		const state = lastState(fake);
+		expect(state.enabled).toBe(true);
+		expect(state.mode).toBe('auto');
+		expect(state.category).toBe('General');
+		expect(state.rotationQueued).toBe(true);
+		expect(state.rotationReason).toBe('model-requested');
+		expect(fake.userMessages.at(-1)!.text).toContain('You requested a fresh Ralph iteration because: checkpoint before a long task');
+	});
+
+	test('refuses to arm the auto loop when the session backlog has no open tasks', async () => {
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+		);
+		// No session backlog at all: nothing to loop on.
+		await rm(autoFile(), { force: true });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		await expect(rotateTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'No open tasks in the session backlog'
+		);
+		expect(stateEntries(fake).length).toBe(0);
+	});
+
+	test('self-heals when the reload dispatch is a no-op: the next settle continues the rotation', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await rotateTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
+
+		// The recording turn settles: the reload is dispatched (a no-op in a bare
+		// SDK session without a bound reload action) and the durable marker stays.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)?.text).toBe('/ralph reload');
+		expect(lastState(fake).rotationQueued).toBe(true);
+		expect(lastState(fake).rotationCheckpointing).toBe(false);
+
+		// No reloaded session_start arrives. The next settle sees the
+		// "iteration pending" state and continues the rotation on the current
+		// code instead of stalling.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+		expect(fake.userMessages.at(-1)?.text).toContain('requested a fresh iteration because: applying extension changes');
+		expect(lastState(fake).reloadRequested).toBeUndefined();
+	});
+
+	test('a stop clears the pending reload flag', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await rotateTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
+		expect(lastState(fake).reloadRequested).toBe(true);
+
+		// A force stop drops the pending rotation and its reload.
+		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
+		const state = lastState(fake);
+		expect(state.enabled).toBe(false);
+		expect(state.reloadRequested).toBeUndefined();
+	});
+
+	test('/ralph reload runs the reload flow and treats it as terminal', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		let reloads = 0;
+		(fakeCtx.ctx as { reload?: () => Promise<void> }).reload = async () => {
+			reloads += 1;
+		};
+		await fake.commands.get('ralph')!.handler('reload', fakeCtx.ctx);
+		expect(reloads).toBe(1);
+	});
+
+	test('the status shows the model-requested finish-up phase', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await rotateTool(fake).execute('t', { note: 'stuck pattern' }, undefined, undefined, fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+
+		// /ralph status names the phase.
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('finishing up before the requested fresh iteration');
 	});
 });

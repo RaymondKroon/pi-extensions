@@ -93,17 +93,19 @@ function rotateOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): 'tas
 	if (config.rotateOn === 'task' || config.rotateOn === 'budget') return config.rotateOn;
 	return mode === 'auto' ? 'budget' : 'task';
 }
+/** The rotation tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a rotation — and arm the auto loop — even while no loop is active yet. */
+const ROTATE_TOOL_NAME = 'ralph_rotate';
 /** Tools activated additively (defer_loading) by ralph_enable or /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
-const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision'];
+const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision', ROTATE_TOOL_NAME];
 /** The backlog tool name. With auto mode "on" the auto tool set is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
 const TODO_TOOL_NAME = 'ralph_todo';
 const GOAL_TOOL_NAME = 'ralph_goal';
-/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool plus the goal tool — the auto loop's big-picture layer is the backlog's goal. */
-const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, GOAL_TOOL_NAME];
+/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool plus the goal tool — the auto loop's big-picture layer is the backlog's goal — plus the rotation tool, so a model-requested rotation (and its boundary reload) is possible from a plain auto-mode session. */
+const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, GOAL_TOOL_NAME, ROTATE_TOOL_NAME];
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
-type RotationReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit';
+type RotationReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested';
 
 interface RalphConfig {
 	/**
@@ -180,6 +182,10 @@ interface RalphState {
 	category?: string;
 	/** Task numbers that flipped to done for the pending completed-task rotation. */
 	completedTasks?: string[];
+	/** Why the model requested the pending model-requested rotation; carried into the recording prompt and the fresh iteration's prompt. */
+	rotationNote?: string;
+	/** Queue an extension reload at the pending rotation boundary: after the recording turn and the context cut, before the fresh iteration's first request. */
+	reloadRequested?: boolean;
 }
 
 function isRalphState(value: unknown): value is RalphState {
@@ -202,7 +208,10 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.rotationReason === undefined ||
 			state.rotationReason === 'completed-task' ||
 			state.rotationReason === 'plan-updated' ||
-			state.rotationReason === 'context-limit') &&
+			state.rotationReason === 'context-limit' ||
+			state.rotationReason === 'model-requested') &&
+		(state.rotationNote === undefined || typeof state.rotationNote === 'string') &&
+		(state.reloadRequested === undefined || typeof state.reloadRequested === 'boolean') &&
 		(state.rotationCheckpointing === undefined || typeof state.rotationCheckpointing === 'boolean') &&
 		(state.stopRequested === undefined || typeof state.stopRequested === 'boolean') &&
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
@@ -724,6 +733,8 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 		const contextNote =
 			reason === 'context-limit'
 				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. The backlog also carries "Findings: " entries with what the previous iteration learned, and DEBUG.md at the project root may carry durable debug findings — read them before starting work instead of rediscovering what they already establish.'
+				: reason === 'model-requested'
+				? `The previous iteration requested a fresh iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat what the recorded checkpoint lists as already tried.`
 			: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
 		// From the second iteration on, the backlog also carries the big-picture
 		// layer (the backlog's goal, maintained via ralph_goal) and the findings
@@ -768,6 +779,8 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 					? 'The plan was just updated with new tasks. Start the next independent iteration with a clean review of the repository and the updated plan.'
 				: reason === 'phase-changed'
 						? 'The goal phase changed. Start the next independent iteration with a clean review of the repository and the backlog.'
+					: reason === 'model-requested'
+							? `The previous iteration requested a fresh iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat what the recorded checkpoint lists as already tried.`
 						: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
 	// Closing step per rotation policy: under "task" the commit ends the
 	// iteration (the loop rotates and starts a fresh one); under "budget" the
@@ -933,13 +946,15 @@ function recordingPromptFor(state: RalphState): string {
 		? completionRecordingPrompt(state)
 		: state.rotationReason === 'plan-updated'
 			? planRecordingPrompt()
+			: state.rotationReason === 'model-requested'
+				? finishUpPrompt(state, 'model-requested')
 			: state.rotationReason === 'phase-changed'
 				? finishUpPrompt(state, 'phase-changed')
-				: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
-					? contextCheckpointPrompt(state)
-					: isRalphBacklog(state.baselineTodo)
-						? finishUpPrompt(state, 'context-limit')
-						: contextCheckpointPrompt(state);
+			: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
+				? contextCheckpointPrompt(state)
+			: isRalphBacklog(state.baselineTodo)
+				? finishUpPrompt(state, 'context-limit')
+				: contextCheckpointPrompt(state);
 }
 
 function contextCheckpointPrompt(state: RalphState): string {
@@ -982,7 +997,7 @@ function contextCheckpointPromptBody(state: RalphState): string {
  * iteration on, keeps the big picture in the backlog's goal (maintained via
  * ralph_goal). The settled turn starts the fresh iteration.
  */
-function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-changed'): string {
+function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-changed' | 'model-requested'): string {
 	const isAuto = state.mode === 'auto';
 	// The auto loop records its todos in the session category; the other loops
 	// in their scoped category (or the work's own category when unscoped).
@@ -999,6 +1014,8 @@ function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-chan
 	const opening =
 		reason === 'phase-changed'
 			? 'The goal phase changed. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
+			: reason === 'model-requested'
+				? `You requested a fresh Ralph iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
 			: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
 	return `${automatedPrefix()}${renderPrompt('finish-up', {
 		opening,
@@ -1634,6 +1651,8 @@ export default function (pi: ExtensionAPI) {
 			rotationQueued: false,
 			rotationReason: undefined,
 			rotationCheckpointing: false,
+			rotationNote: undefined,
+			reloadRequested: undefined,
 			stopRequested: false,
 			blocked: false,
 			blockedItem: undefined
@@ -1651,6 +1670,10 @@ export default function (pi: ExtensionAPI) {
 			rotationQueued: false,
 			rotationReason: undefined,
 			rotationCheckpointing: false,
+			rotationNote: undefined,
+			// A dropped rotation must not leave a stale reload flag that a later,
+			// unrelated rotation would pick up.
+			reloadRequested: undefined,
 			blocked: true,
 			blockedItem: question
 		});
@@ -1664,7 +1687,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_enable',
 		label: 'Enable Ralph tools',
 		description:
-			'Enable the ralph_todo, ralph_goal, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable.',
+			'Enable the ralph_todo, ralph_goal, ralph_rotate, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable.',
 		promptSnippet: 'Enable the Ralph tools',
 		parameters: Type.Object({}),
 		async execute() {
@@ -1748,6 +1771,84 @@ export default function (pi: ExtensionAPI) {
 					}
 				],
 				details: {}
+			};
+		}
+	});
+
+	// Force the rotation boundary now: a progress-recording turn runs next
+	// (finish-up: commit finished work, record the remaining work), then the
+	// context is cut and a fresh iteration continues from the backlog. Two
+	// model-driven uses: (1) after changing extension/runtime code — with
+	// reload: true the extensions reload at the boundary, AFTER the context
+	// cut, so the reload never re-sends the finished iteration's long context
+	// and the fresh iteration runs on the new code; (2) an escape hatch when
+	// the model notices it is looping (repeating the same failing approach):
+	// the recording turn forces an honest checkpoint of what was tried, and
+	// the fresh context starts without the stuck pattern.
+	pi.registerTool({
+		name: ROTATE_TOOL_NAME,
+		label: 'Rotate Ralph iteration',
+		description:
+			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the rotation boundary, after the context cut — and (2) when you notice you are looping: repeating the same failing approach without progress. Each rotation costs a recording turn and one iteration of the maxIterations budget; do not rotate to avoid work. With no active loop it arms the auto loop first when auto mode is "on" and the session backlog has open tasks. After calling it, stop working; the recording turn follows.',
+		parameters: Type.Object({
+			note: Type.String({
+				description:
+					'Why the fresh iteration is requested (e.g. the stuck pattern being broken, or the runtime change being applied). Recorded in the checkpoint and shown to the fresh iteration.'
+			}),
+			reload: Type.Optional(
+				Type.Boolean({
+					description:
+						'Reload extensions, skills, prompts, and themes at the rotation boundary (after the context cut, before the fresh iteration starts). Use after changing extension code.'
+				})
+			)
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const note = params.note.trim();
+			if (!note) throw new Error('A rotation note is required: why the fresh iteration is requested.');
+			const reload = params.reload === true;
+			if (!state?.enabled) {
+				// No active loop: fail — except the auto-mode case. Auto mode "on"
+				// with open tasks in the session backlog arms the auto loop first,
+				// the same explicit-action-supersedes-stop semantics as a
+				// ralph_todo mutation (an explicit /ralph stop only suspends the
+				// automatic context-budget intercept).
+				if (config.autoMode !== 'on') {
+					throw new Error('No active Ralph loop — start one with /ralph start.');
+				}
+				const todoPath = autoTodoPath(ctx);
+				const category = autoCategoryName(ctx.sessionManager.getSessionName());
+				let open = 0;
+				try {
+					open = todoCounts(Backlog.open(todoPath).render(), category).open;
+				} catch (error) {
+					// A missing backlog has no open tasks; a corrupt or non-ralph
+					// file is surfaced (arming would fail on it anyway).
+					if (!isMissingFileError(error)) throw error;
+				}
+				if (open === 0) {
+					throw new Error(`No open tasks in the session backlog's "${category}" category — nothing to loop on.`);
+				}
+				const armed = await armAutoLoop(ctx);
+				if (!armed) throw new Error('Could not arm the Ralph auto loop.');
+			}
+			if (!state) throw new Error('No active Ralph loop — start one with /ralph start.');
+			if (state.rotationQueued) throw new Error('A rotation is already pending; it runs when the current turn ends.');
+			if (state.stopRequested) throw new Error('The loop is stopping after the current iteration; stop working instead of rotating.');
+			const lastIteration = state.iteration + 1 > state.maxIterations;
+			// The note and the reload flag ride on the state the rotation persists:
+			// queueRotation spreads the current state into its rotation entry.
+			persistState({ ...state, rotationNote: note, reloadRequested: reload });
+			queueRotation(ctx, 'model-requested');
+			updateStatus(ctx);
+			ctx.ui.notify(`Ralph rotation requested: ${note}`, 'info');
+			return {
+				content: [
+					{
+						type: 'text',
+						text: `Rotation queued${reload ? ' (extensions reload at the boundary, after the context cut)' : ''}. Stop working now; the progress-recording turn follows.${lastIteration ? ' This is the final iteration: the loop stops after the rotation.' : ''}`
+					}
+				],
+				details: { note, reload }
 			};
 		}
 	});
@@ -2351,7 +2452,13 @@ export default function (pi: ExtensionAPI) {
 					taskNumber: currentTaskNumber(taskCount.current),
 					rotationQueued: false,
 					rotationReason: undefined,
-					rotationCheckpointing: false
+					rotationCheckpointing: false,
+					// The reload (if any) is dispatched at this rotation boundary;
+					// the flag must not leak into a later, unrelated rotation.
+					// (rotationNote is kept: it is descriptive, only read while the
+					// model-requested reason is active, and overwritten by the next
+					// model-requested rotation.)
+					reloadRequested: undefined
 				};
 				if (next.iteration > next.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after reaching the maximum of ${next.maxIterations} iterations`);
@@ -2869,6 +2976,17 @@ export default function (pi: ExtensionAPI) {
 				if (next) queueRotation(ctx, 'context-limit');
 			}
 		}
+		// A model-requested rotation with reload: the recording turn ran in the
+		// pre-reload instance, which dispatched /ralph reload instead of starting
+		// the fresh iteration (durable marker: rotationQueued without
+		// rotationCheckpointing). Continue the rotation on the reloaded code: the
+		// compaction (when enabled) and the fresh iteration now run with the new
+		// extension code, and the context is cut before the first post-reload
+		// request, so the reload never re-sends the finished iteration's long
+		// context.
+		if (state?.enabled && state.rotationQueued && !state.rotationCheckpointing) {
+			startFreshIteration(ctx);
+		}
 		updateStatus(ctx);
 		syncToolActivation();
 	});
@@ -3068,10 +3186,29 @@ export default function (pi: ExtensionAPI) {
 			if (state.rotationCheckpointing) {
 				if (state.stopRequested) {
 					stopLoop(ctx, 'Ralph loop stopped after recording progress');
+				} else if (state.reloadRequested) {
+					// Model-requested reload: the recording turn has run, but the
+					// fresh iteration must start on the RELOADED code with the cut
+					// context — reloading now would pay the finished iteration's
+					// long context with a cold prefix. Persist the durable
+					// "recording done, iteration pending" marker (rotationQueued
+					// without rotationCheckpointing) and dispatch the reload command
+					// (the session is idle at settle, so it runs now): the reloaded
+					// instance's session_start continues the rotation (compaction +
+					// fresh iteration) on the new code. Treat the reload as terminal:
+					// this instance is stale after it.
+					persistState({ ...state, rotationCheckpointing: false });
+					await pi.sendUserMessage('/ralph reload', { expandPromptTemplates: true });
 				} else {
 					persistState({ ...state, rotationCheckpointing: false });
 					startFreshIteration(ctx);
 				}
+			} else {
+				// "Iteration pending" without a checkpoint: the reload dispatch was
+				// a no-op (e.g. a bare SDK session without a bound reload action)
+				// and no reloaded session_start will continue the rotation —
+				// continue it on the current code instead of stalling.
+				startFreshIteration(ctx);
 			}
 			return;
 		}
@@ -3525,7 +3662,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand('ralph', {
-		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|reload|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
@@ -3535,7 +3672,8 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into the session\'s ralph file, merging into an existing backlog. Each source file is only imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The first non-empty line (optionally an H1 heading) is the title, the rest is the body. Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
-				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the rotation/finish-up boundary.' },
+			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the rotation/finish-up boundary.' },
+			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested rotation continues on the reloaded code.' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
 				{ value: 'config', label: 'config', description: 'Configure fresh-context rotation and decision approval.' }
 			];
@@ -3610,6 +3748,8 @@ export default function (pi: ExtensionAPI) {
 							? `${loopName} is committing the updated plan`
 							: state.rotationReason === 'phase-changed'
 								? `${loopName} is finishing up after the goal phase change`
+								: state.rotationReason === 'model-requested'
+								? `${loopName} is finishing up before the requested fresh iteration`
 								: `${loopName} is finishing up and recording todos for the next iteration`
 									: state.stopRequested
 										? `${loopName} will stop after the current iteration`
@@ -3620,12 +3760,12 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'status', 'config'];
+			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'status', 'config', 'reload'];
 			if (command !== '' && !knownCommands.includes(command)) {
 				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
 					ctx.ui.notify(
-						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|status|config]`,
+						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|status|config|reload]`,
 						'error'
 					);
 					return;
@@ -3635,10 +3775,20 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === '') {
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|status|config] (in TUI: bare /ralph opens the home view)', 'warning');
+					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|status|config|reload] (in TUI: bare /ralph opens the home view)', 'warning');
 					return;
 				}
 				await openHome(ctx);
+				return;
+			}
+			if (command === 'reload') {
+				// The reload entrypoint: manual use and the queued reload of a
+				// model-requested rotation (ralph_rotate with reload: true). ctx.reload()
+				// runs the /reload flow (session_shutdown, extension/resource reload,
+				// session_start with reason "reload"); the loop state is restored from
+				// the session entries. Treat the reload as terminal — code after it
+				// still runs from the pre-reload version.
+				await ctx.reload();
 				return;
 			}
 			if (command === 'set-goal') {

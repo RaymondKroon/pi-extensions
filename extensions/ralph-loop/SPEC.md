@@ -280,7 +280,7 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   which is unscoped (all lists, one global numbering). Arming rule: idle +
   `autoMode: "on"` + mutating action (`add`, `add-many`,
   `update`, `complete`) → `setupAutoLoop()` first, then execute. The auto tool
-  set (`ralph_todo` + `ralph_goal`) is pre-activated at session start when
+  set (`ralph_todo` + `ralph_goal` + `ralph_rotate`) is pre-activated at session start when
   auto mode is "on" (cache-neutral arming). `next` skips `Findings: `
   reference entries (the session backlog is the only backlog).
 - **The auto loop's big picture is the backlog's goal.** The auto loop
@@ -311,3 +311,52 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   iterations (planning/re-evaluation checkpoint the goal via
   `ralph_goal checkpoint`) and Markdown backlogs.
 - Quality bar unchanged: `bun test` in full (all suites).
+
+## 13. Model-requested rotations and boundary reloads (`ralph_rotate`)
+
+A `ralph_rotate` tool lets the model force the rotation boundary now, and —
+with `reload: true` — reload the pi extensions at that boundary.
+
+- **Tool: `ralph_rotate { note: string, reload?: boolean }`.** `note` is
+  required (why: the stuck pattern being broken, or the runtime change being
+  applied); it is carried into the recording prompt and the fresh iteration's
+  prompt. Part of `RALPH_TOOL_NAMES` and of `AUTO_TOOL_NAMES` (pre-activated
+  at session start in auto mode, so it is callable before a loop is armed —
+  activation stays at session start, keeping arming cache-neutral).
+- **Two model-driven uses.** (1) After changing extension/runtime code:
+  `reload: true` queues the extension reload at the rotation boundary. (2)
+  An escape hatch when the model notices it is looping (repeating the same
+  failing approach): the finish-up recording turn forces an honest checkpoint
+  of what was tried, and the fresh context starts without the stuck pattern.
+- **The reload lands after the context cut.** The rotation runs the
+  progress-recording turn first; when it settles with `reloadRequested`, the
+  settle handler persists the durable "recording done, iteration pending"
+  marker (`rotationQueued` without `rotationCheckpointing`) and dispatches
+  `/ralph reload` (the session is idle at settle, so the command runs now).
+  The reloaded instance's `session_start` sees the marker and continues the
+  rotation (`startFreshIteration`: compaction when enabled, boundary marker,
+  fresh iteration prompt) on the new code. The first post-reload model
+  request is the fresh iteration's — small, boundary-sliced context — so the
+  reload never re-sends the finished iteration's long context with a cold
+  prefix. Without `reload`, the settle handler starts the fresh iteration
+  directly, as before.
+- **`/ralph reload` subcommand.** The `ctx.reload()` entrypoint (the same
+  flow as `/reload`); manual use plus the dispatch target of the queued
+  boundary reload. The handler treats the reload as terminal (code after
+  `await ctx.reload()` still runs from the pre-reload version).
+- **No active loop.** The tool fails with a `/ralph start` pointer — except
+  the auto-mode case: `autoMode: "on"` with open tasks in the session
+  backlog's session category arms the auto loop first (`armAutoLoop`, the
+  same explicit-action-supersedes-stop semantics as a `ralph_todo` mutation),
+  then rotates. No open tasks → clean error, nothing persisted.
+- **Guards.** A pending rotation (`rotationQueued`) or a requested stop
+  (`stopRequested`) refuses the call. Each rotation costs a recording turn
+  and one iteration of `maxIterations` (the tool warns on the final one).
+  `stopLoop` and `blockLoop` clear the pending `reloadRequested` flag so a
+  dropped rotation cannot leak a reload into a later, unrelated rotation.
+- **State.** `RalphState` gains `rotationNote?` (descriptive; only read while
+  the `model-requested` reason is active) and `reloadRequested?` (action
+  flag; cleared by `startFreshIteration` when the rotation runs). The
+  `model-requested` rotation reuses the finish-up recording prompt (new
+  opening carrying the note) and the existing settle → `startFreshIteration`
+  path; the fresh iteration prompt gets a `model-requested` context note.
