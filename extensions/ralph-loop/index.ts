@@ -1054,9 +1054,9 @@ function completionRecordingPromptBody(state: RalphState): string {
 
 /**
  * Sent as the dedicated recording turn before a fresh iteration after the goal
- * plan grew: the plan update must be committed locally before the next
- * iteration starts, but no completion log entry is written because no task
- * was completed in the turn.
+ * plan grew: the current task's progress is checkpointed (no commit: the
+ * backlog is durable outside the repo), but no completion log entry is written
+ * because no task was completed in the turn.
  */
 function planRecordingPrompt(): string {
 	return `${automatedPrefix()}${renderPrompt('plan-recording', {})}`;
@@ -3292,7 +3292,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Goal mode: under "task" a grown plan (new open tasks, no
-			// completions) is a progress boundary that rotates with a commit-only
+			// completions) is a progress boundary that rotates with a checkpoint-only
 			// recording turn; under "budget" the model keeps working on the new
 			// tasks in the same iteration, and only a phase change (planning →
 			// execution → re-evaluation) rotates — without it a finished plan with

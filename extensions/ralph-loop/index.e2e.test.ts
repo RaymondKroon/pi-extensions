@@ -644,8 +644,8 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 					'call_plan'
 				),
 				textResponder('Plan recorded: two tasks added.'),
-				// Plan-updated recording turn (commit-only).
-				textResponder('Plan committed.'),
+				// Plan-updated recording turn (checkpoint-only).
+				textResponder('Task checkpointed.'),
 				// Iteration 2 (execution): complete task 1 via the real tool.
 				toolCallResponder('ralph_todo', { action: 'complete', task: '1' }, 'call_task1'),
 				textResponder('Task one complete.'),
@@ -696,7 +696,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
 			expect(requestText(endpoint!.requests[2]!)).toContain('add-many');
 
-			// The grown plan triggers a plan-updated rotation with a commit-only
+			// The grown plan triggers a plan-updated rotation with a checkpoint-only
 			// recording turn (no completion log: no task was completed).
 			await waitFor(() => endpoint!.requests.length >= 4, 30000);
 			expect(requestText(endpoint!.requests[3]!)).toContain('The Ralph plan was just updated');
@@ -707,7 +707,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			let fresh = requestText(endpoint!.requests[4]!);
 			expect(fresh).toContain('You are executing the goal');
 			expect(fresh).toContain('The plan was just updated with new tasks.');
-			expect(fresh).not.toContain('Plan committed.');
+			expect(fresh).not.toContain('Task checkpointed.');
 
 			// Iteration 2 completes task 1 via the real tool.
 			await waitFor(() => endpoint!.requests.length >= 6, 30000);

@@ -2549,14 +2549,14 @@ T 2 - "Port the state."
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// A commit-only recording turn runs before the fresh iteration: the plan
-		// update is committed, but no completion log entry is written.
+		// A checkpoint-only recording turn runs before the fresh iteration:
+		// the current task's progress is checkpointed, but no completion log
+		// entry is written.
 		let status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (goal): recording');
 		const recordingPrompt = fake.userMessages.at(-1)?.text ?? '';
 		expect(recordingPrompt).toContain('plan was just updated');
-		expect(recordingPrompt).toContain('Check git status');
-		expect(recordingPrompt).toContain('Do not push');
+		expect(recordingPrompt).toContain('action "checkpoint"');
 		expect(recordingPrompt).toContain('Do not add a completion log entry');
 		expect(recordingPrompt).toContain('Do not start work on the new tasks');
 		expect(recordingPrompt).not.toContain('action "log"');
