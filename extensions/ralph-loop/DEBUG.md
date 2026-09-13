@@ -85,3 +85,29 @@ environment quirks. Organized by topic.
   Rationale: trust-the-model minify style per the task-13 feedback, pushed
   further by the user.
   Evidence: the user's replies in this session's decision pauses.
+- Approval record (task 17, 2026-09-13): the user approved the minified
+  `prompts/iteration-ralph.md` via the ralph_request_decision pause, with one
+  refinement over the proposal: use bullet items ('-') instead of numbered
+  steps. Final steps (bullets): (1) "Call ralph_todo with action \"next\" to
+  get the next open task{{categoryScope}}" (2) "Add focused tests and run
+  every quality command required by the backlog." (3) "Only after all
+  acceptance criteria pass, complete the task with a concise note. The note
+  becomes the completion log entry." Dropped vs the original: "its number,
+  body, and checkpoint" + the wider-backlog clause from step 1; step 2 ("Do
+  not work on a later task") → the `categoryGuard` var is removed from the
+  renderPrompt call; step 3 ("one coherent vertical slice"); from step 5 the
+  ralph_todo action mechanics, the note-content list, "— the single
+  completion record — so do not call action 'log' separately", and the
+  restated "Do not edit {{todoPath}} directly" guard (already in the backlog
+  note) → the `todoPath` var is also removed from the renderPrompt call.
+  Kept: "Run the Ralph loop for this repository" (index.test.ts, e2e) and
+  "completion log" (tests assert it). Code: `ralphCloseStep = closeStep('-',
+  …)` (bullet) for iteration-ralph; iteration-goal-execution keeps its
+  user-chosen numbers and gets its own `closeStep('4', …)` (fixing the 6→4
+  inconsistency from task 16); iteration-markdown keeps `closeStep('6', …)`.
+  Approver: the user.
+  Rationale: trust-the-model minify style per the task-13 feedback, plus the
+  user's bullet refinement.
+  Evidence: the user's reply in this session's decision pause ("Approve, but
+  just use bullet items ('-') instead of numbers"); bun test and the commit
+  "ralph: minify iteration-ralph prompt (user-approved)".

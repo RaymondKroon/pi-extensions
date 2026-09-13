@@ -798,10 +798,13 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 		state.rotateOn === 'task'
 			? `${number}. ${commitText} This is the last step of the iteration: stop working when the commit is made.`
 			: `${number}. ${commitText} After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.`;
-	const ralphCloseStep = closeStep(
-		'6',
-		`Commit the completed task locally in a single commit. Do not push.`
-	);
+	const commitText = `Commit the completed task locally in a single commit. Do not push.`;
+	// The closing step is a bullet in the ralph prompt (bullet steps), numbered
+	// to follow the prompt's own steps in the goal-execution (4) and markdown (6)
+	// prompts.
+	const ralphCloseStep = closeStep('-', commitText);
+	const goalCloseStep = closeStep('4', commitText);
+	const markdownCloseStep = closeStep('6', commitText);
 
 	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
 
@@ -834,7 +837,7 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 				backlogNote,
 				goalBlock: goalBlock(goal),
 				categoryScope,
-				ralphCloseStep,
+				goalCloseStep,
 				decisionNote
 			});
 		}
@@ -843,9 +846,7 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 		return renderPrompt('iteration-ralph', {
 			contextNote,
 			backlogNote: `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`,
-			todoPath: state.todoPath,
 			categoryScope,
-			categoryGuard: state.category ? ' or on a task in another category' : '',
 			ralphCloseStep,
 			decisionNote
 		});
@@ -854,7 +855,7 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 	return renderPrompt('iteration-markdown', {
 		contextNote,
 		todoPath: state.todoPath,
-		ralphCloseStep,
+		markdownCloseStep,
 		decisionNote
 	});
 }
