@@ -1010,8 +1010,6 @@ function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-chan
 			: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
 	return `${automatedPrefix()}${renderPrompt('finish-up', {
 		opening,
-		iteration: String(state.iteration),
-		maxIterations: String(state.maxIterations),
 		categoryClause,
 		findings
 	})}`;

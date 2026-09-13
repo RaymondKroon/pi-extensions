@@ -385,8 +385,8 @@ describe('ralph-loop extension', () => {
 		// The loop must queue the finish-up turn and say so in the status bar.
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
-		// The finish-up label must carry the actual iteration number, not a placeholder.
-		expect(fake.userMessages.at(-1)?.text).toContain('iteration 1 of 10');
+		// The finish-up status line must carry the actual iteration number, not a placeholder.
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 		expect(fake.userMessages.at(-1)?.text).toContain('action "add"');
 		// Stale todos are fixed in place: no duplicates accumulate.
 		expect(fake.userMessages.at(-1)?.text).toContain('instead of adding a duplicate');
@@ -4022,7 +4022,6 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 		const prompt = fake.userMessages.at(-1)!.text;
 		expect(prompt).toContain('Finish up now');
-		expect(prompt).toContain('iteration 1 of 10');
 		expect(prompt).toContain('ralph_todo');
 		expect(prompt).toContain('action "add"');
 		expect(prompt).toContain('General');
@@ -4061,12 +4060,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		let finish = fake.userMessages.at(-1)!.text;
 		expect(finish).toContain('OK to leave the code in a bad state');
-		// The finish-up commits completed work (never pushes) but never broken
-		// or half-done work: the handoff is the backlog, git the checkpoint.
-		expect(finish).toContain('commit');
-		expect(finish).toContain('do not commit broken or half-done work');
 		// The handoff logs the iteration's findings for the next round.
-		expect(finish).toContain('Findings: ');
 		expect(finish).toContain('rediscover from scratch');
 		// The auto loop has no goal layer.
 		expect(finish).not.toContain('ralph_goal');
@@ -4093,9 +4087,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		finish = fake.userMessages.at(-1)!.text;
-		expect(finish).toContain('iteration 2 of 10');
 		expect(finish).not.toContain('ralph_goal');
-		expect(finish).toContain('Findings: ');
 		expect(finish).toContain('OK to leave the code in a bad state');
 	});
 
@@ -5283,7 +5275,6 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const prompt = fake.userMessages.at(-1)!.text;
 		expect(prompt).toContain('You requested a fresh Ralph iteration because: stuck: repeating the same failing fix');
 		expect(prompt).toContain('Finish up now');
-		expect(prompt).toContain('iteration 1 of 10');
 
 		// The rotation state is durable with the note.
 		const state = lastState(fake);

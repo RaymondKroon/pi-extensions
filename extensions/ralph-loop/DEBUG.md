@@ -33,3 +33,13 @@ environment quirks. Organized by topic.
   (before / after / where used) and STOP — do not complete the task or commit
   until the user approves in chat. Task 10 was completed without that pause
   (user feedback 2026-09-13); tasks 11–19 must present-then-wait.
+- Minify style per user feedback (2026-09-13, task 13): trust the model even
+  more aggressively than the first proposals did —
+  - No iteration counter ("This is iteration N of M") in finish-up.md.
+  - Committing completed work and completion log entries belong to task
+    completion (the iteration prompt + ralph_todo "complete"), not to the
+    finish-up prompt — do not restate them there.
+  - finish-up-findings.md is literally just: "Log what a fresh iteration
+    would otherwise rediscover from scratch."
+  - Apply the same restraint to the remaining minify tasks (14–19): drop
+    anything already established elsewhere or obvious to the model.

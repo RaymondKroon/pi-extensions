@@ -1,1 +1,1 @@
-4. Log what a fresh iteration would otherwise rediscover from scratch — root causes, failed approaches, environment quirks, key code locations — as ralph_todo "add" entries: title "Findings: <short summary>", body as markdown bullets, one per coherent cluster, skip trivialities. Lasting findings also go to DEBUG.md at the project root.
+Log what a fresh iteration would otherwise rediscover from scratch.
