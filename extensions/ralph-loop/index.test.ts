@@ -582,7 +582,7 @@ describe('ralph-loop extension', () => {
 		})) as { action: string; text: string } | undefined;
 		expect(fake.userMessages.length).toBe(1);
 		expect(transform?.action).toBe('transform');
-		expect(transform?.text).toContain('was interrupted and is now resumed');
+		expect(transform?.text).toContain('resumed the interrupted loop');
 		expect(transform?.text).toContain('focus on the parser first');
 	});
 
@@ -636,7 +636,7 @@ describe('ralph-loop extension', () => {
 		})) as { action: string; text: string } | undefined;
 		expect(fake.userMessages.length).toBe(before);
 		expect(transform?.action).toBe('transform');
-		expect(transform?.text).toContain('was interrupted and is now resumed');
+		expect(transform?.text).toContain('resumed the interrupted loop');
 		expect(transform?.text).toContain('add a test for the parser');
 		// The loop is unpaused: the hint widget is gone.
 		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
