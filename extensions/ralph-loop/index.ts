@@ -1771,16 +1771,16 @@ export default function (pi: ExtensionAPI) {
 		name: ROTATE_TOOL_NAME,
 		label: 'Rotate Ralph iteration',
 		description:
-			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the rotation boundary, after the context cut — and (2) when you notice you are looping: repeating the same failing approach without progress. Each rotation costs a recording turn and one iteration of the maxIterations budget; do not rotate to avoid work. With no active loop it arms the auto loop first when auto mode is "on" and the session backlog has open tasks. After calling it, stop working; the recording turn follows.',
+			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the rotation boundary, after the context cut. This is also how you extend yourself: extension files you write this iteration (project .pi/extensions/ in a trusted project, or the global agent directory) are loaded by that reload, so their tools and commands are available in the fresh iteration; your own tool list stays stale until the context cut, so say in note what the new capability is and how to verify it there — and (2) when you notice you are looping: repeating the same failing approach without progress. Each rotation costs a recording turn and one iteration of the maxIterations budget; do not rotate to avoid work or to stage a tool you do not need yet. With no active loop it arms the auto loop first when auto mode is "on" and the session backlog has open tasks. After calling it, stop working; the recording turn follows.',
 		parameters: Type.Object({
 			note: Type.String({
 				description:
-					'Why the fresh iteration is requested (e.g. the stuck pattern being broken, or the runtime change being applied). Recorded in the checkpoint and shown to the fresh iteration.'
+					'Why the fresh iteration is requested (e.g. the stuck pattern being broken, the runtime change being applied, or the new extension to verify). Recorded in the checkpoint and shown to the fresh iteration.'
 			}),
 			reload: Type.Optional(
 				Type.Boolean({
 					description:
-						'Reload extensions, skills, prompts, and themes at the rotation boundary (after the context cut, before the fresh iteration starts). Use after changing extension code.'
+						'Reload extensions, skills, prompts, and themes at the rotation boundary (after the context cut, before the fresh iteration starts). Use after changing or adding extension code — new tools and commands are available in the fresh iteration.'
 				})
 			)
 		}),
