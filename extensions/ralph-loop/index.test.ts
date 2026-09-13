@@ -2016,7 +2016,7 @@ GB
 
 		// Approve: the user decision is resolved, then confirm flips the goal to done.
 		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
+		await resolve.execute('t', { resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
 		await run({ action: 'confirm' });
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
 		expect(statusLine(fakeCtx.widgets)).toContain('goal: done');
@@ -2038,7 +2038,7 @@ GB
 		// Claim, then the user rejects: withdraw returns the goal to open.
 		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
 		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { recordPath: 'docs/decisions/goal.md', resolution: 'Goal rejected' }, undefined, undefined, fakeCtx.ctx);
+		await resolve.execute('t', { resolution: 'Goal rejected' }, undefined, undefined, fakeCtx.ctx);
 		await run({ action: 'withdraw', note: 'The new framework migration is missing.' });
 
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
@@ -2564,7 +2564,7 @@ T 2 - "Port the state."
 		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
 		await resolve.execute(
 			't',
-			{ recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' },
+			{ resolution: 'Goal approved' },
 			undefined,
 			undefined,
 			fakeCtx.ctx
@@ -2687,7 +2687,7 @@ T 2 - "Port the state."
 		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
 		await resolve.execute(
 			't',
-			{ recordPath: 'docs/decisions/goal.md', resolution: 'Goal approved' },
+			{ resolution: 'Goal approved' },
 			undefined,
 			undefined,
 			fakeCtx.ctx

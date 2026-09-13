@@ -666,7 +666,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				// The user approves in chat; the input is transformed into the decision context.
 				toolCallResponder(
 					'ralph_resolve_decision',
-					{ recordPath: 'docs/decisions/goal-approval.md', resolution: 'User approved completion of the goal.' },
+					{ resolution: 'User approved completion of the goal.' },
 					'call_resolve'
 				),
 				// Approved: confirm the claim -> goal done.

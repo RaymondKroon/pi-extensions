@@ -797,17 +797,16 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 	// Closing step per rotation policy: under "task" the commit ends the
 	// iteration (the loop rotates and starts a fresh one); under "budget" the
 	// model keeps working task after task until the context budget.
-	const closeStep = (number: string, commitText: string) =>
+	const closeStep = (commitText: string) =>
 		state.rotateOn === 'task'
-			? `${number}. ${commitText} This is the last step of the iteration: stop working when the commit is made.`
-			: `${number}. ${commitText} After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.`;
+			? `- ${commitText} This is the last step of the iteration: stop working when the commit is made.`
+			: `- ${commitText} After committing, immediately go back to the first step and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.`;
 	const commitText = `Commit the completed task locally in a single commit. Do not push.`;
-	// The closing step is a bullet in the ralph prompt (bullet steps), numbered
-	// to follow the prompt's own steps in the goal-execution (4) prompt.
-	const ralphCloseStep = closeStep('-', commitText);
-	const goalCloseStep = closeStep('4', commitText);
+	// The closing step is a bullet in every iteration prompt (bullet steps).
+	const ralphCloseStep = closeStep(commitText);
+	const goalCloseStep = closeStep(commitText);
 
-	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
+	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, call the ralph_request_decision tool with one precise question. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution and then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, then call ralph_resolve_decision with a concise resolution and continue the blocked work.'}`;
 
 	const goalInfo = goalPhase(state);
 	if (goalInfo) {
@@ -1710,25 +1709,23 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'ralph_resolve_decision',
 		label: 'Resolve Ralph decision',
-		description: 'Resume the blocked Ralph loop after the user decision is documented. Call it only after the user answered and the decision (approver, rationale, evidence) is recorded in versioned documentation.',
+		description: 'Resume the blocked Ralph loop after the user decision is clear.',
 		parameters: Type.Object({
-			recordPath: Type.String({ description: 'Path of the decision record.' }),
 			resolution: Type.String({ description: 'The agreed decision.' })
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state?.enabled) throw new Error('Ralph is not active.');
 			if (!state.blocked) throw new Error('Ralph has no pending decision to resolve.');
-			const recordPath = params.recordPath.trim();
 			const resolution = params.resolution.trim();
-			if (!recordPath || !resolution) throw new Error('Both recordPath and resolution are required.');
+			if (!resolution) throw new Error('resolution is required.');
 			persistState({ ...state, blocked: false, blockedItem: undefined });
 			updateStatus(ctx);
-			ctx.ui.notify(`Ralph decision recorded in ${recordPath}; continuing.`, 'info');
+			ctx.ui.notify('Ralph decision resolved; continuing.', 'info');
 			return {
 				content: [
 					{
 						type: 'text',
-						text: `Decision resolved: ${resolution}\nRecorded in: ${recordPath}\nRalph is unblocked. Continue the previously blocked work now.`
+						text: `Decision resolved: ${resolution}\nRalph is unblocked. Continue the previously blocked work now.`
 					}
 				],
 				details: {}
@@ -2291,7 +2288,7 @@ export default function (pi: ExtensionAPI) {
 						const question = `Approve completion of the goal?`;
 						blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
 						terminated = true;
-						output = `The goal is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision with the record path, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
+						output = `The goal is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
 						break;
 					}
 					case 'confirm': {
@@ -3040,7 +3037,7 @@ export default function (pi: ExtensionAPI) {
 			const question = state.blockedItem ?? 'the pending Ralph decision';
 			return {
 				action: 'transform',
-				text: `Ralph is paused in this session pending this decision:\n${question}\n\nThe user replied:\n${event.text}\n\nWork with the user to make the decision precise. Do not resume implementation yet. If more information or a different choice is needed, explain the exact remaining question and call ralph_request_decision again. Once the answer is sufficient, record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation; update a related TODO decision item only for audit purposes, never to unblock Ralph; then call ralph_resolve_decision with the documentation path and a concise resolution. That tool unblocks the session, after which continue the previously blocked work.`
+				text: `Ralph is paused in this session pending this decision:\n${question}\n\nThe user replied:\n${event.text}\n\nWork with the user to make the decision precise. Do not resume implementation yet. If more information or a different choice is needed, explain the exact remaining question and call ralph_request_decision again. Once the answer is sufficient, then call ralph_resolve_decision with a concise resolution. That tool unblocks the session, after which continue the previously blocked work.`
 			};
 		}
 
