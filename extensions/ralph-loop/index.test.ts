@@ -485,6 +485,70 @@ describe('ralph-loop extension', () => {
 		expect(prompt).toContain('no completion log entry yet');
 	});
 
+	test('completed-task rotation identifies completions by timestamp when the model renumbers the backlog', async () => {
+		// Task one is already done at baseline. The model completes task two,
+		// then rewrites the file by hand with renumbered ids, so task two's new
+		// id points at a slot that was done at baseline — the id diff alone can
+		// no longer name it; its completion timestamp can.
+		await writeFile(
+			autoFile(),
+			`# ralph v2
+
+T 1 - "Task one"
+D 1 2026-01-01T00:00:00Z
+
+T 2 - "Task two"
+
+T 3 - "Task three"
+`
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// Completion timestamps are second-granular: cross a second boundary so
+		// the completion lands in a strictly later second than the baseline.
+		const baselineSecond = Math.floor(Date.now() / 1000);
+		while (Math.floor(Date.now() / 1000) === baselineSecond) await new Promise((resolve) => setTimeout(resolve, 50));
+
+		const tool = fake.tools.get('ralph_todo') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<unknown>;
+		};
+		await tool.execute('t', { action: 'complete', task: '2' }, undefined, undefined, fakeCtx.ctx);
+		const completedAt = readBacklog().listTasks().find((task) => task.title === 'Task two')!.completedAt!;
+
+		// The model rewrites the file by hand with renumbered ids: task two now
+		// occupies the id slot that was done at baseline.
+		await writeFile(
+			autoFile(),
+			`# ralph v2
+
+T 1 - "Task two"
+D 1 ${completedAt}
+
+T 2 - "Task three"
+
+T 3 - "Task one"
+D 3 2026-01-01T00:00:00Z
+`
+		);
+
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		// The recording prompt names the completed task by its new position, and
+		// does not name the pre-existing completion.
+		const prompt = fake.userMessages.at(-1)?.text ?? '';
+		expect(prompt).toContain('was just completed: task 1');
+	});
+
 	test('mid-turn: crossing the threshold during streaming steers the checkpoint into the running turn', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);

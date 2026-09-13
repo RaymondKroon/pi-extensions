@@ -158,6 +158,8 @@ interface RalphState {
 	/** Backlog snapshot at the start of the current loop (never rotated). */
 	loopStartTodo: string;
 	baselineTodo: string;
+	/** Epoch ms when baselineTodo was taken; attributes completions to the current iteration. */
+	baselineTime: number;
 	/** 1-based count of Ralph iterations started in this session. */
 	iteration: number;
 	/** 1-based count of iterations spent on the current TODO task. */
@@ -198,6 +200,7 @@ function isRalphState(value: unknown): value is RalphState {
 		typeof state.todoPath === 'string' &&
 		(state.loopStartTodo === undefined || typeof state.loopStartTodo === 'string') &&
 		typeof state.baselineTodo === 'string' &&
+		(state.baselineTime === undefined || typeof state.baselineTime === 'number') &&
 		(state.iteration === undefined || (typeof state.iteration === 'number' && state.iteration >= 1)) &&
 		(state.taskIteration === undefined || (typeof state.taskIteration === 'number' && state.taskIteration >= 1)) &&
 		(state.taskNumber === undefined || (typeof state.taskNumber === 'number' && state.taskNumber >= 1)) &&
@@ -235,6 +238,7 @@ function normalizeState(state: RalphState): RalphState {
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 		loopStartTodo: state.loopStartTodo ?? state.baselineTodo,
+		baselineTime: state.baselineTime ?? Date.now(),
 		rotationCheckpointing: state.rotationCheckpointing ?? false,
 		stopRequested: state.stopRequested ?? false,
 		paused: state.paused ?? false,
@@ -500,20 +504,50 @@ function hasCompletedTodoItem(previousTodo: string, currentTodo: string, categor
 }
 
 /**
- * Identify the tasks that flipped from open to completed between two snapshots
- * of a ralph-format backlog, addressed by their position number in the newer
- * snapshot. Returns undefined for non-ralph formats or parse failures so
- * callers can fall back to the generic identification wording.
+ * Identify the tasks completed during the current iteration of a ralph-format
+ * backlog, addressed by their position number in the current snapshot. A task
+ * counts when its completion timestamp falls in a strictly later second than
+ * the iteration baseline (robust to task ids changing when the file is
+ * rewritten), or — no timestamp, or same second as the baseline — when it
+ * flipped from open to done against the baseline snapshot. A completion
+ * timestamp in a strictly earlier second proves the task was done before this
+ * iteration. Returns undefined when the current snapshot is not ralph format,
+ * cannot be parsed, or names no task.
  */
-function completedTaskNumbers(previousTodo: string, currentTodo: string, category?: string): string[] | undefined {
-	if (!isRalphBacklog(previousTodo) || !isRalphBacklog(currentTodo)) return undefined;
+function completedTaskNumbers(
+	previousTodo: string,
+	currentTodo: string,
+	category: string | undefined,
+	baselineTime: number | undefined
+): string[] | undefined {
+	if (!isRalphBacklog(currentTodo)) return undefined;
 	try {
-		const previousDone = new Map(Backlog.parse(previousTodo).listTasks().map((task) => [task.id, task.done]));
 		const current = Backlog.parse(currentTodo);
+		let previousDone: Map<number, boolean> | undefined;
+		if (isRalphBacklog(previousTodo)) {
+			try {
+				previousDone = new Map(Backlog.parse(previousTodo).listTasks().map((task) => [task.id, task.done]));
+			} catch {
+				previousDone = undefined;
+			}
+		}
 		const numbers = current.taskNumbers(category);
 		const completed = current
 			.listTasks(category)
-			.filter((task) => task.done && previousDone.get(task.id) !== true)
+			.filter((task) => {
+				if (!task.done) return false;
+				const wasOpenAtBaseline = previousDone !== undefined && previousDone.get(task.id) !== true;
+				if (task.completedAt !== null && baselineTime !== undefined) {
+					const completedAt = Date.parse(task.completedAt);
+					// Completion timestamps are second-granular: only a strictly
+					// later second proves this iteration, and only a strictly
+					// earlier second proves an earlier one; a same-second
+					// timestamp is ambiguous and the baseline diff decides.
+					if (completedAt > baselineTime) return true;
+					if (completedAt < Math.floor(baselineTime / 1000) * 1000) return false;
+				}
+				return wasOpenAtBaseline;
+			})
 			.map((task) => numbers.get(task.id))
 			.filter((number): number is string => number !== undefined);
 		return completed.length > 0 ? completed : undefined;
@@ -1042,13 +1076,24 @@ function completionRecordingPromptBody(state: RalphState): string {
 		const singular = numbers.length === 1;
 		const target = singular ? `task ${numbers[0]}` : `tasks ${numbers.join(', ')}`;
 		return renderPrompt('completion-recording', {
+			targetIntro: `: ${target}`,
 			target,
 			taskRef: singular ? 'the task' : 'a task',
 			entryWord: singular ? 'entry' : 'entry per task',
 			reportWord: singular ? 'entry' : 'entries'
 		});
 	}
-	return renderPrompt('completion-recording-identify', {});
+	// Degenerate case: neither the completion timestamps nor the baseline diff
+	// named the task (e.g. a hand-written completion record without a timestamp
+	// while task ids shifted). The model completed the task in the previous
+	// turn, so it knows which one.
+	return renderPrompt('completion-recording', {
+		targetIntro: '',
+		target: 'the task you just completed',
+		taskRef: 'the task',
+		entryWord: 'entry',
+		reportWord: 'entry'
+	});
 }
 
 /**
@@ -2446,6 +2491,7 @@ export default function (pi: ExtensionAPI) {
 				const next: RalphState = {
 					...state,
 					baselineTodo: currentTodo,
+					baselineTime: Date.now(),
 					iteration: state.iteration + 1,
 					taskIteration: taskChanged ? 1 : state.taskIteration + 1,
 					taskNumber: currentTaskNumber(taskCount.current),
@@ -2601,6 +2647,7 @@ export default function (pi: ExtensionAPI) {
 				todoPath,
 				loopStartTodo: rendered,
 				baselineTodo: rendered,
+				baselineTime: Date.now(),
 				iteration: 1,
 				taskIteration: 1,
 				taskNumber: currentTaskNumber(taskCount.current),
@@ -2745,6 +2792,7 @@ export default function (pi: ExtensionAPI) {
 				todoPath,
 				loopStartTodo: baselineTodo,
 				baselineTodo,
+				baselineTime: Date.now(),
 				iteration: 1,
 				taskIteration: 1,
 				taskNumber: currentTaskNumber(taskCount.current),
@@ -2797,10 +2845,11 @@ export default function (pi: ExtensionAPI) {
 
 		// For completed-task rotations, name the completed task(s) in the
 		// recording prompt instead of making the model re-read the backlog to
-		// find them: the diff against the baseline already identifies them.
+		// find them: completion timestamps (with the baseline diff for records
+		// without one) already identify them.
 		const completedTasks =
 			reason === 'completed-task' && options?.currentTodo
-				? completedTaskNumbers(state.baselineTodo, options.currentTodo, countCategory(state))
+				? completedTaskNumbers(state.baselineTodo, options.currentTodo, countCategory(state), state.baselineTime)
 				: undefined;
 
 		persistState({
