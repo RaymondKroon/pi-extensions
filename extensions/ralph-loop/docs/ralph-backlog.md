@@ -26,9 +26,8 @@ list** (one global numbering, each task shows its list).
 Compact view of the first open task. Prefer it over `list` when you only need
 the next task. Reference entries (titles starting
 with `Findings: `) are not work items and are skipped; when only reference
-entries remain open, the result says so and lists them. (The big-picture
-objective is the backlog's goal, not a `Goal: ` task — `next` never skips a
-`Goal: ` title.)
+entries remain open, the result says so and lists them. (The larger objective
+is not a `Goal: ` task — `next` never skips a `Goal: ` title.)
 
 ### list
 Compact by default: counts, per-list counts, and open tasks.
@@ -113,19 +112,9 @@ are read-only; only its state changes, via this tool.
 Prints the goal's title, status, body, evidence, and checkpoint. Works
 anywhere (no active loop needed).
 
-### set
-Auto loop only. Creates or replaces the goal (`title`, optional `body` as
-markdown bullets). In the auto loop the goal is the model-maintained
-big picture — the larger objective the work serves — not a user contract,
-so the model may rewrite it. In the goal loop the goal is the user's
-contract and `set` is refused (set it with `/ralph set-goal` or the `/ralph`
-home view).
-
 ### checkpoint
-Goal or auto loop. Replaces the single goal checkpoint — the durable state
-of task-less planning/re-evaluation iterations (goal loop), or progress
-toward the big picture (auto loop, where the model keeps working). Requires
-`note`.
+Goal loop only. Replaces the single goal checkpoint — the durable state of
+task-less planning/re-evaluation iterations. Requires `note`.
 
 ### complete
 Goal loop only. Requires the goal `open` and no open tasks. `note` is the
@@ -143,9 +132,7 @@ becomes the goal checkpoint.
 ## Auto mode
 
 The **auto loop** (the "Auto mode" setting in `/ralph config`: off / on) runs
-through the per-session ralph file with `ralph_todo` and keeps its big picture
-in the backlog's **goal** via
-`ralph_goal`. It stores its state in a per-session file in the `ralph`
+through the per-session ralph file with `ralph_todo`. It stores its state in a per-session file in the `ralph`
 directory of pi's global agent directory (`<session-id>.db`, like sessions
 in its `sessions` directory) and uses one session category per session, named
 after the pi session when it has a name (e.g. `Fix-login-flow`, spaces become
@@ -156,7 +143,7 @@ shows its list) — while `add` records to the session's own list by default, so
 lists you add by hand are picked up automatically. It rotates on its context
 budget by default (see Rotation policy), tells the model to finish up and
 record todos for the next iteration, and activates the auto tool set
-(`ralph_todo` + `ralph_goal` + `ralph_rotate`, not the full ralph tool set). The loop itself
+(`ralph_todo` + `ralph_rotate`, not the full ralph tool set). The loop itself
 only starts via `/ralph start`.
 
 - `off`: nothing automatic; a plain `/ralph start` runs the regular task loop.
@@ -180,11 +167,7 @@ iteration's important findings as reference entries (titles starting with
 `Findings: ` — root causes, failed approaches, environment quirks, key code
 locations) so the next round does not rediscover them from scratch; the loop
 reads them before starting work and marks them done once read, so the backlog
-does not accumulate open reference entries. From the second
-iteration on, the big picture is the backlog's **goal**: the loop keeps it
-current with `ralph_goal` (`set` when it is missing or stale, `checkpoint`
-for what advanced), and every fresh iteration prompt carries the goal block
-(objective + checkpoint) so the next round sees the larger objective.
+does not accumulate open reference entries.
 
 Without an active auto loop, `ralph_todo` reads the session backlog unscoped.
 `add`, `add-many`, `update`, and `complete` on the

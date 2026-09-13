@@ -2307,9 +2307,9 @@ GE "All routes render."
 		// No loop at all.
 		await expect(run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active Ralph loop/);
 
-		// A task-mode loop is not a goal or auto loop.
+		// A task-mode loop is not a goal loop.
 		const taskLoop = await startLoopWith(GOAL_OPEN_WITH_TASK, 'tasks');
-		await expect(taskLoop.run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active goal or auto loop/);
+		await expect(taskLoop.run({ action: 'checkpoint', note: 'x' })).rejects.toThrow(/active goal loop/);
 
 		// A goal loop still needs the note.
 		const goalLoop = await startLoopWith(GOAL_OPEN);
@@ -3883,7 +3883,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('context: 10% / 50%');
 	});
 
-	test('auto mode pre-activates the auto tool set (ralph_todo + ralph_goal) at session start so arming is cache-neutral', async () => {
+	test('auto mode pre-activates the auto tool set (ralph_todo + ralph_rotate) at session start so arming is cache-neutral', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3891,10 +3891,11 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The auto tool set (backlog + goal) is in context before the loop
-		// arms; the decision tools stay out.
+		// The auto tool set (backlog + rotation) is in context before the loop
+		// arms; the goal and decision tools stay out.
 		expect(fake.activeTools).toContain('ralph_todo');
-		expect(fake.activeTools).toContain('ralph_goal');
+		expect(fake.activeTools).toContain('ralph_rotate');
+		expect(fake.activeTools).not.toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
 
@@ -3944,7 +3945,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(status).toContain('category: General');
 		// The auto tool set is activated — not the full ralph tool set.
 		expect(fake.activeTools).toContain('ralph_todo');
-		expect(fake.activeTools).toContain('ralph_goal');
+		expect(fake.activeTools).toContain('ralph_rotate');
+		expect(fake.activeTools).not.toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
 	});
@@ -4046,7 +4048,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.userMessages.at(-1)?.text).toContain('Do not push');
 	});
 
-	test('auto mode finish-up allows a bad state and keeps the big-picture goal from the second iteration on', async () => {
+	test('auto mode finish-up allows a bad state and records findings, with no goal layer', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4054,8 +4056,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		await startLoop(fake, fakeCtx);
 
-		// Iteration 1 finishes up at the budget: a bad state is OK, and there is
-		// no big-picture step yet (the first round establishes the work).
+		// Iteration 1 finishes up at the budget: a bad state is OK.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		let finish = fake.userMessages.at(-1)!.text;
@@ -4067,17 +4068,16 @@ describe('ralph-loop extension (auto mode)', () => {
 		// The handoff logs the iteration's findings for the next round.
 		expect(finish).toContain('Findings: ');
 		expect(finish).toContain('rediscover from scratch');
-		// No big-picture step yet: the first round establishes the work.
+		// The auto loop has no goal layer.
 		expect(finish).not.toContain('ralph_goal');
 
-		// The fresh iteration 2 prompt maintains the big-picture layer.
+		// The fresh iteration 2 prompt carries the findings layer.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('message_update', fakeCtx.ctx);
 		const fresh = fake.userMessages.at(-1)!.text;
-		expect(fresh).toContain('Keep the big picture in the backlog');
-		expect(fresh).toContain('ralph_goal (action "show")');
+		expect(fresh).not.toContain('ralph_goal');
 		expect(fresh).toContain('"next" skips them');
 		expect(fresh).toContain('Findings: ');
 		// Findings entries are consumed (marked done) by the iteration that reads
@@ -4088,14 +4088,13 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fresh).toContain('Commit the completed task locally');
 		expect(fresh).toContain('Do not push');
 
-		// Iteration 2 finishes up at the budget: the handoff now also refreshes
-		// the big-picture tasks.
+		// Iteration 2 finishes up at the budget: the handoff still records
+		// findings and has no goal layer.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		finish = fake.userMessages.at(-1)!.text;
 		expect(finish).toContain('iteration 2 of 10');
-		expect(finish).toContain("Keep the big picture in the backlog's goal");
-		expect(finish).toContain('ralph_goal (action "set"');
+		expect(finish).not.toContain('ralph_goal');
 		expect(finish).toContain('Findings: ');
 		expect(finish).toContain('OK to leave the code in a bad state');
 	});
@@ -4425,7 +4424,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		await tool.execute('t', { action: 'add', title: 'Fix the parser' }, undefined, undefined, fakeCtx.ctx);
 
 		// next skips the Findings entry; a "Goal: " title is ordinary work
-		// (the big picture is the backlog's goal, not a task convention).
+		// (the auto loop has no goal layer).
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
 		expect(next.content[0]!.text).toContain('Goal: working desktop app with verified analysis');
 
@@ -4724,128 +4723,37 @@ describe('ralph-loop extension (auto mode)', () => {
 
 	const goalTool = (fake: ReturnType<typeof createFakePi>) => fake.tools.get('ralph_goal') as GoalTool;
 
-	test('ralph_goal set creates and replaces the goal in the auto loop', async () => {
+	test('ralph_goal checkpoint is refused in the auto loop (the auto loop has no goal layer)', async () => {
 		await writeAutoConfig();
+		await writeFile(
+			autoFile(),
+			'# ralph v2\n\nG "Working desktop app" open\nGB\n  - verified analysis\n'
+		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		const tool = goalTool(fake);
-		const created = await tool.execute(
-			't',
-			{ action: 'set', title: 'Working desktop app', body: '- verified analysis' },
-			undefined,
-			undefined,
-			fakeCtx.ctx
-		);
-		expect(created.content[0]!.text).toContain('Goal "Working desktop app" created');
-		let file = readBacklog();
-		expect(file.goal()?.title).toBe('Working desktop app');
-		expect(file.goal()?.status).toBe('open');
-		expect(file.goal()?.body).toContain('- verified analysis');
-
-		// set replaces the existing goal (the model-maintained big picture).
-		const replaced = await tool.execute(
-			't',
-			{ action: 'set', title: 'Working desktop app with verified analysis', body: '- criterion one' },
-			undefined,
-			undefined,
-			fakeCtx.ctx
-		);
-		expect(replaced.content[0]!.text).toContain('Goal "Working desktop app with verified analysis" updated');
-		file = readBacklog();
-		expect(file.goal()?.title).toBe('Working desktop app with verified analysis');
-		expect(file.goal()?.status).toBe('open');
-
-		// show reads it back.
-		const shown = await tool.execute('t', { action: 'show' }, undefined, undefined, fakeCtx.ctx);
-		expect(shown.content[0]!.text).toContain('Working desktop app with verified analysis');
-		expect(shown.content[0]!.text).toContain('status: open');
+		await expect(
+			goalTool(fake).execute('t', { action: 'checkpoint', note: 'x' }, undefined, undefined, fakeCtx.ctx)
+		).rejects.toThrow(/active goal loop/);
 	});
 
-	test('ralph_goal set is refused outside the auto loop (the goal is the user\'s contract)', async () => {
-		// Task loop: refused.
-		{
-			await writeFile(autoFile(), RALPH_V1);
-			const fake = createFakePi();
-			extension(fake.pi as never);
-			const fakeCtx = createFakeCtx(dir);
-			await startLoop(fake, fakeCtx);
-			await expect(
-				goalTool(fake).execute('t', { action: 'set', title: 'x' }, undefined, undefined, fakeCtx.ctx)
-			).rejects.toThrow(/user's contract/);
-		}
-		// Goal loop: refused.
-		{
-			await writeFile(
-				autoFile(),
-				'# ralph v2\n\nG "Rewrite the app" open\nGB\n  - Port the routes.\n'
-			);
-			const fake = createFakePi();
-			extension(fake.pi as never);
-			const fakeCtx = createFakeCtx(dir);
-			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-			await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
-			await expect(
-				goalTool(fake).execute('t', { action: 'set', title: 'x' }, undefined, undefined, fakeCtx.ctx)
-			).rejects.toThrow(/user's contract/);
-		}
-	});
-
-	test('ralph_goal checkpoint records progress toward the goal in the auto loop', async () => {
+	test('auto iteration prompt carries no goal section (the auto loop has no goal layer)', async () => {
 		await writeAutoConfig();
+		await writeFile(
+			autoFile(),
+			'# ralph v2\n\nG "Working desktop app" open\nGB\n  - verified analysis\n\nT 1 - "A task."\n'
+		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		const tool = goalTool(fake);
-		await tool.execute('t', { action: 'set', title: 'Working desktop app' }, undefined, undefined, fakeCtx.ctx);
-		const checkpointed = await tool.execute(
-			't',
-			{ action: 'checkpoint', note: 'Parser done; rendering next' },
-			undefined,
-			undefined,
-			fakeCtx.ctx
-		);
-		expect(checkpointed.content[0]!.text).toContain('Checkpoint recorded for the goal "Working desktop app"');
-		// Auto mode: progress, not a boundary — the model keeps working.
-		expect(checkpointed.content[0]!.text).toContain('Continue working');
-		expect(readBacklog().goal()?.checkpoint).toBe('Parser done; rendering next');
-	});
-
-	test('auto iteration prompt carries the goal block; the goal is the big-picture layer', async () => {
-		await writeAutoConfig();
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-		await startLoop(fake, fakeCtx);
-
-		// The model establishes the big picture as the backlog's goal.
-		const tool = goalTool(fake);
-		await tool.execute(
-			't',
-			{ action: 'set', title: 'Working desktop app', body: '- verified analysis' },
-			undefined,
-			undefined,
-			fakeCtx.ctx
-		);
-
-		// The iteration settles over budget: finish-up, then the fresh iteration.
-		fakeCtx.usagePercent.value = 55;
-		await fake.fire('agent_settled', fakeCtx.ctx);
-		await fake.fire('agent_settled', fakeCtx.ctx);
-		await flush();
-		fakeCtx.usagePercent.value = 10;
-		await fake.fire('message_update', fakeCtx.ctx);
-
-		// The fresh iteration carries the goal (objective + body) as its
-		// big picture.
-		const fresh = fake.userMessages.at(-1)!.text;
-		expect(fresh).toContain('Big picture — the backlog\'s goal');
-		expect(fresh).toContain('The goal is "Working desktop app" (status: open).');
-		expect(fresh).toContain('- verified analysis');
+		const prompt = fake.userMessages[0]!.text;
+		expect(prompt).toContain('Run the Ralph auto loop');
+		expect(prompt).not.toContain('Big picture');
+		expect(prompt).not.toContain('ralph_goal');
 	});
 });
 

@@ -280,17 +280,9 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   which is unscoped (all lists, one global numbering). Arming rule: idle +
   `autoMode: "on"` + mutating action (`add`, `add-many`,
   `update`, `complete`) → `setupAutoLoop()` first, then execute. The auto tool
-  set (`ralph_todo` + `ralph_goal` + `ralph_rotate`) is pre-activated at session start when
+  set (`ralph_todo` + `ralph_rotate`) is pre-activated at session start when
   auto mode is "on" (cache-neutral arming). `next` skips `Findings: `
   reference entries (the session backlog is the only backlog).
-- **The auto loop's big picture is the backlog's goal.** The auto loop
-  activates `ralph_goal` too and keeps the larger objective in the per-session
-  backlog's goal entry: `ralph_goal set` (auto loop only — the auto goal is
-  model-maintained, not a user contract) creates/replaces it, `checkpoint`
-  records progress toward it, and every fresh auto iteration prompt carries
-  the goal block. This replaces the earlier `Goal: ` tracking-task
-  convention; the goal loop's read-only user-contract invariant is untouched
-  (`set` is refused outside the auto loop).
 - **One rotation policy: `rotateOn`.** Config value `"task"` | `"budget"`
   (defaults: `"task"` for task/goal loops, `"budget"` for auto), captured
   into `RalphState` at loop start. `"task"`: rotate after every completed
@@ -305,8 +297,7 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   policy) send the completion/plan recording prompt; `context-limit`/
   `phase-changed` send one merged finish-up prompt (wrap up, completion log
   entries, local commit of finished work only, record remaining work as
-  todos; the auto loop adds the findings layer and keeps the big picture in
-  the backlog's goal via `ralph_goal`). The old
+  todos; the auto loop adds the findings layer). The old
   mid-task `contextCheckpointPrompt` is kept only for task-less goal
   iterations (planning/re-evaluation checkpoint the goal via
   `ralph_goal checkpoint`) and Markdown backlogs.
