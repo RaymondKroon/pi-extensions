@@ -1043,7 +1043,6 @@ function completionRecordingPromptBody(state: RalphState): string {
 		const target = singular ? `task ${numbers[0]}` : `tasks ${numbers.join(', ')}`;
 		return renderPrompt('completion-recording', {
 			target,
-			numberRef: singular ? 'the task\'s number' : 'each task\'s number',
 			taskRef: singular ? 'the task' : 'a task',
 			entryWord: singular ? 'entry' : 'entry per task',
 			reportWord: singular ? 'entry' : 'entries'

@@ -430,10 +430,10 @@ describe('ralph-loop extension', () => {
 		expect(status).toContain('Ralph: recording');
 		expect(fake.userMessages.at(-1)?.text).toContain('completion log');
 		// The ralph backlog is diffed by task id, so the prompt names the task, and it
-		// is idempotent: check for an existing entry before logging.
+		// is idempotent: the model only logs an entry if it is missing.
 		expect(fake.userMessages.at(-1)?.text).toContain('was just completed: task 1');
 		expect(fake.userMessages.at(-1)?.text).toContain('action "log" for task 1');
-		expect(fake.userMessages.at(-1)?.text).toContain('do not add another');
+		expect(fake.userMessages.at(-1)?.text).toContain('no completion log entry yet');
 
 		// The recording turn settles: only now does the fresh iteration start.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -478,12 +478,11 @@ describe('ralph-loop extension', () => {
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
 		// The recording prompt names the completed task directly and is idempotent:
-		// the model checks the task's completion log before adding an entry.
+		// the model only logs an entry if it is missing.
 		const prompt = fake.userMessages.at(-1)?.text ?? '';
 		expect(prompt).toContain('was just completed: task 1');
 		expect(prompt).toContain('action "log" for task 1');
-		expect(prompt).toContain('action "list"');
-		expect(prompt).toContain('do not add another');
+		expect(prompt).toContain('no completion log entry yet');
 	});
 
 	test('mid-turn: crossing the threshold during streaming steers the checkpoint into the running turn', async () => {
