@@ -2130,9 +2130,9 @@ D 2
 		const prompt = fake.userMessages[0].text;
 		expect(prompt).toContain('Run the Ralph goal loop');
 		expect(prompt).toContain('This is a re-evaluation iteration: the goal is open and every planned task is complete.');
-		expect(prompt).toContain('Re-check every acceptance criterion of the goal against the repository');
-		expect(prompt).toContain('add tasks for the missing work with ralph_todo');
-		expect(prompt).toContain('ralph_goal with action "complete"');
+		expect(prompt).toContain('Verify every acceptance criterion of the goal against the repository');
+		expect(prompt).toContain("add tasks for the missing work to the plan's list");
+		expect(prompt).toContain('complete the goal with ralph_goal');
 		expect(prompt).not.toContain('action "next"');
 	});
 

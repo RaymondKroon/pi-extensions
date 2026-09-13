@@ -51,3 +51,18 @@ environment quirks. Organized by topic.
   Rationale: trust-the-model minify style per the task-13 feedback.
   Evidence: `bun test` 411 pass / 0 fail; commit "ralph: minify
   iteration-goal-planning prompt (user-approved)".
+- Approval record (task 15, 2026-09-13): the user approved the minified
+  `prompts/iteration-goal-re-evaluation.md` via the ralph_request_decision
+  pause, with one refinement over the proposal: step 3 is exactly
+  "complete the goal with ralph_goal." (no ", with the evidence"). Final
+  steps: (1) "Verify every acceptance criterion of the goal against the
+  repository, running every verification command required by the goal and
+  the backlog." (2) "If any criterion is not met, add tasks for the missing
+  work to the plan's list and stop after recording them." (3) "If every
+  criterion is met and verified, complete the goal with ralph_goal."
+  Dropped: ralph_todo/ralph_goal action mechanics (documented in the tool
+  descriptions) and the restated "Do not edit {{todoPath}} directly" guard
+  (already in the backlog note) → the `todoPath` var is removed from the
+  renderPrompt call in index.ts. Approver: the user.
+  Rationale: trust-the-model minify style per the task-13 feedback.
+  Evidence: the user's reply in this session's decision pause.
