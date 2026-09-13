@@ -1005,12 +1005,7 @@ function contextCheckpointPromptBody(state: RalphState): string {
 		}
 		return renderPrompt('context-checkpoint-ralph', {});
 	}
-	return renderPrompt('context-checkpoint-markdown', {
-		iteration: String(state.iteration),
-		maxIterations: String(state.maxIterations),
-		taskIteration: String(state.taskIteration),
-		todoPath: state.todoPath
-	});
+	return renderPrompt('context-checkpoint-markdown', { todoPath: state.todoPath });
 }
 
 /**
