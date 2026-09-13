@@ -52,7 +52,6 @@ const CONTEXT_BOUNDARY_TYPE = 'ralph-loop-context-boundary';
 const COMPLETION_SUMMARY_TYPE = 'ralph-loop-completion-summary';
 /** Marker in a ralph-provided compaction entry's details (distinguishes it from pi's LLM compactions). */
 const COMPACTION_SOURCE = 'ralph-loop';
-const DEFAULT_SPEC = 'SPEC.md';
 /**
  * The ralph backlog directory: every loop (tasks/goal/auto) and every idle
  * ralph_todo/ralph_goal read runs on the per-session ralph file here. Stored
@@ -67,8 +66,6 @@ const DEFAULT_SPEC = 'SPEC.md';
 const AUTO_TODO_DIR = 'ralph';
 const autoTodoPath = (ctx: ExtensionContext): string =>
 	join(getAgentDir(), AUTO_TODO_DIR, `${ctx.sessionManager.getSessionId()}.db`);
-/** Generic planning document bundled with this extension for /ralph-init to adapt. */
-const INIT_TEMPLATE_SPEC = join(import.meta.dirname, 'SPEC.template.md');
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
 const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -156,7 +153,6 @@ interface RalphState {
 	/** The rotation policy resolved at loop start (config "default" → per-mode default); a mid-loop config edit does not change a running loop. */
 	rotateOn: 'task' | 'budget';
 	todoPath: string;
-	specPath: string;
 	/** Backlog snapshot at the start of the current loop (never rotated). */
 	loopStartTodo: string;
 	baselineTodo: string;
@@ -194,7 +190,6 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal' || state.mode === 'auto') &&
 		(state.rotateOn === undefined || state.rotateOn === 'task' || state.rotateOn === 'budget') &&
 		typeof state.todoPath === 'string' &&
-		typeof state.specPath === 'string' &&
 		(state.loopStartTodo === undefined || typeof state.loopStartTodo === 'string') &&
 		typeof state.baselineTodo === 'string' &&
 		(state.iteration === undefined || (typeof state.iteration === 'number' && state.iteration >= 1)) &&
@@ -759,7 +754,6 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 			goalSection,
 			category: String(state.category),
 			referenceTaskNote,
-			specPath: state.specPath,
 			closeStep,
 			bigGoalMaintenance
 		});
@@ -802,7 +796,6 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 					contextNote,
 					backlogNote,
 					goalBlock: goalBlock(goal),
-					specPath: state.specPath,
 					todoPath: state.todoPath,
 					decisionNote
 				});
@@ -812,7 +805,6 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 					contextNote,
 					backlogNote,
 					goalBlock: goalBlock(goal),
-					specPath: state.specPath,
 					todoPath: state.todoPath,
 					decisionNote
 				});
@@ -821,7 +813,6 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 				contextNote,
 				backlogNote,
 				goalBlock: goalBlock(goal),
-				specPath: state.specPath,
 				todoPath: state.todoPath,
 				categoryScope,
 				categoryGuard,
@@ -834,7 +825,6 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 		return renderPrompt('iteration-ralph', {
 			contextNote,
 			backlogNote: `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`,
-			specPath: state.specPath,
 			todoPath: state.todoPath,
 			categoryScope,
 			categoryGuard: state.category ? ' or on a task in another category' : '',
@@ -845,7 +835,6 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 
 	return renderPrompt('iteration-markdown', {
 		contextNote,
-		specPath: state.specPath,
 		todoPath: state.todoPath,
 		ralphCloseStep,
 		decisionNote
@@ -1056,10 +1045,6 @@ function planRecordingPrompt(): string {
 	return `${automatedPrefix()}${renderPrompt('plan-recording', {})}`;
 }
 
-async function readRequiredFile(path: string): Promise<string> {
-	return readFile(path, 'utf8');
-}
-
 /** Parse command arguments, supporting quoted paths that contain spaces. */
 function parseCommandArguments(args: string): string[] | undefined {
 	const values: string[] = [];
@@ -1092,23 +1077,13 @@ function parseCommandArguments(args: string): string[] | undefined {
 }
 
 interface RalphStartFiles {
-	specFile: string;
 	category?: string;
 	/** Start the goal loop instead of the task loop. */
 	goal: boolean;
 }
 
-interface RalphInitFiles {
-	specFile?: string;
-	force: boolean;
-	prompt: string;
-	/** Initialize for the goal loop: the backlog gets the goal from the brief. */
-	goal: boolean;
-}
-
-/** Parse the start options: the spec file may be overridden; the backlog is always the session's ralph file. */
+/** Parse the start options; the backlog is always the session's ralph file. */
 function parseStartFiles(args: string[]): RalphStartFiles | undefined {
-	let specFile = DEFAULT_SPEC;
 	let category: string | undefined;
 	let goal = false;
 
@@ -1119,76 +1094,14 @@ function parseStartFiles(args: string[]): RalphStartFiles | undefined {
 			goal = true;
 			continue;
 		}
-		if (option !== '--spec' && option !== '--category') return undefined;
+		if (option !== '--category') return undefined;
 		const path = args[index + 1];
 		if (!path || path.startsWith('--')) return undefined;
-		if (option === '--spec') specFile = path;
-		else category = path;
+		category = path;
 		index += 1;
 	}
 
-	return { specFile, category, goal };
-}
-
-/**
- * Parse an init request. The specification (in the project) is generated by
- * the LLM from the project brief; with --goal the session's ralph backlog also
- * gets the goal derived from the brief (so a brief is always required with
- * --goal). `--` permits a brief that starts with an option-looking word.
- */
-function parseInitFiles(args: string[]): RalphInitFiles | undefined {
-	let specFile: string | undefined;
-	let force = false;
-	let goal = false;
-	let index = 0;
-
-	for (; index < args.length; index += 1) {
-		const option = args[index];
-		if (option === '--') {
-			index += 1;
-			break;
-		}
-		if (!option.startsWith('--')) break;
-		if (option === '--force') {
-			if (force) return undefined;
-			force = true;
-			continue;
-		}
-		if (option === '--goal') {
-			if (goal) return undefined;
-			goal = true;
-			continue;
-		}
-		if (option !== '--spec') return undefined;
-		const path = args[index + 1];
-		if (!path || path.startsWith('--')) return undefined;
-		if (specFile) return undefined;
-		specFile = path;
-		index += 1;
-	}
-
-	const resolvedSpec = specFile ?? DEFAULT_SPEC;
-	const prompt = args.slice(index).join(' ').trim();
-	if ((resolvedSpec || goal) && !prompt) return undefined;
-	return {
-		specFile: resolvedSpec,
-		force,
-		prompt,
-		goal
-	};
-}
-
-/**
- * Derive the goal record of a --goal init from the project brief: the first
- * line is the title, the full brief is the body (omitted when it adds nothing
- * beyond the title). The user reviews and edits the goal before starting the
- * goal loop; this is only the initial contract.
- */
-function goalFromBrief(brief: string): { title: string; body?: string } {
-	const trimmed = brief.trim();
-	const firstLine = trimmed.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? trimmed;
-	const body = trimmed === firstLine ? undefined : trimmed;
-	return { title: firstLine, body };
+	return { category, goal };
 }
 
 interface RalphSetGoalArgs {
@@ -1271,7 +1184,7 @@ async function setGoalFromFile(
 			return {
 				ok: false,
 				level: 'error',
-				message: `No backlog at ${outName} — create it first with ralph_todo action "init" (or /ralph-init)`
+				message: `No backlog at ${outName} — create it first with ralph_todo action "init"`
 			};
 		}
 		return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
@@ -1333,9 +1246,9 @@ function isMissingFileError(error: unknown): boolean {
 }
 
 /**
- * Inspect an init output target before writing. Shared by /ralph-init and
- * ralph_todo action "init" to decide whether the file can be created, already
- * holds a ralph backlog (init is idempotent on it), or must not be replaced.
+ * Inspect an init output target before writing (ralph_todo action "init") to
+ * decide whether the file can be created, already holds a ralph backlog (init
+ * is idempotent on it), or must not be replaced.
  */
 async function inspectInitTarget(path: string): Promise<
 	| { kind: 'missing' }
@@ -1494,25 +1407,6 @@ async function importMarkdownBacklog(
 		return { ok: false, level: 'error', message: `Could not write ${outPath}: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	return { ok: true, outName, category, merged, counts: target.counts() };
-}
-
-function initPrompt(specFile: string, prompt: string, force: boolean, goal?: { title: string; body?: string }): string {
-	const templateWarning =
-		specFile === DEFAULT_SPEC ? '; the target SPEC.md is intentionally allowed because it was explicitly selected' : '';
-	const goalNote = goal
-		? `\n\n${renderPrompt('init-goal', {
-				goalTitle: goal.title,
-				goalBody: goal.body ? `${goal.body}\n` : ''
-			})}\n`
-		: '';
-	return `${automatedPrefix()}${renderPrompt('init', {
-		brief: prompt,
-		specFile,
-		templateSpec: INIT_TEMPLATE_SPEC,
-		forceClause: force ? ', replacing the named existing file because --force was explicitly supplied,' : '',
-		templateWarning,
-		goalNote
-	})}`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -2260,7 +2154,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_goal',
 		label: 'Ralph goal',
 		description:
-			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else the session\'s ralph file). In the goal loop the goal is the user\'s contract: its title/body are read-only; change only its state via this tool. In the auto loop the goal is the model-maintained big picture: set creates or replaces it, checkpoint records progress toward it. Actions: show, set (auto loop only), checkpoint (goal or auto loop), complete, confirm, withdraw (the last three require the active goal loop). complete requires a full verification run of every SPEC.md command with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
+			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else the session\'s ralph file). In the goal loop the goal is the user\'s contract: its title/body are read-only; change only its state via this tool. In the auto loop the goal is the model-maintained big picture: set creates or replaces it, checkpoint records progress toward it. Actions: show, set (auto loop only), checkpoint (goal or auto loop), complete, confirm, withdraw (the last three require the active goal loop). complete requires a full verification run of every verification command required by the goal and the backlog, with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('show'),
@@ -2575,7 +2469,6 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const setupAutoLoop = async (ctx: ExtensionContext): Promise<RalphState | undefined> => {
 		const todoPath = autoTodoPath(ctx);
-		const specPath = resolve(ctx.cwd, DEFAULT_SPEC);
 		try {
 		let backlog: Backlog;
 		try {
@@ -2600,7 +2493,6 @@ export default function (pi: ExtensionAPI) {
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
-				specPath,
 				loopStartTodo: rendered,
 				baselineTodo: rendered,
 				iteration: 1,
@@ -2647,8 +2539,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// Shared by /ralph start and the GUI (the backlog view's s key): the same
-	// validation (idle, readable spec + TODO, known category, open tasks) and
-	// the same state setup.
+	// validation (idle, known category, open tasks) and the same state setup.
 	const startLoop = async (ctx: ExtensionCommandContext, files: RalphStartFiles): Promise<void> => {
 		if (state?.enabled) {
 			ctx.ui.notify('Ralph loop is already active — /ralph stop to end it first', 'info');
@@ -2659,20 +2550,15 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const { specFile, category: requestedCategory, goal } = files;
+		const { category: requestedCategory, goal } = files;
 		// Every loop runs on the session's ralph file (<session-id>.db in the
 		// global agent directory). The auto loop is selected by the auto mode
 		// setting (on): a plain /ralph start uses it with an auto-created
 		// session category. An explicit --goal start is unaffected.
 		const auto = !goal && config.autoMode !== 'off';
 		const todoPath = autoTodoPath(ctx);
-		const specPath = resolve(ctx.cwd, specFile);
 		let category = requestedCategory;
 		try {
-			// The auto loop runs in any project: SPEC.md may be missing
-			// (the prompt says "when present", and the loop creates it when the
-			// project is not yet documented). The task/goal loops require it.
-			if (!auto) await readRequiredFile(specPath);
 			let baselineTodo: string;
 			let backlog: Backlog;
 			if (auto) {
@@ -2751,7 +2637,6 @@ export default function (pi: ExtensionAPI) {
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
-				specPath,
 				loopStartTodo: baselineTodo,
 				baselineTodo,
 				iteration: 1,
@@ -2779,7 +2664,7 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(
-				`Ralph loop needs a readable spec file ${specFile} and the session backlog ${todoPath}: ${message}`,
+				`Could not start the Ralph loop on the session backlog ${todoPath}: ${message}`,
 				'error'
 			);
 		}
@@ -3483,112 +3368,6 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	pi.registerCommand('ralph-init', {
-		description:
-			'Create the Ralph spec (generated in the project) and, with --goal, the goal in the session backlog: [--goal] [--spec file] [--force] <project brief>',
-		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
-			const options: AutocompleteItem[] = [
-				{ value: '--goal', label: '--goal', description: 'Initialize for the goal loop: the session backlog gets the goal (derived from the brief) and the spec must state it with acceptance criteria.' },
-				{ value: '--spec', label: '--spec', description: 'Generate this specification file instead of SPEC.md.' },
-				{ value: '--force', label: '--force', description: 'Allow replacing a named existing output file.' }
-			];
-			const matches = options.filter((option) => option.value.startsWith(prefix.toLowerCase()));
-			return matches.length > 0 ? matches : null;
-		},
-		handler: async (args, ctx) => {
-			const commandArgs = parseCommandArguments(args.trim());
-			const initFiles = commandArgs ? parseInitFiles(commandArgs) : undefined;
-			if (!initFiles) {
-				ctx.ui.notify(
-					'Usage: /ralph-init [--goal] [--spec file] [--force] <project brief> (quote paths or briefs containing spaces)',
-					'warning'
-				);
-				return;
-			}
-			if (!ctx.isIdle()) {
-				ctx.ui.notify('Wait for the current agent run to finish before initializing Ralph documents', 'warning');
-				return;
-			}
-
-			const specPath = resolveProjectFile(ctx.cwd, initFiles.specFile!);
-			if (!specPath) {
-				ctx.ui.notify('Ralph document paths must be relative files inside the project', 'warning');
-				return;
-			}
-
-			// The specification is generated by the LLM from the project brief;
-			// with --goal the session\'s ralph backlog also gets the goal (created
-			// when missing; idempotent on an existing goal).
-			if (!initFiles.force) {
-				const status = await inspectInitTarget(specPath);
-				if (status.kind === 'exists') {
-					ctx.ui.notify(
-						`Refusing to replace existing ${initFiles.specFile}. Choose a new name or add --force.`,
-						'warning'
-					);
-					return;
-				}
-			}
-
-			if (initFiles.goal) {
-				const todoPath = autoTodoPath(ctx);
-				const todoStatus = await inspectInitTarget(todoPath);
-				if (todoStatus.kind === 'exists' && !todoStatus.ralph && !initFiles.force) {
-					ctx.ui.notify(
-						`Refusing to replace existing ${todoPath} (it is not a ralph-format backlog). Delete the file or add --force.`,
-						'warning'
-					);
-					return;
-				}
-				let backlog: Backlog | undefined;
-				if (todoStatus.kind === 'missing' || !todoStatus.ralph) {
-					backlog = Backlog.empty();
-				} else {
-					// Existing ralph backlog: add the goal only when it has none yet,
-					// so re-running --goal init is idempotent.
-					try {
-						const existing = Backlog.open(todoPath);
-						if (existing.goal()) {
-							ctx.ui.notify(
-								`Ralph backlog at ${todoPath} already has the goal "${existing.goal()!.title}"; keeping it.`,
-								'info'
-							);
-						} else {
-							backlog = existing;
-						}
-					} catch (error) {
-						ctx.ui.notify(
-							`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`,
-							'error'
-						);
-						return;
-					}
-				}
-				if (backlog !== undefined && !backlog.goal()) {
-					backlog.setGoal(goalFromBrief(initFiles.prompt));
-					try {
-						backlog.save(todoPath);
-					} catch (error) {
-						ctx.ui.notify(
-							`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`,
-							'error'
-						);
-						return;
-					}
-					ctx.ui.notify(
-						`Set goal "${goalFromBrief(initFiles.prompt).title}" in ${todoPath}. Review the goal; start the goal loop with /ralph start --goal.`,
-						'info'
-					);
-				}
-			}
-
-			ctx.ui.notify('Preparing Ralph specification…', 'info');
-			pi.sendUserMessage(
-				initPrompt(initFiles.specFile!, initFiles.prompt, initFiles.force, initFiles.goal ? goalFromBrief(initFiles.prompt) : undefined)
-			);
-		}
-	});
-
 	/**
 	 * Open the Ralph home view (bare /ralph or /ralph <file>): a pinned goal
 	 * row above the list rows; enter on a list opens the task view for it.
@@ -3709,7 +3488,7 @@ export default function (pi: ExtensionAPI) {
 						reload: loadBacklog,
 						mutate: persist,
 						onStartLoop: (loopCategory) => {
-							void startLoop(ctx, { specFile: DEFAULT_SPEC, category: loopCategory, goal: false });
+							void startLoop(ctx, { category: loopCategory, goal: false });
 						}
 					})
 				);
@@ -3730,7 +3509,7 @@ export default function (pi: ExtensionAPI) {
 						mutate: persist,
 						onOpenList: (category) => showView(category),
 						onStartGoalLoop: () => {
-							void startLoop(ctx, { specFile: DEFAULT_SPEC, goal: true });
+							void startLoop(ctx, { goal: true });
 						}
 					})
 				);
@@ -3752,7 +3531,7 @@ export default function (pi: ExtensionAPI) {
 				{
 					value: 'start',
 					label: 'start',
-					description: 'Runs on the session\'s ralph file (created when missing). Override the spec with --spec <file>; scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
+					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into the session\'s ralph file, merging into an existing backlog. Each source file is only imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The first non-empty line (optionally an H1 heading) is the title, the rest is the body. Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
@@ -3766,7 +3545,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const commandArgs = parseCommandArguments(args.trim());
 			if (!commandArgs) {
-				ctx.ui.notify('Usage: /ralph start [--spec file] (quote paths containing spaces)', 'warning');
+				ctx.ui.notify('Usage: /ralph start [--category name] [--goal] (quote values containing spaces)', 'warning');
 				return;
 			}			const command = commandArgs[0]?.toLowerCase() ?? '';
 			if (command === 'stop') {
@@ -3922,7 +3701,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const startFiles = parseStartFiles(commandArgs.slice(1));
 			if (!startFiles) {
-				ctx.ui.notify('Usage: /ralph start [--spec file] [--category name] [--goal]', 'warning');
+				ctx.ui.notify('Usage: /ralph start [--category name] [--goal]', 'warning');
 				return;
 			}
 			await startLoop(ctx, startFiles);

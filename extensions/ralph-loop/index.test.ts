@@ -315,7 +315,6 @@ beforeEach(async () => {
 	agentDir = await mkdtemp(join(tmpdir(), 'ralph-loop-agent-'));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	await mkdir(join(agentDir, 'ralph'), { recursive: true });
-	await writeFile(join(dir, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
 	await mkdir(join(dir, '.pi'), { recursive: true });
 	await writeFile(
 		join(dir, '.pi', 'ralph-loop.json'),
@@ -3044,7 +3043,6 @@ describe('ralph-loop extension (/ralph home view)', () => {
 				enabled: true,
 				mode: 'auto',
 				todoPath: join(agentDir, 'ralph', 'test-session.ralph'),
-				specPath: join(dir, 'SPEC.md'),
 				baselineTodo: '',
 				contextThreshold: 0.5,
 				rotationQueued: false,
@@ -3061,118 +3059,6 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		expect(
 			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
 		).toContain('Ralph home — test-session.db');
-	});
-});
-
-describe('/ralph-init (ralph-format-only)', () => {
-	let fake: ReturnType<typeof createFakePi>;
-	let fakeCtx: FakeCtx;
-
-	beforeEach(async () => {
-		fake = createFakePi();
-		extension(fake.pi as never);
-		fakeCtx = createFakeCtx(dir);
-		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-	});
-
-	const init = (args: string) => fake.commands.get('ralph-init')!.handler(args, fakeCtx.ctx);
-
-	test('sends a spec-only prompt and leaves the session backlog untouched', async () => {
-		await rm(join(dir, 'SPEC.md'));
-		await init('Build a lamp.');
-
-		// The session backlog is created on demand (ralph_todo / loops), not by init.
-		await expect(readFile(autoFile(), 'utf8')).rejects.toThrow();
-		// The LLM is asked for the spec only.
-		expect(fake.userMessages).toHaveLength(1);
-		const prompt = fake.userMessages[0]!.text;
-		expect(prompt).toContain('specification: SPEC.md');
-		expect(prompt).toContain('SPEC.template.md');
-		expect(prompt).not.toContain('TODO template');
-		expect(prompt).not.toContain('TODO.template.md');
-		expect(prompt).not.toContain('backlog: ');
-	});
-
-	test('unknown options are a usage error', async () => {
-		await init('--todo TODO.ralph');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph-init');
-		expect(fake.userMessages).toHaveLength(0);
-		await expect(readFile(autoFile(), 'utf8')).rejects.toThrow();
-	});
-
-	test('refuses to replace an existing spec without --force', async () => {
-		// The top-level beforeEach writes SPEC.md.
-		await init('Build a lamp.');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('Refusing to replace existing SPEC.md');
-		expect(fake.userMessages).toHaveLength(0);
-	});
-
-	test('refuses a non-ralph session backlog without --force and overwrites it with --force', async () => {
-		await rm(join(dir, 'SPEC.md'));
-		await writeFile(autoFile(), '- [ ] old markdown\n');
-		await init('--goal Build a lamp that dims.');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('Refusing to replace existing');
-		expect(fake.userMessages).toHaveLength(0);
-		expect(await readFile(autoFile(), 'utf8')).toBe('- [ ] old markdown\n');
-
-		fakeCtx.notifications.length = 0;
-		await init('--force --goal Build a lamp that dims.');
-		expect(readBacklog().goal()?.title).toBe('Build a lamp that dims.');
-		expect(fake.userMessages).toHaveLength(1);
-	});
-
-	describe('--goal', () => {
-		test('creates a backlog with the goal and no tasks, and a goal-aware spec prompt', async () => {
-			await rm(join(dir, 'SPEC.md'));
-			await init('--goal Build a lamp that dims.');
-
-			const backlog = readBacklog();
-			const goal = backlog.goal();
-			expect(goal?.title).toBe('Build a lamp that dims.');
-			expect(goal?.status).toBe('open');
-			expect(goal?.body).toBeNull();
-			expect(backlog.counts()).toEqual({ open: 0, total: 0, completed: 0 });
-
-			// The LLM is asked for the spec only, and the spec must state the
-			// goal verbatim with acceptance criteria.
-			expect(fake.userMessages).toHaveLength(1);
-			const prompt = fake.userMessages[0]!.text;
-			expect(prompt).toContain('Goal: Build a lamp that dims.');
-			expect(prompt).toContain('acceptance criteria');
-			expect(prompt).toContain('exactly as given');
-			expect(prompt).not.toContain('backlog: ');
-		});
-
-		test('requires a brief', async () => {
-			await init('--goal');
-			expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph-init [--goal]');
-			expect(fake.userMessages).toHaveLength(0);
-			await expect(readFile(autoFile(), 'utf8')).rejects.toThrow();
-		});
-
-		test('is idempotent on an existing goal', async () => {
-			await rm(join(dir, 'SPEC.md'));
-			await init('--goal Build a lamp that dims.');
-			const first = renderFile();
-			fake.userMessages.length = 0;
-			fakeCtx.notifications.length = 0;
-			await init('--goal Build a lamp that dims.');
-			expect(renderFile()).toBe(first);
-			expect(fakeCtx.notifications.some((n) => n.message.includes('already has the goal'))).toBe(true);
-			// The spec prompt is still sent (the spec is always generated).
-			expect(fake.userMessages).toHaveLength(1);
-		});
-
-		test('adds the goal to an existing ralph backlog that has none', async () => {
-			await rm(join(dir, 'SPEC.md'));
-			await writeFile(autoFile(), RALPH_V1);
-			await init('--goal Build a lamp that dims.');
-
-			const backlog = readBacklog();
-			expect(backlog.goal()?.title).toBe('Build a lamp that dims.');
-			// The existing tasks are untouched.
-			expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
-		});
 	});
 });
 
@@ -3999,22 +3885,6 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(fake.activeTools).toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
-	});
-
-	test('auto mode starts without a SPEC.md (the loop creates it when the project is undocumented)', async () => {
-		await writeAutoConfig();
-		await rm(join(dir, 'SPEC.md'));
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-
-		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
-
-		// The loop starts anyway; the prompt references the spec as optional.
-		expect(fake.userMessages[0]!.text).toContain('Run the Ralph auto loop');
-		expect(fake.userMessages[0]!.text).toContain('(when present)');
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): on');
 	});
 
 	test('auto mode start reuses the per-session auto file and continues the same category on restart', async () => {
@@ -5266,7 +5136,6 @@ describe('ralph-loop extension (global config store)', () => {
 		await mkdir(repo, { recursive: true });
 		execFileSync('git', ['init', '-q'], { cwd: repo });
 		execFileSync('git', ['checkout', '-q', '-b', 'feature'], { cwd: repo });
-		await writeFile(join(repo, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
 		await writeFile(autoFile(), RALPH_V1);
 		await writeStore({
 			dirs: { [repo]: { default: fullConfig({ maxIterations: 7 }), feature: fullConfig({ maxIterations: 4 }) } }
@@ -5284,7 +5153,6 @@ describe('ralph-loop extension (global config store)', () => {
 		await mkdir(repo, { recursive: true });
 		execFileSync('git', ['init', '-q'], { cwd: repo });
 		execFileSync('git', ['checkout', '-q', '-b', 'feature'], { cwd: repo });
-		await writeFile(join(repo, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
 		await writeFile(autoFile(), RALPH_V1);
 		await writeStore({ dirs: { [repo]: { default: fullConfig({ maxIterations: 7 }) } } });
 		const fake = createFakePi();

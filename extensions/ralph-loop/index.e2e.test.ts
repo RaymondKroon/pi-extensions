@@ -243,7 +243,6 @@ beforeEach(async () => {
 	// directory so tests never touch the real ~/.pi/agent.
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	await mkdir(join(agentDir, 'extensions'), { recursive: true });
-	await writeFile(join(projectDir, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
 	// The loop's backlog is the session's ralph file in the agent directory
 	// (the e2e session manager uses the fixed id "e2e-session").
 	await mkdir(join(agentDir, 'ralph'), { recursive: true });

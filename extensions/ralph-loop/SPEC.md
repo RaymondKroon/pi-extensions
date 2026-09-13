@@ -44,8 +44,6 @@ repository; the pi core is untouched.
 - Bare `/ralph [file]` opens a **home GUI**: pinned goal row + list rows;
   the `todos` subcommand and the standalone list picker are removed.
 - Status line shows loop mode and goal state.
-- `/ralph-init --goal` template (SPEC with goal + acceptance criteria,
-  backlog with a goal and no tasks).
 
 ### Explicitly out of scope
 
@@ -132,8 +130,9 @@ Ralph decision workflow.
 
 ## 7. User journeys and acceptance criteria
 
-1. **New project, giant goal.** User runs `/ralph-init --goal <brief>`,
-   reviews/edits the generated SPEC and goal, runs `/ralph start --goal`.
+1. **New project, giant goal.** User sets the goal in the session backlog
+   (e.g. `/ralph set-goal <file>` or the home view's `A`), reviews/edits it,
+   runs `/ralph start --goal`.
    Acceptance: the first iteration is a planning iteration that decomposes
    the goal into small ordered tasks; subsequent iterations execute tasks;
    when the plan is exhausted the loop re-evaluates the goal against the

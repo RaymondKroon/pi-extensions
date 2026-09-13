@@ -175,9 +175,7 @@ self-contained todos for the next iteration. Auto mode commits every completed
 task locally (never pushes): the backlog is the handoff, and the per-task
 commit is the durable checkpoint of finished work. The finish-up turn commits
 completed work that is still uncommitted, but never broken or half-done work.
-`SPEC.md` is optional: the auto
-loop runs in any project and creates it (along with `DEBUG.md`) when the
-project is not yet documented. Every finish-up also logs the
+Every finish-up also logs the
 iteration's important findings as reference entries (titles starting with
 `Findings: ` — root causes, failed approaches, environment quirks, key code
 locations) so the next round does not rediscover them from scratch; the loop
