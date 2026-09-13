@@ -32,8 +32,8 @@ repository; the pi core is untouched.
   re-evaluation → completion.
 - `/ralph set-goal <file>`: set the backlog's goal from a file (first
   non-empty line, optionally an H1 heading, is the title; the rest is the
-  body). Targets the active loop's backlog or `TODO.ralph`; replaces an
-  open goal, refuses claimed/done goals.
+  body). Targets the active loop's backlog or the session's ralph file;
+  replaces an open goal, refuses claimed/done goals.
 - A `ralph_goal` tool: `show`, `checkpoint`, `complete`, `confirm`,
   `withdraw` — separate from `ralph_todo`.
 - User approval gate for goal completion, reusing the existing decision
@@ -71,8 +71,8 @@ Ralph decision workflow.
   (withdraw). `Backlog` API: `goal()`, `setGoal({title, body})`,
   `deleteGoal()`, `claimGoal(evidence)`, `confirmGoal()`,
   `withdrawGoal(note)`, `setGoalCheckpoint(note, iteration)`.
-- **`ralph_goal` tool** targets the active loop's backlog, else
-  `TODO.ralph`. Mutations require an active goal loop; `show` works
+- **`ralph_goal` tool** targets the active loop's backlog, else the
+  session's ralph file. Mutations require an active goal loop; `show` works
   anywhere. Both `ralph_todo` and `ralph_goal` share the
   parse → mutate → render → write discipline; turns are serialized, so no
   locking is needed.
@@ -249,16 +249,17 @@ is `docs/ralph-backlog.md`. The consolidation collapsed the parallel
 task/goal/auto code paths to one loop with two orthogonal axes.
 
 - **One backlog tool: `ralph_todo`.** `ralph_auto` is deleted; the auto loop
-  uses `ralph_todo` with `backlog: "session"` (the per-session auto backlog).
-  Target resolution: omitted → active loop's backlog, else `TODO.ralph`;
-  `backlog: "project"` / `"session"` make the target explicit. Scope for
+  uses `ralph_todo` (the per-session auto backlog). The project's `TODO.ralph`
+  is gone: every loop and idle read targets the session's ralph file
+  (`<session-id>.ralph` in the global agent directory) — the active loop's
+  backlog when a loop is running. Scope for
   task-numbered actions: the active loop's category — except the auto loop,
   which is unscoped (all lists, one global numbering). Arming rule: idle +
-  `autoMode: "on"` + session target + mutating action (`add`, `add-many`,
+  `autoMode: "on"` + mutating action (`add`, `add-many`,
   `update`, `complete`) → `setupAutoLoop()` first, then execute. The auto tool
   set (`ralph_todo` + `ralph_goal`) is pre-activated at session start when
   auto mode is "on" (cache-neutral arming). `next` skips `Findings: `
-  reference entries on the session backlog only.
+  reference entries (the session backlog is the only backlog).
 - **The auto loop's big picture is the backlog's goal.** The auto loop
   activates `ralph_goal` too and keeps the larger objective in the per-session
   backlog's goal entry: `ralph_goal set` (auto loop only — the auto goal is

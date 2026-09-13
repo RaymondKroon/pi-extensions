@@ -243,7 +243,10 @@ beforeEach(async () => {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	await mkdir(join(agentDir, 'extensions'), { recursive: true });
 	await writeFile(join(projectDir, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
-	await writeFile(join(projectDir, 'TODO.ralph'), RALPH_V1);
+	// The loop's backlog is the session's ralph file in the agent directory
+	// (the e2e session manager uses the fixed id "e2e-session").
+	await mkdir(join(agentDir, 'ralph'), { recursive: true });
+	await writeFile(join(agentDir, 'ralph', 'e2e-session.ralph'), RALPH_V1);
 	await mkdir(join(projectDir, '.pi'), { recursive: true });
 });
 
@@ -306,7 +309,7 @@ async function createRalphSession(port: number, config: Record<string, unknown>)
 		model,
 		modelRuntime,
 		resourceLoader: loader,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.inMemory(projectDir, { id: 'e2e-session' }),
 		cwd: projectDir,
 		// Hermetic settings: without this the session would read the developer's
 		// real ~/.pi/agent/settings.json (e.g. compaction.keepRecentTokens).
@@ -413,7 +416,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'completed-task: a turn that checks off a TODO item via the real write tool starts the next iteration',
 		{ timeout: 60000 },
 		async () => {
-			const todoPath = join(projectDir, 'TODO.ralph');
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.ralph');
 			endpoint = startMockEndpoint([
 				writeToolCallResponder(todoPath, RALPH_V2_TASK_ONE_DONE),
 				textResponder('Task one complete.'),
@@ -431,7 +434,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await sess.prompt('/ralph start');
 
 			// Iteration 1: the mock model calls the real write tool, which really
-			// updates TODO.ralph on disk.
+			// updates the session ralph file on disk.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
 			const todoOnDisk = await readFile(todoPath, 'utf8');
 			expect(todoOnDisk).toContain('D 1');
@@ -456,7 +459,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'rotation: the finished iteration is compacted out of the TUI context; the fresh iteration\'s model context drops the completion summary',
 		{ timeout: 60000 },
 		async () => {
-			const todoPath = join(projectDir, 'TODO.ralph');
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.ralph');
 			// Lower the compaction gate so a small test iteration is compactable
 			// (pi refuses to compact when less than keepRecentTokens would be
 			// discarded; the default is 20000).
@@ -479,7 +482,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await sess.prompt('/ralph start');
 
 			// Iteration 1: the mock model calls the real write tool, which really
-			// updates TODO.ralph on disk.
+			// updates the session ralph file on disk.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
 			const todoOnDisk = await readFile(todoPath, 'utf8');
 			expect(todoOnDisk).toContain('D 1');
@@ -629,7 +632,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'goal loop: planning -> execution -> re-evaluation -> approved completion stops the loop',
 		{ timeout: 90000 },
 		async () => {
-			const todoPath = join(projectDir, 'TODO.ralph');
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.ralph');
 			await writeFile(todoPath, RALPH_GOAL_ONLY);
 			endpoint = startMockEndpoint([
 				// Iteration 1 (planning): the model creates the plan's list, then

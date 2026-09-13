@@ -10,11 +10,9 @@ call `ralph_enable` first, then continue with this reference.
 
 The ralph-format backlog is a SQLite-backed TODO file. `ralph_todo` is its only
 interface: never read or modify the file by any other means (no file tools, no
-grep/cat/sed). Target: with an active Ralph loop the loop's backlog;
-otherwise the project's `TODO.ralph`. The optional `backlog` parameter makes
-the target explicit: `"project"` for the project's `TODO.ralph`, `"session"`
-for the per-session auto backlog (`<session-id>.ralph` in pi's global agent
-directory). Tasks are addressed by their position number as shown by
+grep/cat/sed). Target: the session's ralph file (`<session-id>.ralph` in pi's
+global agent directory) — the active loop's backlog when a loop is running.
+Tasks are addressed by their position number as shown by
 `list`/`next` (e.g. "1", "2", …). Task-numbered actions are scoped to the
 active loop's category — except the auto loop, which works through **every
 list** (one global numbering, each task shows its list).
@@ -23,10 +21,9 @@ list** (one global numbering, each task shows its list).
 
 ### next
 Compact view of the first open task. Prefer it over `list` when you only need
-the next task. On the session backlog, reference entries (titles starting
+the next task. Reference entries (titles starting
 with `Findings: `) are not work items and are skipped; when only reference
-entries remain open, the result says so and lists them. Project backlogs may
-legitimately carry such titles: they are not skipped there. (The big-picture
+entries remain open, the result says so and lists them. (The big-picture
 objective is the backlog's goal, not a `Goal: ` task — `next` never skips a
 `Goal: ` title.)
 
@@ -58,13 +55,11 @@ Loop only. Records a checkpoint note (`note`) on the task.
 
 ### add
 Adds a task (`title`, optional `body` as markdown bullets) to a list given by
-`category`. Project backlog: the list must **exist** — the action never
-creates a list there; use `new-list` for that. Session backlog: missing
-lists are created, and an omitted `category` defaults to the loop's session
-category (auto-created at loop start). `add` on the session backlog starts
-the auto loop first when auto mode is "on" and no loop is active yet; each
-entry should be self-contained for a fresh session: what remains, why,
-relevant paths, and the exact next step.
+`category`. Missing lists are created, and an omitted `category` defaults to
+the loop's session category (auto-created at loop start). `add` starts the
+auto loop first when auto mode is "on" and no loop is active yet; each entry
+should be self-contained for a fresh session: what remains, why, relevant
+paths, and the exact next step.
 
 ### add-many
 Adds several tasks at once via the `tasks` array (`title`, optional `body`,
@@ -94,11 +89,11 @@ Reorders a task within the list: `direction` "up" or "down", optional `by`
 
 ### import
 Converts a Markdown TODO file (`file`, relative to the project) into the
-ralph format, always merging into the project's `TODO.ralph` (even with an
+ralph format, always merging into the session's ralph file (even with an
 active loop). Each source file is only imported once. Imported tasks are
 stamped with `category`, which defaults to a name derived from the file name
 (`TODO_EMAIL.md` → `Email`). `force: true` overwrites an existing non-ralph
-`TODO.ralph` (default false).
+session file (default false).
 
 ### init
 Bootstraps an empty backlog at the target path when it does not exist yet.
@@ -106,8 +101,9 @@ Idempotent; refuses to overwrite a non-ralph file.
 
 ## ralph_goal actions
 
-`ralph_goal` manages the single goal of the same backlog (active loop's
-backlog, else `TODO.ralph`). The goal is the user's contract: its title/body
+`ralph_goal` manages the single goal of the same backlog (the session's
+ralph file — the active loop's backlog when a loop is running). The goal is
+the user's contract: its title/body
 are read-only; only its state changes, via this tool.
 
 ### show
@@ -144,8 +140,8 @@ becomes the goal checkpoint.
 ## Auto mode
 
 The **auto loop** (the "Auto mode" setting in `/ralph config`: off / on) runs
-through the per-session auto backlog with `ralph_todo` (`backlog:
-"session"`) and keeps its big picture in the backlog's **goal** via
+through the per-session ralph file with `ralph_todo` and keeps its big picture
+in the backlog's **goal** via
 `ralph_goal`. It stores its state in a per-session file in the `ralph`
 directory of pi's global agent directory (`<session-id>.ralph`, like sessions
 in its `sessions` directory) and uses one session category per session, named
@@ -189,8 +185,8 @@ current with `ralph_goal` (`set` when it is missing or stale, `checkpoint`
 for what advanced), and every fresh iteration prompt carries the goal block
 (objective + checkpoint) so the next round sees the larger objective.
 
-Without an active auto loop, `ralph_todo` reads the session backlog unscoped
-(`backlog: "session"`). `add`, `add-many`, `update`, and `complete` on the
+Without an active auto loop, `ralph_todo` reads the session backlog unscoped.
+`add`, `add-many`, `update`, and `complete` on the
 session backlog start the auto loop first when auto mode is "on" and no loop
 is active yet — including right after an explicit `/ralph stop`, because the
 recorded todo is a new request that supersedes the stop (the stop only
