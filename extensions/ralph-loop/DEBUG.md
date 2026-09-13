@@ -27,3 +27,9 @@ environment quirks. Organized by topic.
   since the baseline (`hasCompletedTodoItem`). Deleting a pre-existing
   completed task while completing one new one keeps the count equal → no
   rotation. Keep this in mind when constructing test scenarios.
+
+## Process
+- The minify-prompts workflow requires user approval: present the new prompt
+  (before / after / where used) and STOP — do not complete the task or commit
+  until the user approves in chat. Task 10 was completed without that pause
+  (user feedback 2026-09-13); tasks 11–19 must present-then-wait.
