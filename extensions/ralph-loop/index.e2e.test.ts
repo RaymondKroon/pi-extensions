@@ -6,7 +6,8 @@ import {
 	SessionManager,
 	type AgentSession
 } from '@earendil-works/pi-coding-agent';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { Backlog } from './backlog.ts';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -416,7 +417,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'completed-task: a turn that checks off a TODO item via the real write tool starts the next iteration',
 		{ timeout: 60000 },
 		async () => {
-			const todoPath = join(agentDir, 'ralph', 'e2e-session.ralph');
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.db');
 			endpoint = startMockEndpoint([
 				writeToolCallResponder(todoPath, RALPH_V2_TASK_ONE_DONE),
 				textResponder('Task one complete.'),
@@ -434,10 +435,10 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await sess.prompt('/ralph start');
 
 			// Iteration 1: the mock model calls the real write tool, which really
-			// updates the session ralph file on disk.
+			// updates the session ralph file on disk. Backlog.open auto-migrates
+			// the text the write tool left behind, so we assert structurally.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
-			const todoOnDisk = await readFile(todoPath, 'utf8');
-			expect(todoOnDisk).toContain('D 1');
+			expect(Backlog.open(todoPath).listTasks()[0]?.done).toBe(true);
 
 			// A dedicated recording turn (completion log + commit) runs before the
 			// fresh iteration — it is not the iteration prompt.
@@ -459,7 +460,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'rotation: the finished iteration is compacted out of the TUI context; the fresh iteration\'s model context drops the completion summary',
 		{ timeout: 60000 },
 		async () => {
-			const todoPath = join(agentDir, 'ralph', 'e2e-session.ralph');
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.db');
 			// Lower the compaction gate so a small test iteration is compactable
 			// (pi refuses to compact when less than keepRecentTokens would be
 			// discarded; the default is 20000).
@@ -482,10 +483,10 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await sess.prompt('/ralph start');
 
 			// Iteration 1: the mock model calls the real write tool, which really
-			// updates the session ralph file on disk.
+			// updates the session ralph file on disk. Backlog.open auto-migrates
+			// the text the write tool left behind, so we assert structurally.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
-			const todoOnDisk = await readFile(todoPath, 'utf8');
-			expect(todoOnDisk).toContain('D 1');
+			expect(Backlog.open(todoPath).listTasks()[0]?.done).toBe(true);
 
 			// The recording turn runs, then the rotation compacts the finished
 			// iteration (extension-provided: no LLM call) and starts the fresh one.
@@ -632,7 +633,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		'goal loop: planning -> execution -> re-evaluation -> approved completion stops the loop',
 		{ timeout: 90000 },
 		async () => {
-			const todoPath = join(agentDir, 'ralph', 'e2e-session.ralph');
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.db');
 			await writeFile(todoPath, RALPH_GOAL_ONLY);
 			endpoint = startMockEndpoint([
 				// Iteration 1 (planning): the model creates the plan's list, then
@@ -753,13 +754,15 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 
 			// The final file state proves the real tools did the work: both tasks
 			// completed, the goal claimed with evidence and then confirmed to done.
-			const todoOnDisk = await readFile(todoPath, 'utf8');
-			expect(todoOnDisk).toContain('T 1 Plan "Task one."');
-			expect(todoOnDisk).toContain('D 1');
-			expect(todoOnDisk).toContain('T 2 Plan "Task two."');
-			expect(todoOnDisk).toContain('D 2');
-			expect(todoOnDisk).toContain('G "Ship the thing" done');
-			expect(todoOnDisk).toContain('GE "All acceptance criteria verified: bun test passes (5 suites)."');
+			const todo = Backlog.open(todoPath);
+			expect(todo.listTasks().map((t) => [t.category, t.title, t.done])).toEqual([
+				['Plan', 'Task one.', true],
+				['Plan', 'Task two.', true]
+			]);
+			const goal = todo.goal();
+			expect(goal?.title).toBe('Ship the thing');
+			expect(goal?.status).toBe('done');
+			expect(goal?.evidence).toBe('All acceptance criteria verified: bun test passes (5 suites).');
 		}
 	);
 
@@ -804,11 +807,8 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(requestText(freshRequest)).not.toContain(BLOB_MARKER);
 
 			// The state file was created with the auto-created session category.
-			const autoFile = await readFile(
-				join(agentDir, 'ralph', `${session!.sessionManager.getSessionId()}.ralph`),
-				'utf8'
-			);
-			expect(autoFile).toContain('M list "General"');
+			const auto = Backlog.open(join(agentDir, 'ralph', `${session!.sessionManager.getSessionId()}.db`));
+			expect(auto.createdLists()).toEqual(['General']);
 		}
 	);
 });

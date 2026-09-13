@@ -1,13 +1,20 @@
-// Ralph backlog: a SQLite-backed, text-file-persisted task store.
+// Ralph backlog: a SQLite-backed task store, persisted as a SQLite file.
 //
-// The durable, git-friendly representation is a single line-oriented text
-// file whose first non-blank line is the versioned ralph header. The file
-// is parsed into an in-memory SQLite database (node:sqlite); queries and
-// mutations run as SQL; the result is serialized back to the same text
-// format. No .db file is ever written to disk.
+// The durable representation is a SQLite database file (the ralph file,
+// e.g. <session-id>.db in pi's global agent directory). The extension marks
+// the on-disk format: legacy text files are .ralph, SQLite databases are
+// .db. The backlog is
+// held in an in-memory SQLite database (node:sqlite / bun:sqlite); queries
+// and mutations run as SQL; save() serializes the database to a temp file
+// and atomically renames it over the target. Ralph files are global (never
+// tracked in a repository), so the on-disk format is the binary SQLite
+// format, not the human-readable text format below.
 //
-// Text format (one record per line; multi-line fields are indented blocks
-// that end at the next top-level record):
+// Legacy text format (one record per line; multi-line fields are indented
+// blocks that end at the next top-level record). Still parsed by
+// Backlog.parse for auto-migration of old .ralph files (open() migrates
+// them to a .db file), for in-memory baseline snapshots (render()), and
+// for importing ralph-format files:
 //
 //   # ralph v2
 //
@@ -45,6 +52,8 @@
 // v2 form. Once no v1 files remain, the v1 branch can be removed.
 
 import { createRequire } from 'node:module';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 // The store runs on whichever runtime hosts the extension: Node (pi) exposes
 // node:sqlite, while the test runner (Bun) exposes bun:sqlite. Both expose a
@@ -57,22 +66,49 @@ type SqliteStatement = {
 type SqliteDb = {
 	exec: (sql: string) => void;
 	prepare: (sql: string) => SqliteStatement;
+	/** Serialize the whole database to a buffer (both runtimes). */
+	serialize: () => Uint8Array;
+	close: () => void;
 };
 
-function createSqlite(): SqliteDb {
+function createSqlite(path?: string): SqliteDb {
 	const require = createRequire(import.meta.url);
 	try {
 		const mod = require('node:sqlite') as { DatabaseSync: new (path?: string) => SqliteDb };
-		return new mod.DatabaseSync(':memory:');
+		return new mod.DatabaseSync(path ?? ':memory:');
 	} catch {
 		const mod = require('bun:sqlite') as { Database: new (path: string) => SqliteDb };
-		return new mod.Database(':memory:');
+		return new mod.Database(path ?? ':memory:');
 	}
 }
 
 export const RALPH_HEADER = '# ralph v2';
 /** v1 header: accepted for auto-migration; render() writes the v2 form. */
 export const LEGACY_RALPH_HEADER = '# ralph v1';
+
+/** The ralph_schema marker row: identifies a SQLite file as a ralph backlog. */
+const RALPH_SCHEMA_NAME = 'ralph';
+const RALPH_SCHEMA_VERSION = 1;
+
+/** The SQLite file header (magic) every .db file starts with. */
+const SQLITE_MAGIC = Buffer.from('SQLite format 3\0');
+
+/** True when the bytes start with the SQLite file header. */
+export function isSqliteFile(bytes: Uint8Array): boolean {
+	if (bytes.length < SQLITE_MAGIC.length) return false;
+	for (let i = 0; i < SQLITE_MAGIC.length; i += 1) {
+		if (bytes[i] !== SQLITE_MAGIC[i]) return false;
+	}
+	return true;
+}
+
+/** Thrown when a file exists but holds no ralph backlog (neither SQLite nor ralph text). */
+export class NotRalphBacklogError extends Error {
+	constructor(path: string, detail?: string) {
+		super(`${path} is not a ralph backlog${detail ? `: ${detail}` : ''}`);
+		this.name = 'NotRalphBacklogError';
+	}
+}
 
 export interface Task {
 	id: number;
@@ -136,6 +172,11 @@ export class BacklogParseError extends Error {
 }
 
 const SCHEMA = `
+CREATE TABLE ralph_schema (
+	name TEXT NOT NULL,
+	version INTEGER NOT NULL
+);
+INSERT INTO ralph_schema (name, version) VALUES ('ralph', ${RALPH_SCHEMA_VERSION});
 CREATE TABLE tasks (
 	id INTEGER PRIMARY KEY,
 	category TEXT,
@@ -221,6 +262,29 @@ export class Backlog {
 
 	private constructor(db: SqliteDb) {
 		this.db = db;
+	}
+
+	/**
+	 * Copy the data of an opened ralph SQLite file into a fresh in-memory
+	 * database (the marker table comes from the schema). Row-wise, so it
+	 * works on both runtimes (neither exposes backup/deserialize for
+	 * cross-db copies here).
+	 */
+	private static copyIntoMemory(fileDb: SqliteDb): Backlog {
+		const db = newDatabase();
+		const copyTable = (table: string, columns: string[]) => {
+			const rows = fileDb.prepare(`SELECT ${columns.join(', ')} FROM ${table}`).all() as Array<Record<string, unknown>>;
+			if (rows.length === 0) return;
+			const insert = db.prepare(
+				`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
+			);
+			for (const row of rows) insert.run(...columns.map((column) => row[column] ?? null));
+		};
+		copyTable('tasks', ['id', 'category', 'title', 'body', 'done', 'completed_at', 'checkpoint', 'checkpoint_iteration', 'position']);
+		copyTable('completion_entries', ['id', 'task_id', 'date', 'note', 'kind', 'position']);
+		copyTable('meta', ['id', 'key', 'value', 'position']);
+		copyTable('goal', ['id', 'title', 'status', 'body', 'evidence', 'checkpoint', 'checkpoint_iteration']);
+		return new Backlog(db);
 	}
 
 	// --- construction -------------------------------------------------------
@@ -486,6 +550,125 @@ export class Backlog {
 		closeBlock(lines.length);
 		insertLogEntries(db, pendingLogs, legacyKeys);
 		return backlog;
+	}
+
+	/**
+	 * The format sibling of a ralph file name: the extension marks the
+	 * on-disk format, so .ralph (legacy text) and .db (SQLite) are siblings.
+	 * Names with any other extension are their own sibling.
+	 */
+	static formatSibling(path: string): string {
+		if (path.endsWith('.ralph')) return `${path.slice(0, -'.ralph'.length)}.db`;
+		if (path.endsWith('.db')) return `${path.slice(0, -'.db'.length)}.ralph`;
+		return path;
+	}
+
+	/**
+	 * Open a ralph backlog file from disk. The content decides the format,
+	 * not the name: SQLite files are loaded into an in-memory copy (the file
+	 * itself is left untouched until save()); legacy ralph text files (v1/v2)
+	 * are parsed and migrated to a .db file (best effort — a failed migration
+	 * leaves the text file as is and the in-memory backlog still works). A
+	 * missing path falls back to the format sibling (a legacy .ralph file
+	 * already migrated to .db, or the other way around). A SQLite database
+	 * found under the legacy .ralph name is moved to the .db name. Throws
+	 * ENOENT when neither the path nor its sibling exists and
+	 * NotRalphBacklogError when the file holds neither a ralph SQLite
+	 * database nor ralph text.
+	 */
+	static open(path: string): Backlog {
+		let file = path;
+		let bytes: Buffer;
+		try {
+			bytes = readFileSync(file);
+		} catch (error) {
+			const sibling = Backlog.formatSibling(path);
+			if (sibling === path) throw error;
+			file = sibling;
+			bytes = readFileSync(file); // throws ENOENT when that is missing too
+		}
+		if (isSqliteFile(bytes)) {
+			let fileDb: SqliteDb;
+			try {
+				fileDb = createSqlite(file);
+			} catch (error) {
+				throw new NotRalphBacklogError(path, `corrupt SQLite file (${error instanceof Error ? error.message : String(error)})`);
+			}
+			try {
+				let marker: { version: number } | undefined;
+				try {
+					marker = fileDb.prepare('SELECT version FROM ralph_schema WHERE name = ?').get(RALPH_SCHEMA_NAME) as
+						| { version: number }
+						| undefined;
+				} catch {
+					marker = undefined; // no ralph_schema table: a foreign SQLite file
+				}
+				if (!marker || marker.version !== RALPH_SCHEMA_VERSION) {
+					throw new NotRalphBacklogError(path, 'no ralph schema marker');
+				}
+				const backlog = Backlog.copyIntoMemory(fileDb);
+				if (file.endsWith('.ralph')) {
+					// A SQLite database under the legacy text name: move it to
+					// the .db name (best effort; the sibling fallback keeps it
+					// reachable either way).
+					try {
+						const target = Backlog.formatSibling(file);
+						if (!existsSync(target)) {
+							backlog.save(target);
+							unlinkSync(file);
+						}
+					} catch {
+						// keep it where it is
+					}
+				}
+				return backlog;
+			} finally {
+				fileDb.close();
+			}
+		}
+		const text = bytes.toString('utf8');
+		if (!isRalphBacklog(text)) {
+			throw new NotRalphBacklogError(path);
+		}
+		const backlog = Backlog.parse(text);
+		// Auto-migrate the legacy text file to SQLite: the database is written
+		// to the .db name (the extension marks the format), verified by
+		// reopening, and the text file is removed. Best effort: on any failure
+		// the text file stays and is migrated on a later open.
+		try {
+			const target = file.endsWith('.ralph') ? Backlog.formatSibling(file) : file;
+			const fresh = target === file || !existsSync(target);
+			if (fresh) backlog.save(target);
+			if (target !== file && fresh) {
+				const check = Backlog.open(target);
+				if (check.render() !== backlog.render()) throw new Error('migrated database renders differently');
+				unlinkSync(file);
+			}
+		} catch {
+			// read-only location or similar: keep the text file, migrate later
+		}
+		return backlog;
+	}
+
+	/**
+	 * Persist the in-memory store to path as a SQLite file: serialize to a
+	 * temp file in the same directory, then atomically rename over the target
+	 * (a crash never leaves a truncated ralph file behind).
+	 */
+	save(path: string): void {
+		mkdirSync(dirname(path), { recursive: true });
+		const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
+		try {
+			writeFileSync(temp, this.db.serialize());
+			renameSync(temp, path);
+		} catch (error) {
+			try {
+				unlinkSync(temp);
+			} catch {
+				// the temp file may not exist (serialize failed)
+			}
+			throw error;
+		}
 	}
 
 	// --- queries --------------------------------------------------------------

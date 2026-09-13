@@ -304,7 +304,11 @@ let dir: string;
 /** The fake global agent directory (getAgentDir via PI_CODING_AGENT_DIR). */
 let agentDir: string;
 /** The auto mode's per-session state file in the fake agent directory. */
-const autoFile = () => join(agentDir, 'ralph', 'test-session.ralph');
+const autoFile = () => join(agentDir, 'ralph', 'test-session.db');
+/** Read a ralph file from disk (a SQLite database; legacy text auto-migrates). */
+const readBacklog = (path: string = autoFile()): Backlog => Backlog.open(path);
+/** The rendered text form of a ralph file (for snapshot comparisons). */
+const renderFile = (path: string = autoFile()): string => Backlog.open(path).render();
 
 beforeEach(async () => {
 	dir = await mkdtemp(join(tmpdir(), 'ralph-loop-test-'));
@@ -1023,12 +1027,12 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
 		await importTodo(fake, fakeCtx, 'import TODO.md');
-		const imported = await readFile(autoFile(), 'utf8');
-		expect(imported.startsWith('# ralph v2')).toBe(true);
-		expect(imported).toContain('M source "TODO.md"');
-		expect(imported).toContain('T 1 General "Establish a clean local developer contract."');
-		expect(imported).toContain('D 3');
-		expect(imported).toContain('L 1 3 2026-08-10');
+		const imported = readBacklog();
+		expect(imported.sources()).toEqual(['TODO.md']);
+		expect(imported.listTasks().find((t) => t.title === 'Establish a clean local developer contract.')?.category).toBe('General');
+		expect(imported.listTasks().find((t) => t.title === 'Add sign-in.')?.done).toBe(true);
+		expect(imported.counts()).toEqual({ open: 2, total: 3, completed: 1 });
+		expect(imported.listLogEntries().map((e) => [e.taskId, e.date])).toEqual([[3, '2026-08-10']]);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 3 tasks (2 open)');
 
 		// Importing the same file again is refused: the source is recorded.
@@ -1049,7 +1053,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
 		await importTodo(fake, fakeCtx, 'import TODO.md');
-		expect((await readFile(autoFile(), 'utf8')).startsWith('# ralph v2')).toBe(true);
+		expect(readBacklog().listTasks()).toHaveLength(3);
 
 		fakeCtx.notifications.length = 0;
 		await importTodo(fake, fakeCtx, 'import TODO.ralph');
@@ -1057,12 +1061,12 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 
 		// Non-Markdown input is rejected outright; ralph-format content in a
 		// .md file is rejected as input.
-		await writeFile(join(dir, 'OTHER.ralph'), await readFile(autoFile(), 'utf8'));
+		await writeFile(join(dir, 'OTHER.ralph'), renderFile());
 		fakeCtx.notifications.length = 0;
 		await importTodo(fake, fakeCtx, 'import OTHER.ralph');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('only accepts Markdown TODO files');
 
-		await writeFile(join(dir, 'OTHER.md'), await readFile(autoFile(), 'utf8'));
+		await writeFile(join(dir, 'OTHER.md'), renderFile());
 		fakeCtx.notifications.length = 0;
 		await importTodo(fake, fakeCtx, 'import OTHER.md');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('already a ralph-format backlog');
@@ -1087,11 +1091,9 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await importTodo(fake, fakeCtx, 'import FEATURES.md --category beta');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Merged 1 task');
 
-		const combined = await readFile(autoFile(), 'utf8');
-		expect(combined).toContain('M source "TODO.md"');
-		expect(combined).toContain('M source "FEATURES.md"');
+		const merged = readBacklog();
+		expect(merged.sources()).toEqual(['TODO.md', 'FEATURES.md']);
 		// Both files' tasks are present, stamped with their import categories.
-		const merged = Backlog.parse(combined);
 		expect(merged.listTasks().find((t) => t.title === 'Establish a clean local developer contract.')?.category).toBe('alpha');
 		expect(merged.listTasks().find((t) => t.title === 'Ship export.')?.category).toBe('beta');
 		expect(merged.counts()).toEqual({ open: 3, total: 4, completed: 1 });
@@ -1115,13 +1117,13 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		fakeCtx.inputQueue.push('');
 		await importTodo(fake, fakeCtx, 'import TODO.md');
 		expect(fakeCtx.inputPrompts).toEqual([{ title: 'Category', placeholder: 'General' }]);
-		expect((await readFile(autoFile(), 'utf8')).startsWith('# ralph v2')).toBe(true);
+		expect(readBacklog().listTasks()).toHaveLength(3);
 
 		// Second import: merges into the same session file; --category skips the prompt.
 		fakeCtx.inputPrompts.length = 0;
 		await importTodo(fake, fakeCtx, 'import TODO_EMAIL.md --category Email');
 		expect(fakeCtx.inputPrompts).toEqual([]);
-		const main = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const main = readBacklog();
 		expect(main.listTasks().find((t) => t.title === 'Establish a clean local developer contract.')).toBeDefined();
 		expect(main.listTasks().find((t) => t.title === 'Fetch mail.')?.category).toBe('Email');
 		expect(main.sources()).toEqual(['TODO.md', 'TODO_EMAIL.md']);
@@ -1200,14 +1202,18 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		for (const task of ['1', '2']) {
 			await tool.execute('t', { action: 'complete', task }, undefined, undefined, fakeCtx.ctx);
 			fakeCtx.usagePercent.value = 10;
-			await fake.fire('agent_settled', fakeCtx.ctx);
 			if (task === '2') {
-				// While the loop winds down (recording the last completion) the
-				// counter says done instead of a misleading 3/3.
+				// As soon as the last task completes the counter says done
+				// instead of a misleading 3/3; the loop winds down (recording
+				// the completion, then stopping on the finished backlog) at
+				// the next settle.
 				expect(statusLine(fakeCtx.widgets)).toMatch(/task: 3\/3 \(done\) \(iteration \d+\)/);
 			}
+			await fake.fire('agent_settled', fakeCtx.ctx);
 			await flush();
 		}
+		// The finished backlog stops the loop once the recording turn settles.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
 	});
 
 	test('start --category scopes the backlog; a new category is created but must hold tasks', async () => {
@@ -1217,12 +1223,12 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 		await importTodo(fake, fakeCtx, 'import TODO.md');
 
-		// Give the tasks categories by editing the imported file directly.
-		const withCategories = (await readFile(autoFile(), 'utf8'))
-			.replace('T 1 General ', 'T 1 dossier ')
-			.replace('T 2 General ', 'T 2 dossier ')
-			.replace('T 3 General ', 'T 3 auth ');
-		await writeFile(autoFile(), withCategories);
+		// Give the tasks categories by editing the imported backlog directly.
+		const withCategories = readBacklog();
+		withCategories.updateTaskById(1, { category: 'dossier' });
+		withCategories.updateTaskById(2, { category: 'dossier' });
+		withCategories.updateTaskById(3, { category: 'auth' });
+		withCategories.save(autoFile());
 
 		const ralph = fake.commands.get('ralph')!;
 		fakeCtx.notifications.length = 0;
@@ -1230,7 +1236,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(fake.userMessages.length).toBe(0);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('category "nope" has no tasks');
 		// The refused start leaves the session file untouched.
-		expect(await readFile(autoFile(), 'utf8')).not.toContain('M list "nope"');
+		expect(readBacklog().createdLists()).not.toContain('nope');
 
 		fakeCtx.notifications.length = 0;
 		await ralph.handler('start --category dossier', fakeCtx.ctx);
@@ -1259,7 +1265,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		};
 		expect(tool).toBeDefined();
 		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
-		const file = () => readFile(autoFile(), 'utf8');
+		const file = () => readBacklog();
 
 		// The compact list shows open tasks only; the recorded completion (P0.3) stays out.
 		const list = await run({ action: 'list' });
@@ -1286,30 +1292,29 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 
 		const done = await run({ action: 'complete', task: '1' });
 		expect(done.content[0]!.text).toContain('Marked task 1 "Establish a clean local developer contract." done');
-		expect(await file()).toContain('D 1');
+		expect(file().listTasks()[0]?.done).toBe(true);
 
 		const checkpoint = await run({ action: 'checkpoint', task: '2', note: 'Removed routes; next step is the shell.' });
 		expect(checkpoint.content[0]!.text).toContain('Checkpoint recorded for task 2');
-		const afterCheckpoint = await file();
-		expect(afterCheckpoint).toContain('C 2 1');
-		expect(afterCheckpoint).toContain('Removed routes; next step is the shell.');
+		const afterCheckpoint = file();
+		expect(afterCheckpoint.listTasks()[1]?.checkpoint).toBe('Removed routes; next step is the shell.');
+		expect(afterCheckpoint.listTasks()[1]?.checkpointIteration).toBe(1);
 
 		const logged = await run({ action: 'log', task: '1', date: '2026-08-11', note: 'Replaced the README. Verified: bun test.' });
 		expect(logged.content[0]!.text).toContain('Completion log entry recorded');
-		expect(await file()).toContain('L 2 1 2026-08-11');
+		expect(file().listLogEntriesForTask(1).map((e) => [e.date, e.note])).toEqual([['2026-08-11', 'Replaced the README. Verified: bun test.']]);
 
 		// Creating a list is explicit; add to it after.
 		await run({ action: 'new-list', name: 'auth' });
 		const added = await run({ action: 'add', title: 'Add sign-out.', category: 'auth', body: '- Acceptance: sessions expire.' });
 		expect(added.content[0]!.text).toContain('Added task 4 "Add sign-out." in category "auth"');
-		expect(await file()).toContain('T 4 auth "Add sign-out."');
+		expect(file().listTasks().find((t) => t.title === 'Add sign-out.')?.category).toBe('auth');
 
 		// Unknown numbers report the known numbers.
 		await expect(run({ action: 'complete', task: 'NOPE' })).rejects.toThrow(/no task NOPE \(tasks: 1, 2, 3, 4\)/);
 
-		// The file stays valid ralph format after every mutation.
-		const final = await file();
-		expect(final.startsWith('# ralph v2')).toBe(true);
+		// The file stays a valid ralph backlog after every mutation.
+		expect(file().listTasks()).toHaveLength(4);
 	});
 
 	test('ralph_todo complete with a note records the completion log entry in the same call', async () => {
@@ -1331,15 +1336,15 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			) => Promise<{ content: Array<{ type: string; text: string }> }>;
 		};
 		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
-		const file = () => readFile(autoFile(), 'utf8');
+		const file = () => readBacklog();
 
 		// complete with a note: the note becomes the completion log entry, and the
 		// result says so — the model never has to guess whether it was recorded.
 		const done = await run({ action: 'complete', task: '1', note: 'Replaced the README. Verified: bun test.' });
 		expect(done.content[0]!.text).toContain('Marked task 1 "Establish a clean local developer contract." done');
 		expect(done.content[0]!.text).toContain('recorded the completion log entry');
-		expect(await file()).toContain('D 1');
-		expect(await file()).toContain('Replaced the README. Verified: bun test.');
+		expect(file().listTasks()[0]?.done).toBe(true);
+		expect(file().listLogEntriesForTask(1).map((e) => e.note)).toEqual(['Replaced the README. Verified: bun test.']);
 
 		// The entry shows in the task detail view.
 		const detail = await run({ action: 'list', task: '1' });
@@ -1385,7 +1390,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(created.content[0]!.text).toContain('Created list "Docs"');
 		const added = await run({ action: 'add', title: 'Write the onboarding doc.', category: 'Docs' });
 		expect(added.content[0]!.text).toContain('category "Docs"');
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		const task = backlog.listTasks().find((t) => t.title === 'Write the onboarding doc.');
 		expect(task?.category).toBe('Docs');
 		// Adding to a list that does not exist yet creates it (session backlog).
@@ -1404,7 +1409,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// move reorders tasks in the file.
 		const moved = await run({ action: 'move', task: '4', direction: 'up' });
 		expect(moved.content[0]!.text).toContain('Moved task 3 "Write the onboarding doc." up by 1.');
-		const afterMove = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const afterMove = readBacklog();
 		expect(afterMove.listTasks().map((t) => t.title)).toEqual([
 			'Establish a clean local developer contract.',
 			'Remove starter/demo surfaces.',
@@ -1455,7 +1460,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(batch.content[0]!.text).toContain('Added 3 tasks:');
 		expect(batch.content[0]!.text).toContain('[Infra]');
 		expect(batch.content[0]!.text).toContain('[Docs]');
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		expect(backlog.listTasks().slice(-3).map((t) => t.title)).toEqual([
 			'First batch task.',
 			'Second batch task.',
@@ -1469,12 +1474,12 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// A missing category is refused: nothing is added.
 		const before = backlog.listTasks().length;
 		await expect(run({ action: 'add-many', tasks: [{ title: 'X.' }] })).rejects.toThrow(/requires a category/);
-		expect(Backlog.parse(await readFile(autoFile(), 'utf8')).listTasks().length).toBe(before);
+		expect(readBacklog().listTasks().length).toBe(before);
 
 		// An unknown batch category is created (session backlog): the whole batch lands.
 		const addedNope = await run({ action: 'add-many', category: 'Nope', tasks: [{ title: 'X.' }, { title: 'Y.', category: 'Docs' }] });
 		expect(addedNope.content[0]!.text).toContain('Added 2 tasks:');
-		expect(Backlog.parse(await readFile(autoFile(), 'utf8')).categories()).toContain('Nope');
+		expect(readBacklog().categories()).toContain('Nope');
 
 		// An unknown per-entry override is created as well.
 		const addedOverride = await run({ action: 'add-many', category: 'Infra', tasks: [{ title: 'X.' }, { title: 'Y.', category: 'Nope' }] });
@@ -1503,7 +1508,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			) => Promise<{ content: Array<{ type: string; text: string }> }>;
 		};
 		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
-		const before = await readFile(autoFile(), 'utf8');
+		const before = renderFile();
 
 		// query is required.
 		await expect(run({ action: 'search' })).rejects.toThrow(/search requires the query/);
@@ -1526,7 +1531,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(none.content[0]!.text).toBe('No matches for "werkvoorraad" (3 tasks in all lists).');
 
 		// Search is read-only: the backlog file is untouched.
-		expect(await readFile(autoFile(), 'utf8')).toBe(before);
+		expect(renderFile()).toBe(before);
 	});
 
 
@@ -1553,10 +1558,10 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		const imported = await run({ action: 'import', file: 'TODO.md' });
 		expect(imported.content[0]!.text).toContain('Imported 3 tasks (2 open)');
 		expect(imported.content[0]!.text).toContain('category "General"');
-		let file = await readFile(autoFile(), 'utf8');
-		expect(file.startsWith('# ralph v2')).toBe(true);
-		expect(file).toContain('M source "TODO.md"');
-		expect(file).toContain('T 1 General "Establish a clean local developer contract."');
+		let file = readBacklog();
+		expect(file.sources()).toEqual(['TODO.md']);
+		expect(file.listTasks()[0]?.title).toBe('Establish a clean local developer contract.');
+		expect(file.listTasks()[0]?.category).toBe('General');
 
 		// Re-importing the same source is refused (the source is recorded).
 		await expect(run({ action: 'import', file: 'TODO.md' })).rejects.toThrow(/already imported into/);
@@ -1569,9 +1574,9 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// Omitted category defaults to the file-name-derived name (EMAIL.md → Email).
 		const merged = await run({ action: 'import', file: 'EMAIL.md' });
 		expect(merged.content[0]!.text).toContain('Merged 2 tasks');
-		file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('M source "EMAIL.md"');
-		expect(file).toContain('T 4 Email "Draft the reply template."');
+		file = readBacklog();
+		expect(file.sources()).toEqual(['TODO.md', 'EMAIL.md']);
+		expect(file.listTasks().find((t) => t.title === 'Draft the reply template.')?.category).toBe('Email');
 
 		// Non-Markdown input, missing files, and a missing path are refused.
 		await expect(run({ action: 'import', file: 'TODO.ralph' })).rejects.toThrow(/only accepts Markdown TODO files/);
@@ -1639,7 +1644,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(listCreated.content[0]!.text).toContain('Created list "Docs"');
 		const added = await run({ action: 'add', title: 'Write the onboarding doc.', category: 'Docs' });
 		expect(added.content[0]!.text).toContain('category "Docs"');
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		const task = backlog.listTasks().find((t) => t.title === 'Write the onboarding doc.');
 		expect(task?.category).toBe('Docs');
 
@@ -1670,7 +1675,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// init creates the missing file.
 		const created = await run({ action: 'init' });
 		expect(created.content[0]!.text).toContain('Created empty Ralph backlog');
-		expect((await readFile(autoFile(), 'utf8')).startsWith('# ralph v2')).toBe(true);
+		expect(readBacklog().listTasks()).toHaveLength(0);
 
 		// init is idempotent on an existing ralph backlog.
 		const again = await run({ action: 'init' });
@@ -2253,25 +2258,20 @@ GE "All routes render."
 
 	test('checkpoint replaces the single goal checkpoint in the file', async () => {
 		const { run } = await startLoopWith(GOAL_OPEN);
-		const file = () => readFile(autoFile(), 'utf8');
+		const file = () => readBacklog();
 
 		const first = await run({ action: 'checkpoint', note: 'Plan drafted; next: review the routes.' });
 		expect(first.content[0]!.text).toContain('Checkpoint recorded for the goal "Rewrite the app" (iteration 1)');
-		let text = await file();
-		expect(text).toContain('GC 1');
-		expect(text).toContain('Plan drafted; next: review the routes.');
+		let goal = file().goal()!;
+		expect(goal.checkpoint).toBe('Plan drafted; next: review the routes.');
+		expect(goal.checkpointIteration).toBe(1);
 
 		// The checkpoint is replaced, never stacked.
 		const second = await run({ action: 'checkpoint', note: 'Plan reviewed; next: start execution.' });
 		expect(second.content[0]!.text).toContain('(iteration 1)');
-		text = await file();
-		expect(text).toContain('Plan reviewed; next: start execution.');
-		expect(text).not.toContain('Plan drafted; next: review the routes.');
-		const goal = Backlog.parse(text).goal()!;
+		goal = file().goal()!;
 		expect(goal.checkpoint).toBe('Plan reviewed; next: start execution.');
 		expect(goal.checkpointIteration).toBe(1);
-		// The file stays valid ralph format.
-		expect(text.startsWith('# ralph v2')).toBe(true);
 	});
 
 	test('complete requires an active goal loop, an open goal, no open tasks, and evidence', async () => {
@@ -2292,7 +2292,7 @@ GE "All routes render."
 		// Open tasks block completion; the file is untouched.
 		const openTasks = await startLoopWith(GOAL_OPEN_WITH_TASK);
 		await expect(openTasks.run({ action: 'complete', note: 'verified' })).rejects.toThrow(/1 task still open/);
-		expect(await readFile(autoFile(), 'utf8')).toContain('G "Rewrite the app" open');
+		expect(readBacklog().goal()?.status).toBe('open');
 
 		// Missing evidence is refused before any state change.
 		const noEvidence = await startLoopWith(GOAL_OPEN_TASKS_DONE);
@@ -2322,14 +2322,9 @@ GE "All routes render."
 		expect(result.content[0]!.text).toContain('ralph_goal with action "withdraw"');
 
 		// The goal is claimed (not done) with the evidence in the file.
-		const text = await readFile(autoFile(), 'utf8');
-		expect(text).toContain('G "Rewrite the app" claimed');
-		expect(text).toContain('GE "All criteria verified: bun test green."');
-		const goal = Backlog.parse(text).goal()!;
+		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('claimed');
 		expect(goal.evidence).toBe('All criteria verified: bun test green.');
-		// The file stays valid ralph format.
-		expect(text.startsWith('# ralph v2')).toBe(true);
 
 		// The loop is blocked: the status shows waiting, the decision widget is
 		// set, and the user is notified.
@@ -2357,9 +2352,9 @@ GE "All routes render."
 		expect(result.terminate).toBeUndefined();
 		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approver: auto-approved)');
 
-		const text = await readFile(autoFile(), 'utf8');
-		expect(text).toContain('G "Rewrite the app" done');
-		expect(text).toContain('GE "All criteria verified: bun test green."');
+		const goal = readBacklog().goal()!;
+		expect(goal.status).toBe('done');
+		expect(goal.evidence).toBe('All criteria verified: bun test green.');
 		expect(statusLine(fakeCtx.widgets)).not.toContain('waiting');
 	});
 
@@ -2390,14 +2385,9 @@ GE "All routes render."
 		expect(result.terminate).toBeUndefined();
 		expect(result.content[0]!.text).toContain('Goal "Rewrite the app" is done (approved)');
 
-		const text = await readFile(autoFile(), 'utf8');
-		expect(text).toContain('G "Rewrite the app" done');
-		expect(text).toContain('GE "All routes render."');
-		const goal = Backlog.parse(text).goal()!;
+		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('done');
 		expect(goal.evidence).toBe('All routes render.');
-		// The file stays valid ralph format.
-		expect(text.startsWith('# ralph v2')).toBe(true);
 	});
 
 	test('withdraw requires an active goal loop, a claimed goal, and a note', async () => {
@@ -2431,14 +2421,10 @@ GE "All routes render."
 		expect(result.terminate).toBeUndefined();
 		expect(result.content[0]!.text).toContain('open again');
 
-		const text = await readFile(autoFile(), 'utf8');
-		expect(text).toContain('G "Rewrite the app" open');
-		const goal = Backlog.parse(text).goal()!;
+		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('open');
 		expect(goal.evidence).toBeNull();
 		expect(goal.checkpoint).toBe('Criterion 2 not met: the state was not ported.');
-		// The file stays valid ralph format.
-		expect(text.startsWith('# ralph v2')).toBe(true);
 	});
 });
 
@@ -2685,13 +2671,13 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		// The home view shows the list rows (the import stamped "General");
 		// with no goal the (all) row is highlighted first.
 		const home = component.render(100).join('\n');
-		expect(home).toContain('Ralph home — test-session.ralph');
+		expect(home).toContain('Ralph home — test-session.db');
 		expect(home).toContain('> (all) — 2 open / 3 total');
 		expect(home).toContain('General — 2 open / 3 total');
 		// Enter on (all) opens the unchanged task view.
 		component.handleInput('\r');
 		const rendered = component.render(100).join('\n');
-		expect(rendered).toContain('Ralph backlog — test-session.ralph');
+		expect(rendered).toContain('Ralph backlog — test-session.db');
 		expect(rendered).toContain('Establish a clean local developer contract.');
 		// No separate completion log section in the view.
 		expect(rendered).not.toContain('Completion log');
@@ -2706,13 +2692,11 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 		const ralph = fake.commands.get('ralph')!;
 		await ralph.handler('import TODO.md', fakeCtx.ctx);
-		await writeFile(
-			autoFile(),
-			(await readFile(autoFile(), 'utf8'))
-				.replace('T 1 General ', 'T 1 dossier ')
-				.replace('T 2 General ', 'T 2 dossier ')
-				.replace('T 3 General ', 'T 3 auth ')
-		);
+		const reclassified = readBacklog();
+		reclassified.updateTaskById(1, { category: 'dossier' });
+		reclassified.updateTaskById(2, { category: 'dossier' });
+		reclassified.updateTaskById(3, { category: 'auth' });
+		reclassified.save(autoFile());
 		await ralph.handler('start --category dossier', fakeCtx.ctx);
 
 		await ralph.handler('', fakeCtx.ctx);
@@ -2755,7 +2739,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		};
 		// The home view shows one row per list with open/total counts.
 		const homeText = host.render(100).join('\n');
-		expect(homeText).toContain('Ralph home — test-session.ralph');
+		expect(homeText).toContain('Ralph home — test-session.db');
 		expect(homeText).toContain('> (all) — 3 open / 4 total');
 		expect(homeText).toContain('General — 2 open / 3 total');
 		expect(homeText).toContain('Email — 1 open / 1 total');
@@ -2808,7 +2792,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 
 		// Re-opening a list from the home view swaps back to the view.
 		component.handleInput('\r'); // (all) row
-		expect(component.render(100).join('\n')).toContain('Ralph backlog — test-session.ralph');
+		expect(component.render(100).join('\n')).toContain('Ralph backlog — test-session.db');
 	});
 
 	test('R renames the highlighted list from the home view', async () => {
@@ -2839,7 +2823,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		home.handleInput('2');
 		home.handleInput('\r');
 		await flush();
-		const onDisk = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const onDisk = readBacklog();
 		expect(onDisk.categories()).toEqual(['General2', 'Email']);
 		expect(onDisk.listTasks().find((t) => t.title === 'Establish a clean local developer contract.')?.category).toBe('General2');
 		// The home view shows the renamed list in place with a saved notice.
@@ -2853,7 +2837,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		for (const ch of 'Email') home.handleInput(ch);
 		home.handleInput('\r');
 		await flush();
-		const after = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const after = readBacklog();
 		expect(after.categories()).toEqual(['General2', 'Email']);
 		expect(home.render(100).join('\n')).toContain('not saved');
 
@@ -2893,7 +2877,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			handleInput: (data: string) => void;
 		};
 		host.handleInput('\r');
-		expect(host.render(100).join('\n')).toContain('Ralph backlog — test-session.ralph');
+		expect(host.render(100).join('\n')).toContain('Ralph backlog — test-session.db');
 
 		// Missing file: error notification, no view.
 		fakeCtx.notifications.length = 0;
@@ -2932,8 +2916,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		for (const ch of 'New task from the view') component.handleInput(ch);
 		component.handleInput('\x13'); // Ctrl+S saves the form
 		await flush();
-		const onDisk = await readFile(autoFile(), 'utf8');
-		expect(onDisk).toContain('New task from the view');
+		expect(readBacklog().listTasks().map((t) => t.title)).toContain('New task from the view');
 	});
 
 	test('s starts a loop scoped to the chosen list through the shared start path', async () => {
@@ -3009,7 +2992,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		expect(fakeCtx.customFactories.length).toBe(1);
 		expect(
 			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
-		).toContain('Ralph home — test-session.ralph');
+		).toContain('Ralph home — test-session.db');
 
 		// A first argument that is not a subcommand is a backlog file.
 		fakeCtx.customFactories.length = 0;
@@ -3017,7 +3000,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		expect(fakeCtx.customFactories.length).toBe(1);
 		expect(
 			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
-		).toContain('Ralph home — test-session.ralph');
+		).toContain('Ralph home — test-session.db');
 
 		// Known subcommands are untouched: start still starts the task loop.
 		fakeCtx.customFactories.length = 0;
@@ -3044,6 +3027,40 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			'status',
 			'config'
 		]);
+	});
+
+	test('bare /ralph follows a persisted pre-migration .ralph state path to its .db sibling', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		// The session's backlog exists only as the migrated SQLite database;
+		// the persisted loop state (from before the SQLite migration) still
+		// records the legacy .ralph name.
+		Backlog.parse(RALPH_V1).save(autoFile());
+		fakeCtx.branchEntries.push({
+			type: 'custom',
+			customType: 'ralph-loop-state',
+			data: {
+				enabled: true,
+				mode: 'auto',
+				todoPath: join(agentDir, 'ralph', 'test-session.ralph'),
+				specPath: join(dir, 'SPEC.md'),
+				baselineTodo: '',
+				contextThreshold: 0.5,
+				rotationQueued: false,
+				maxIterations: 10
+			}
+		});
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('', fakeCtx.ctx);
+		expect(
+			fakeCtx.notifications.some((n) => n.message.startsWith('No backlog found'))
+		).toBe(false);
+		expect(fakeCtx.customFactories.length).toBe(1);
+		expect(
+			(fakeCtx.customFactories[0]!({ requestRender: () => {} }, fakeTheme, undefined, () => {}) as { render: (w: number) => string[] }).render(100).join('\n')
+		).toContain('Ralph home — test-session.db');
 	});
 });
 
@@ -3100,7 +3117,7 @@ describe('/ralph-init (ralph-format-only)', () => {
 
 		fakeCtx.notifications.length = 0;
 		await init('--force --goal Build a lamp that dims.');
-		expect((await readFile(autoFile(), 'utf8')).startsWith('# ralph v2')).toBe(true);
+		expect(readBacklog().goal()?.title).toBe('Build a lamp that dims.');
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
@@ -3109,8 +3126,7 @@ describe('/ralph-init (ralph-format-only)', () => {
 			await rm(join(dir, 'SPEC.md'));
 			await init('--goal Build a lamp that dims.');
 
-			const text = await readFile(autoFile(), 'utf8');
-			const backlog = Backlog.parse(text);
+			const backlog = readBacklog();
 			const goal = backlog.goal();
 			expect(goal?.title).toBe('Build a lamp that dims.');
 			expect(goal?.status).toBe('open');
@@ -3137,11 +3153,11 @@ describe('/ralph-init (ralph-format-only)', () => {
 		test('is idempotent on an existing goal', async () => {
 			await rm(join(dir, 'SPEC.md'));
 			await init('--goal Build a lamp that dims.');
-			const first = await readFile(autoFile(), 'utf8');
+			const first = renderFile();
 			fake.userMessages.length = 0;
 			fakeCtx.notifications.length = 0;
 			await init('--goal Build a lamp that dims.');
-			expect(await readFile(autoFile(), 'utf8')).toBe(first);
+			expect(renderFile()).toBe(first);
 			expect(fakeCtx.notifications.some((n) => n.message.includes('already has the goal'))).toBe(true);
 			// The spec prompt is still sent (the spec is always generated).
 			expect(fake.userMessages).toHaveLength(1);
@@ -3152,7 +3168,7 @@ describe('/ralph-init (ralph-format-only)', () => {
 			await writeFile(autoFile(), RALPH_V1);
 			await init('--goal Build a lamp that dims.');
 
-			const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+			const backlog = readBacklog();
 			expect(backlog.goal()?.title).toBe('Build a lamp that dims.');
 			// The existing tasks are untouched.
 			expect(backlog.counts()).toEqual({ open: 3, total: 3, completed: 0 });
@@ -3191,7 +3207,7 @@ describe('ralph-loop extension (set-goal command)', () => {
 
 		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
 
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		expect(backlog.goal()?.title).toBe('Port the complete app');
 		expect(backlog.goal()?.status).toBe('open');
 		expect(backlog.goal()?.body).toBe('Port the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
@@ -3210,7 +3226,7 @@ describe('ralph-loop extension (set-goal command)', () => {
 
 		await setGoal(fake, fakeCtx, 'set-goal PLAIN.md');
 
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		expect(backlog.goal()?.title).toBe('Ship the thing');
 		expect(backlog.goal()?.body).toBe('Criterion one holds.\nCriterion two holds.');
 	});
@@ -3225,7 +3241,7 @@ describe('ralph-loop extension (set-goal command)', () => {
 		fakeCtx.notifications.length = 0;
 		await fake.commands.get('ralph')!.handler('set-goal SECOND.md', fakeCtx.ctx);
 
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		expect(backlog.goal()?.title).toBe('Second goal');
 		expect(backlog.goal()?.body).toBe('Second body.');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Replaced the goal in');
@@ -3247,7 +3263,9 @@ T 1 - "Task one"
 		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
 
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('is claimed — resolve it first');
-		expect(await readFile(autoFile(), 'utf8')).toBe(claimed);
+		// The refusal leaves the backlog content untouched (the file itself may
+		// have been migrated to the SQLite form on open).
+		expect(renderFile()).toBe(Backlog.parse(claimed).render());
 	});
 
 	test('refuses a done goal and leaves the file untouched', async () => {
@@ -3267,7 +3285,9 @@ D 1
 		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
 
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('is done — resolve it first');
-		expect(await readFile(autoFile(), 'utf8')).toBe(done);
+		// The refusal leaves the backlog content untouched (the file itself may
+		// have been migrated to the SQLite form on open).
+		expect(renderFile()).toBe(Backlog.parse(done).render());
 	});
 
 	test('targets the active loop’s backlog', async () => {
@@ -3279,7 +3299,7 @@ D 1
 
 		await fake.commands.get('ralph')!.handler('set-goal GOAL.md', fakeCtx.ctx);
 
-		const backlog = Backlog.parse(await readFile(autoFile(), 'utf8'));
+		const backlog = readBacklog();
 		expect(backlog.goal()?.title).toBe('Port the complete app');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('The active task loop is unaffected.');
 	});
@@ -3292,7 +3312,7 @@ D 1
 		await setGoal(fake, fakeCtx, 'set-goal MISSING.md');
 
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Could not read MISSING.md');
-		expect(Backlog.parse(await readFile(autoFile(), 'utf8')).goal()).toBeUndefined();
+		expect(readBacklog().goal()).toBeUndefined();
 	});
 
 	test('refuses a goal file without a title line', async () => {
@@ -3360,7 +3380,7 @@ D 1
 		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
 
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Wait for the current agent run to finish before setting the goal');
-		expect(Backlog.parse(await readFile(autoFile(), 'utf8')).goal()).toBeUndefined();
+		expect(readBacklog().goal()).toBeUndefined();
 	});
 });
 
@@ -3968,10 +3988,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(prompt).toContain('Run the Ralph auto loop');
 		expect(prompt).toContain('only through the ralph_todo tool');
 		expect(prompt).toContain('General');
-		// The state file is created in ralph format with the auto-created session category.
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file.startsWith('# ralph v2')).toBe(true);
-		expect(file).toContain('M list "General"');
+		// The state file is created with the auto-created session category.
+		expect(readBacklog().createdLists()).toEqual(['General']);
 		// Status bar: the auto label and the session category.
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
@@ -4009,9 +4027,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
 		await startLoop(fake, fakeCtx);
 
-		const file = await readFile(autoFile(), 'utf8');
 		// The restart continues the session's category: one list, no suffixed twin.
-		expect(file.match(/M list "General"/g)).toHaveLength(1);
+		expect(readBacklog().createdLists()).toEqual(['General']);
 		expect(fake.userMessages.at(-1)!.text).toContain('your category "General"');
 	});
 
@@ -4026,9 +4043,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		// The category carries the session name (spaces become dashes: list
 		// names cannot contain spaces).
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('M list "Fix-login-flow"');
-		expect(file).not.toContain('M list "General"');
+		expect(readBacklog().createdLists()).toEqual(['Fix-login-flow']);
 		expect(fake.userMessages[0]!.text).toContain('your category "Fix-login-flow"');
 		expect(statusLine(fakeCtx.widgets)).toContain('category: Fix-login-flow');
 	});
@@ -4190,17 +4205,17 @@ describe('ralph-loop extension (auto mode)', () => {
 		const tool = autoTool(fake);
 		const added = await tool.execute('t', { action: 'add', title: 'Continue the rewrite', body: '- finish the parser' }, undefined, undefined, fakeCtx.ctx);
 		expect(added.content[0]!.text).toContain('Added task 1');
-		let file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('Continue the rewrite');
+		let file = readBacklog();
+		expect(file.listTasks().map((t) => t.title)).toContain('Continue the rewrite');
 
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
 		expect(next.content[0]!.text).toContain('Continue the rewrite');
 
 		const done = await tool.execute('t', { action: 'complete', task: '1', note: 'rewrote the parser' }, undefined, undefined, fakeCtx.ctx);
 		expect(done.content[0]!.text).toContain('Marked task 1');
-		file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('D 1');
-		expect(file).toContain('rewrote the parser');
+		file = readBacklog();
+		expect(file.listTasks()[0]?.done).toBe(true);
+		expect(file.listLogEntriesForTask(1).map((e) => e.note)).toEqual(['rewrote the parser']);
 	});
 
 	test('ralph_todo add with a category creates it and records there; the default stays the session category', async () => {
@@ -4219,10 +4234,9 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(defaultAdded.content[0]!.text).toContain('Added task 2');
 		expect(defaultAdded.content[0]!.text).toContain('category "General"');
 
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('M list "Research"');
-		expect(file).toContain('T 1 Research "Research the API"');
-		expect(file).toContain('T 2 General "Session todo"');
+		const file = readBacklog();
+		expect(file.listTasks()[0]?.category).toBe('Research');
+		expect(file.listTasks()[1]?.category).toBe('General');
 		// next works through both categories (one global numbering).
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
 		expect(next.content[0]!.text).toContain('Research the API');
@@ -4246,16 +4260,16 @@ describe('ralph-loop extension (auto mode)', () => {
 			fakeCtx.ctx
 		);
 		expect(updated.content[0]!.text).toContain('Updated task 1 "Finish the parser rewrite"');
-		let file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('Finish the parser rewrite');
-		expect(file).toContain('- add tests');
+		let file = readBacklog();
+		expect(file.listTasks().map((t) => t.title)).toContain('Finish the parser rewrite');
+		expect(file.listTasks()[0]?.body).toContain('- add tests');
 		// The old title is gone: no duplicate was created.
-		expect(file).not.toContain('Continue the rewrite');
+		expect(file.listTasks().map((t) => t.title)).not.toContain('Continue the rewrite');
 
 		// body alone replaces the body; an empty body clears it.
 		await tool.execute('t', { action: 'update', task: '1', body: '' }, undefined, undefined, fakeCtx.ctx);
-		file = await readFile(autoFile(), 'utf8');
-		expect(file).not.toContain('- add tests');
+		file = readBacklog();
+		expect(file.listTasks()[0]?.body).toBeNull();
 
 		// Validation: task number and at least one field are required.
 		await expect(tool.execute('t', { action: 'update', title: 'x' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
@@ -4307,8 +4321,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 
 		// The todo landed in the auto-created session category of the auto backlog.
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('First step');
+		expect(readBacklog().listTasks().map((t) => t.title)).toContain('First step');
 
 		// next/complete now work scoped to the session category.
 		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
@@ -4331,17 +4344,18 @@ describe('ralph-loop extension (auto mode)', () => {
 		]);
 		// Both sibling calls succeed against one armed loop (the armAutoLoop
 		// promise cache), and the per-file lock serializes their
-		// load → mutate → write cycles: no lost todo, no torn file.
-		expect(first.content[0]!.text).toContain('Added task 1');
-		expect(second.content[0]!.text).toContain('Added task 2');
-		expect(first.content[0]!.text).toContain('The Ralph auto loop was started');
-		expect(second.content[0]!.text).toContain('The Ralph auto loop was started');
+		// load → mutate → write cycles: no lost todo, no torn file. Which
+		// sibling gets task number 1 is a race (the first to reach the file
+		// lock wins); exactly one reports the arming.
+		const results = [first.content[0]!.text, second.content[0]!.text];
+		expect(results.join('\n')).toContain('Added task 1');
+		expect(results.join('\n')).toContain('Added task 2');
+		expect(results.filter((text) => text.includes('The Ralph auto loop was started'))).toHaveLength(1);
 		const armed = stateEntries(fake).filter((entry) => (entry.data as { enabled?: boolean }).enabled === true);
 		expect(armed).toHaveLength(1);
 
-		// The file still parses and both todos are in the session category.
-		const file = await readFile(autoFile(), 'utf8');
-		expect(() => Backlog.parse(file)).not.toThrow();
+		// The file still opens and both todos are in the session category.
+		expect(() => readBacklog()).not.toThrow();
 		const list = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
 		expect(list.content[0]!.text).toContain('2 open');
 	});
@@ -4648,8 +4662,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto): finishing');
 		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
 		expect(fake.userMessages.at(-1)!.text).toContain('action "add"');
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('M list "General"');
+		expect(readBacklog().createdLists()).toEqual(['General']);
 
 		// The finish-up turn settles; the fresh iteration continues from the backlog.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -4706,9 +4719,8 @@ describe('ralph-loop extension (auto mode)', () => {
 		// One auto file for the session, and only one session category in it
 		// (a second armed loop would have created another).
 		const files = await readdir(join(agentDir, 'ralph'));
-		expect(files).toEqual(['test-session.ralph']);
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file.match(/M list "General/g)).toHaveLength(1);
+		expect(files).toEqual(['test-session.db']);
+		expect(readBacklog().createdLists()).toEqual(['General']);
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 	});
 
@@ -4798,9 +4810,10 @@ describe('ralph-loop extension (auto mode)', () => {
 			fakeCtx.ctx
 		);
 		expect(created.content[0]!.text).toContain('Goal "Working desktop app" created');
-		let file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('G "Working desktop app" open');
-		expect(file).toContain('- verified analysis');
+		let file = readBacklog();
+		expect(file.goal()?.title).toBe('Working desktop app');
+		expect(file.goal()?.status).toBe('open');
+		expect(file.goal()?.body).toContain('- verified analysis');
 
 		// set replaces the existing goal (the model-maintained big picture).
 		const replaced = await tool.execute(
@@ -4811,9 +4824,9 @@ describe('ralph-loop extension (auto mode)', () => {
 			fakeCtx.ctx
 		);
 		expect(replaced.content[0]!.text).toContain('Goal "Working desktop app with verified analysis" updated');
-		file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('G "Working desktop app with verified analysis" open');
-		expect(file).not.toContain('G "Working desktop app" open');
+		file = readBacklog();
+		expect(file.goal()?.title).toBe('Working desktop app with verified analysis');
+		expect(file.goal()?.status).toBe('open');
 
 		// show reads it back.
 		const shown = await tool.execute('t', { action: 'show' }, undefined, undefined, fakeCtx.ctx);
@@ -4869,8 +4882,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(checkpointed.content[0]!.text).toContain('Checkpoint recorded for the goal "Working desktop app"');
 		// Auto mode: progress, not a boundary — the model keeps working.
 		expect(checkpointed.content[0]!.text).toContain('Continue working');
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('Parser done; rendering next');
+		expect(readBacklog().goal()?.checkpoint).toBe('Parser done; rendering next');
 	});
 
 	test('auto iteration prompt carries the goal block; the goal is the big-picture layer', async () => {
@@ -5115,11 +5127,11 @@ M list "Plan"
 			fakeCtx.ctx
 		);
 		expect(updated.content[0]!.text).toContain('Updated task 1 "Task one (revised)"');
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('Task one (revised)');
-		expect(file).toContain('- replanned');
+		const file = readBacklog();
+		expect(file.listTasks().map((t) => t.title)).toContain('Task one (revised)');
+		expect(file.listTasks()[0]?.body).toContain('- replanned');
 		// The old title is gone: no duplicate was created.
-		expect(file).not.toContain('"Task one"');
+		expect(file.listTasks().map((t) => t.title)).not.toContain('Task one');
 	});
 
 	test('D2: add-many records a batch in the auto loop', async () => {
@@ -5138,9 +5150,9 @@ M list "Plan"
 			fakeCtx.ctx
 		);
 		expect(added.content[0]!.text).toContain('Added 2 tasks');
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file).toContain('First step');
-		expect(file).toContain('Second step');
+		const titles = readBacklog().listTasks().map((t) => t.title);
+		expect(titles).toContain('First step');
+		expect(titles).toContain('Second step');
 	});
 
 	test('D3: move reorders tasks in the auto loop', async () => {
@@ -5158,8 +5170,7 @@ M list "Plan"
 		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
 		const moved = await tool.execute('t', { action: 'move', task: '2', direction: 'up' }, undefined, undefined, fakeCtx.ctx);
 		expect(moved.content[0]!.text).toContain('Moved task');
-		const file = await readFile(autoFile(), 'utf8');
-		expect(file.indexOf('Second step')).toBeLessThan(file.indexOf('First step'));
+		expect(readBacklog().listTasks().map((t) => t.title)).toEqual(['Second step', 'First step']);
 	});
 
 	test('D4: next skips Findings reference entries on the session backlog', async () => {

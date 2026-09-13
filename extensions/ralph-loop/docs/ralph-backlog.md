@@ -8,9 +8,12 @@ description: Full reference for the ralph_todo and ralph_goal actions and parame
 If the `ralph_todo`/`ralph_goal` tools are not available in this session,
 call `ralph_enable` first, then continue with this reference.
 
-The ralph-format backlog is a SQLite-backed TODO file. `ralph_todo` is its only
+The ralph-format backlog is a SQLite database (marker table
+`ralph_schema(name='ralph', version=1)`); the extension marks the format —
+`.db` is the database, the legacy `.ralph` name is the line-oriented text
+format, auto-migrated to a `.db` file when opened. `ralph_todo` is its only
 interface: never read or modify the file by any other means (no file tools, no
-grep/cat/sed). Target: the session's ralph file (`<session-id>.ralph` in pi's
+grep/cat/sed). Target: the session's ralph file (`<session-id>.db` in pi's
 global agent directory) — the active loop's backlog when a loop is running.
 Tasks are addressed by their position number as shown by
 `list`/`next` (e.g. "1", "2", …). Task-numbered actions are scoped to the
@@ -143,7 +146,7 @@ The **auto loop** (the "Auto mode" setting in `/ralph config`: off / on) runs
 through the per-session ralph file with `ralph_todo` and keeps its big picture
 in the backlog's **goal** via
 `ralph_goal`. It stores its state in a per-session file in the `ralph`
-directory of pi's global agent directory (`<session-id>.ralph`, like sessions
+directory of pi's global agent directory (`<session-id>.db`, like sessions
 in its `sessions` directory) and uses one session category per session, named
 after the pi session when it has a name (e.g. `Fix-login-flow`, spaces become
 dashes) or `General` for unnamed sessions (a restarted loop continues the same

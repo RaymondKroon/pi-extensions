@@ -20,7 +20,6 @@ import {
 } from '@earendil-works/pi-tui';
 import { execFileSync } from 'node:child_process';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
 import {
@@ -31,6 +30,7 @@ import {
 	formatSearchResults,
 	formatTaskDetail,
 	isRalphBacklog,
+	NotRalphBacklogError,
 	type CompletionEntry,
 	type Goal,
 	type GoalStatus
@@ -56,14 +56,16 @@ const DEFAULT_SPEC = 'SPEC.md';
  * The ralph backlog directory: every loop (tasks/goal/auto) and every idle
  * ralph_todo/ralph_goal read runs on the per-session ralph file here. Stored
  * in the ralph subdirectory of pi's global agent directory (like sessions in
- * its sessions subdirectory), one per session (`<session-id>.ralph`), so it
+ * its sessions subdirectory), one per session (`<session-id>.db`), so it
  * stays out of the project — no check-in, nothing lost in the repository —
  * and can be looked back on globally. A per-session file also leaves room
- * for multiple categories in one file.
+ * for multiple categories in one file. The file is a SQLite database (the
+ * extension marks the format: .db is SQLite, the legacy .ralph name is the
+ * human-readable text format, auto-migrated on open).
  */
 const AUTO_TODO_DIR = 'ralph';
 const autoTodoPath = (ctx: ExtensionContext): string =>
-	join(getAgentDir(), AUTO_TODO_DIR, `${ctx.sessionManager.getSessionId()}.ralph`);
+	join(getAgentDir(), AUTO_TODO_DIR, `${ctx.sessionManager.getSessionId()}.db`);
 /** Generic planning document bundled with this extension for /ralph-init to adapt. */
 const INIT_TEMPLATE_SPEC = join(import.meta.dirname, 'SPEC.template.md');
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
@@ -119,7 +121,7 @@ interface RalphConfig {
 	 */
 	compactionMode: boolean;
 	/**
-	 * The auto loop (state in the per-session <session-id>.ralph in the global
+	 * The auto loop (state in the per-session <session-id>.db in the global
 	 * agent directory, auto-created session category, ralph_todo tool, rotation
 	 * per the rotation policy — default: the context budget): off — nothing
 	 * automatic; on — the loop starts at session start; auto — the loop arms
@@ -1310,24 +1312,18 @@ async function setGoalFromFile(
 			message: `No goal in ${args.goalFile}: the first non-empty line must be a title (optionally an H1 heading)`
 		};
 	}
-	let todo: string;
-	try {
-		todo = await readFile(todoPath, 'utf8');
-	} catch {
-		return {
-			ok: false,
-			level: 'error',
-			message: `No backlog at ${outName} — create it first with ralph_todo action "init" (or /ralph-init)`
-		};
-	}
-	if (!isRalphBacklog(todo)) {
-		return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
-	}
 	let backlog: Backlog;
 	try {
-		backlog = Backlog.parse(todo);
+		backlog = Backlog.open(todoPath);
 	} catch (error) {
-		return { ok: false, level: 'error', message: `Could not parse ${outName}: ${error instanceof Error ? error.message : String(error)}` };
+		if (isMissingFileError(error)) {
+			return {
+				ok: false,
+				level: 'error',
+				message: `No backlog at ${outName} — create it first with ralph_todo action "init" (or /ralph-init)`
+			};
+		}
+		return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
 	}
 	const existing = backlog.goal();
 	if (existing && existing.status !== 'open') {
@@ -1339,7 +1335,7 @@ async function setGoalFromFile(
 	}
 	backlog.setGoal(goal);
 	try {
-		await writeFile(todoPath, backlog.render());
+		backlog.save(todoPath);
 	} catch (error) {
 		return { ok: false, level: 'error', message: `Could not write ${outName}: ${error instanceof Error ? error.message : String(error)}` };
 	}
@@ -1373,12 +1369,16 @@ function resolveProjectFile(cwd: string, file: string): string | undefined {
 
 async function pathExists(path: string): Promise<boolean> {
 	try {
-		await readFile(path, 'utf8');
+		await access(path);
 		return true;
-	} catch (error) {
-		if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
-		return true;
+	} catch {
+		return false;
 	}
+}
+
+/** True when the error is a missing file (ENOENT). */
+function isMissingFileError(error: unknown): boolean {
+	return error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
 }
 
 /**
@@ -1389,14 +1389,14 @@ async function pathExists(path: string): Promise<boolean> {
 async function inspectInitTarget(path: string): Promise<
 	| { kind: 'missing' }
 	| { kind: 'exists'; ralph: boolean }
-	| { kind: 'error'; message: string }
 > {
+	if (!(await pathExists(path))) return { kind: 'missing' };
 	try {
-		const text = await readFile(path, 'utf8');
-		return { kind: 'exists', ralph: isRalphBacklog(text) };
+		Backlog.open(path);
+		return { kind: 'exists', ralph: true };
 	} catch (error) {
-		if (error instanceof Error && (error as { code?: unknown }).code === 'ENOENT') return { kind: 'missing' };
-		return { kind: 'error', message: `could not read ${path}: ${error instanceof Error ? error.message : String(error)}` };
+		if (isMissingFileError(error)) return { kind: 'missing' };
+		return { kind: 'exists', ralph: false };
 	}
 }
 
@@ -1508,19 +1508,13 @@ async function importMarkdownBacklog(
 	let target: Backlog | undefined;
 	let merged: { tasks: number; logEntries: number } | undefined;
 	if (await pathExists(outPath)) {
-		let outText = '';
+		let existing: Backlog | undefined;
 		try {
-			outText = await readFile(outPath, 'utf8');
+			existing = Backlog.open(outPath);
 		} catch {
-			outText = '';
+			existing = undefined;
 		}
-		if (isRalphBacklog(outText)) {
-			let existing: Backlog;
-			try {
-				existing = Backlog.parse(outText);
-			} catch (error) {
-				return { ok: false, level: 'error', message: `Could not parse ${outName}: ${error instanceof Error ? error.message : String(error)}` };
-			}
+		if (existing) {
 			if (existing.sources().includes(sourceId)) {
 				return {
 					ok: false,
@@ -1544,7 +1538,7 @@ async function importMarkdownBacklog(
 		target.addSource(sourceId);
 	}
 	try {
-		await writeFile(outPath, target.render());
+		target.save(outPath);
 	} catch (error) {
 		return { ok: false, level: 'error', message: `Could not write ${outPath}: ${error instanceof Error ? error.message : String(error)}` };
 	}
@@ -1769,13 +1763,12 @@ export default function (pi: ExtensionAPI) {
 	 * change tasks must go through here.
 	 */
 	const commitBacklog = async (todoPath: string, backlog: Backlog, ctx: ExtensionContext, category?: string) => {
-		const rendered = backlog.render();
 		try {
-			await writeFile(todoPath, rendered);
+			backlog.save(todoPath);
 		} catch (error) {
 			throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		refreshCounts(rendered, category);
+		refreshCounts(backlog.render(), category);
 		updateStatus(ctx);
 	};
 
@@ -1939,44 +1932,38 @@ export default function (pi: ExtensionAPI) {
 		return run;
 	};
 
-	// Shared parse discipline for the backlog tools (ralph_todo, ralph_goal):
-	// load the target file, require the ralph format, and parse it.
+	// Shared load discipline for the backlog tools (ralph_todo, ralph_goal):
+	// open the target file as a ralph backlog (SQLite, or legacy ralph text,
+	// which is migrated in place).
 	const loadTargetBacklog = async (todoPath: string, toolName: string): Promise<Backlog> => {
-		let text: string;
 		try {
-			text = await readRequiredFile(todoPath);
+			return Backlog.open(todoPath);
 		} catch (error) {
-			const missing = error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
-			if (missing) {
+			if (isMissingFileError(error)) {
 				throw new Error(
 					state?.enabled
 						? `${todoPath} is missing; bootstrap it with ralph_todo action "init" or restore the file.`
 						: `No Ralph backlog at ${todoPath}. Bootstrap it with ralph_todo action "init" or import a Markdown TODO with action "import".`
 				);
 			}
-			throw new Error(`could not read ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
-		}
-		if (!isRalphBacklog(text)) {
-			throw new Error(`${todoPath} is not a ralph-format backlog; ${toolName} only works with ralph-format backlogs.`);
-		}
-		try {
-			return Backlog.parse(text);
-		} catch (error) {
-			throw new Error(`could not parse ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
+			if (error instanceof NotRalphBacklogError) {
+				throw new Error(`${todoPath} is not a ralph-format backlog; ${toolName} only works with ralph-format backlogs.`);
+			}
+			throw new Error(`could not open ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	};
 
-	// Read/update the SQLite-backed ralph-format backlog. The tool is the only
-	// writer of the backlog file, so the line-oriented format stays valid for
-	// git diffs and re-imports. It targets the session's ralph file
-	// (<session-id>.ralph in the global agent directory) — the active loop's
+	// Read/update the SQLite-backed ralph backlog. The tool is the only writer
+	// of the backlog file, so the file stays a valid ralph database. It
+	// targets the session's ralph file
+	// (<session-id>.db in the global agent directory) — the active loop's
 	// backlog when a loop is running — so lists (categories) and entries can
 	// be created from chat anytime.
 	pi.registerTool({
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-			`Read/update the Ralph backlog (ralph-format TODO file). Targets the active loop's backlog, else the session's ralph file (<session-id>.ralph in the global agent directory; create with action "init"). Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (task/goal loop only), add (list created when missing), add-many, new-list, update (title/body of an existing task), log, move, import, init. add/update/complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
+			`Read/update the Ralph backlog (ralph-format TODO file). Targets the active loop's backlog, else the session's ralph file (<session-id>.db in the global agent directory; create with action "init"). Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (task/goal loop only), add (list created when missing), add-many, new-list, update (title/body of an existing task), log, move, import, init. add/update/complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('next'),
@@ -2070,7 +2057,6 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === 'init') {
 				return withBacklogLock(todoPath, async () => {
 					const status = await inspectInitTarget(todoPath);
-					if (status.kind === 'error') throw new Error(status.message);
 					if (status.kind === 'exists') {
 						if (status.ralph) {
 							return {
@@ -2081,8 +2067,7 @@ export default function (pi: ExtensionAPI) {
 						throw new Error(`${todoPath} exists but is not a ralph-format backlog; refusing to overwrite it.`);
 					}
 					try {
-						await mkdir(dirname(todoPath), { recursive: true });
-						await writeFile(todoPath, Backlog.empty().render());
+						Backlog.empty().save(todoPath);
 					} catch (error) {
 						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
 					}
@@ -2477,7 +2462,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (mutated) {
 					try {
-						await writeFile(todoPath, backlog.render());
+						backlog.save(todoPath);
 					} catch (error) {
 						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
 					}
@@ -2506,8 +2491,10 @@ export default function (pi: ExtensionAPI) {
 		void (async () => {
 			if (!state?.enabled) return;
 			const reason = state.rotationReason ?? 'completed-task';
-			try {
-				const currentTodo = await readRequiredFile(state.todoPath);
+		try {
+				// The rotation logic compares text snapshots; render the on-disk
+				// backlog (SQLite file) into that form.
+				const currentTodo = Backlog.open(state.todoPath).render();
 				// Goal mode is done when the goal is done, not when the plan is
 				// exhausted: an empty plan is the planning state. Auto mode never
 				// stops on an empty backlog: the session category starts empty.
@@ -2640,7 +2627,7 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Set up the auto loop's durable state: the per-session auto backlog
-	 * (<session-id>.ralph in the global agent directory) with its
+	 * (<session-id>.db in the global agent directory) with its
 	 * auto-created session category, the loop state, and the ralph_todo tool
 	 * activation. Shared by /ralph start and the context-budget intercept
 	 * (auto mode "on"). Returns undefined (with a notification) when the setup
@@ -2650,27 +2637,26 @@ export default function (pi: ExtensionAPI) {
 		const todoPath = autoTodoPath(ctx);
 		const specPath = resolve(ctx.cwd, DEFAULT_SPEC);
 		try {
-			let backlog: Backlog;
-			if (await pathExists(todoPath)) {
-				const text = await readRequiredFile(todoPath);
-				if (!isRalphBacklog(text)) {
-					ctx.ui.notify(
-						`Ralph auto mode needs a ralph-format backlog: ${todoPath} is not one. Delete or replace the file first.`,
-						'warning'
-					);
-					return undefined;
-				}
-				backlog = Backlog.parse(text);
-			} else {
+		let backlog: Backlog;
+		try {
+			backlog = Backlog.open(todoPath);
+		} catch (error) {
+			if (isMissingFileError(error)) {
 				backlog = Backlog.empty();
+			} else {
+				ctx.ui.notify(
+					`Ralph auto mode needs a ralph-format backlog: ${error instanceof Error ? error.message : String(error)}. Delete or replace the file first.`,
+					'warning'
+				);
+				return undefined;
 			}
-			const category = autoCategoryName(ctx.sessionManager.getSessionName());
-			// A restarted loop continues the session's existing category.
-			if (!backlog.categories().includes(category)) backlog.createList(category);
-			const rendered = backlog.render();
-			await mkdir(dirname(todoPath), { recursive: true });
-			await writeFile(todoPath, rendered);
-			refreshCounts(rendered);
+		}
+		const category = autoCategoryName(ctx.sessionManager.getSessionName());
+		// A restarted loop continues the session's existing category.
+		if (!backlog.categories().includes(category)) backlog.createList(category);
+		const rendered = backlog.render();
+		backlog.save(todoPath);
+		refreshCounts(rendered);
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
@@ -2734,7 +2720,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const { specFile, category: requestedCategory, goal } = files;
-		// Every loop runs on the session's ralph file (<session-id>.ralph in the
+		// Every loop runs on the session's ralph file (<session-id>.db in the
 		// global agent directory). The auto loop is selected by the auto mode
 		// setting (on): a plain /ralph start uses it with an auto-created
 		// session category. An explicit --goal start is unaffected.
@@ -2764,19 +2750,22 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				// The session's ralph file is created when missing (like the
 				// auto loop); an existing file must be a ralph-format backlog.
-				if (await pathExists(todoPath)) {
-					baselineTodo = await readRequiredFile(todoPath);
-					if (!isRalphBacklog(baselineTodo)) {
+				try {
+					backlog = Backlog.open(todoPath);
+				} catch (error) {
+					if (isMissingFileError(error)) {
+						backlog = Backlog.empty();
+					} else {
 						ctx.ui.notify(
-							`Ralph loops run on ralph-format backlogs only: ${todoPath} is not one. Delete or replace the file first.`,
+							`Ralph loops run on ralph-format backlogs only: ${error instanceof Error ? error.message : String(error)}. Delete or replace the file first.`,
 							'warning'
 						);
 						return;
 					}
-				} else {
-					baselineTodo = Backlog.empty().render();
 				}
-				backlog = Backlog.parse(baselineTodo);
+				// The baseline is the backlog as the loop starts; the goal-mode
+				// list creation below re-renders it before the loop state is set.
+				baselineTodo = backlog.render();
 				if (goal) {
 					const goalRecord = backlog.goal();
 					if (!goalRecord) {
@@ -2815,8 +2804,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				// Persist the (possibly new or list-extended) backlog.
-				await mkdir(dirname(todoPath), { recursive: true });
-				await writeFile(todoPath, backlog.render());
+				backlog.save(todoPath);
 				baselineTodo = backlog.render();
 			}
 			refreshCounts(baselineTodo, category);
@@ -2940,6 +2928,16 @@ export default function (pi: ExtensionAPI) {
 				state = normalizeState(entry.data);
 			}
 		}
+		// The persisted state may predate the SQLite migration: when the
+		// recorded backlog path no longer exists but its format sibling does
+		// (a .ralph text file migrated to .db, or vice versa), follow the
+		// sibling so the loop keeps operating on the migrated backlog.
+		if (state && !(await pathExists(state.todoPath))) {
+			const sibling = Backlog.formatSibling(state.todoPath);
+			if (sibling !== state.todoPath && (await pathExists(sibling))) {
+				state = { ...state, todoPath: sibling };
+			}
+		}
 		// Sessions created before the config entry retain their last active setting.
 		if (state && !hasSessionConfig) {
 			config = {
@@ -3015,7 +3013,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (state?.enabled) {
 			try {
-				const currentTodo = await readRequiredFile(state.todoPath);
+				const currentTodo = Backlog.open(state.todoPath).render();
 				// Goal mode is done when the goal is done, not when the plan is
 				// exhausted: an empty plan is the planning state. Auto mode never
 				// stops on an empty backlog.
@@ -3258,7 +3256,7 @@ export default function (pi: ExtensionAPI) {
 			// an over-budget context gets a durable checkpoint, before the loop
 			// ends. Otherwise progress would be lost with the old conversation.
 			try {
-				const currentTodo = await readRequiredFile(state.todoPath);
+				const currentTodo = Backlog.open(state.todoPath).render();
 				refreshCounts(currentTodo, countCategory(state));
 				// Goal mode is done when the goal is done, not when the plan is
 				// exhausted: an empty plan is the planning state. Auto mode never
@@ -3297,7 +3295,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		try {
-			const currentTodo = await readRequiredFile(state.todoPath);
+			const currentTodo = Backlog.open(state.todoPath).render();
 			refreshCounts(currentTodo, countCategory(state));
 			// Re-render with the fresh count: a turn can complete several tasks
 			// (auto mode works task after task), so the bar must not stay stale.
@@ -3468,7 +3466,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'autoMode',
 				label: 'Auto mode',
 				description:
-					`The auto loop stores its state in a per-session file in the ralph directory of pi's global agent directory (<session-id>.ralph) with an auto-created session category, rotates per the rotation policy (default: the context budget — the model finishes up and records todos for the next iteration), and uses the ralph_todo tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session) or on the first ralph_todo add/complete on the session backlog. /ralph start begins the auto loop immediately with an iteration prompt unless the mode is off (an explicit --goal start is unaffected).`,
+					`The auto loop stores its state in a per-session file in the ralph directory of pi's global agent directory (<session-id>.db) with an auto-created session category, rotates per the rotation policy (default: the context budget — the model finishes up and records todos for the next iteration), and uses the ralph_todo tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session) or on the first ralph_todo add/complete on the session backlog. /ralph start begins the auto loop immediately with an iteration prompt unless the mode is off (an explicit --goal start is unaffected).`,
 				currentValue: config.autoMode,
 				values: ['off', 'on']
 			},
@@ -3586,10 +3584,6 @@ export default function (pi: ExtensionAPI) {
 			// when missing; idempotent on an existing goal).
 			if (!initFiles.force) {
 				const status = await inspectInitTarget(specPath);
-				if (status.kind === 'error') {
-					ctx.ui.notify(status.message, 'warning');
-					return;
-				}
 				if (status.kind === 'exists') {
 					ctx.ui.notify(
 						`Refusing to replace existing ${initFiles.specFile}. Choose a new name or add --force.`,
@@ -3602,10 +3596,6 @@ export default function (pi: ExtensionAPI) {
 			if (initFiles.goal) {
 				const todoPath = autoTodoPath(ctx);
 				const todoStatus = await inspectInitTarget(todoPath);
-				if (todoStatus.kind === 'error') {
-					ctx.ui.notify(todoStatus.message, 'warning');
-					return;
-				}
 				if (todoStatus.kind === 'exists' && !todoStatus.ralph && !initFiles.force) {
 					ctx.ui.notify(
 						`Refusing to replace existing ${todoPath} (it is not a ralph-format backlog). Delete the file or add --force.`,
@@ -3620,7 +3610,7 @@ export default function (pi: ExtensionAPI) {
 					// Existing ralph backlog: add the goal only when it has none yet,
 					// so re-running --goal init is idempotent.
 					try {
-						const existing = Backlog.parse(await readFile(todoPath, 'utf8'));
+						const existing = Backlog.open(todoPath);
 						if (existing.goal()) {
 							ctx.ui.notify(
 								`Ralph backlog at ${todoPath} already has the goal "${existing.goal()!.title}"; keeping it.`,
@@ -3640,8 +3630,7 @@ export default function (pi: ExtensionAPI) {
 				if (backlog !== undefined && !backlog.goal()) {
 					backlog.setGoal(goalFromBrief(initFiles.prompt));
 					try {
-						await mkdir(dirname(todoPath), { recursive: true });
-						await writeFile(todoPath, backlog.render());
+						backlog.save(todoPath);
 					} catch (error) {
 						ctx.ui.notify(
 							`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -3677,16 +3666,23 @@ export default function (pi: ExtensionAPI) {
 				: [autoTodoPath(ctx)];
 		let todoPath: string | undefined;
 		for (const candidate of candidates) {
-			if (candidate && (await pathExists(candidate))) {
+			if (!candidate) continue;
+			// The path may predate the SQLite migration: when the recorded name
+			// no longer exists, follow the format sibling (.ralph ↔ .db).
+			if (await pathExists(candidate)) {
 				todoPath = candidate;
-				break;
+			} else {
+				const sibling = Backlog.formatSibling(candidate);
+				if (sibling === candidate || !(await pathExists(sibling))) continue;
+				todoPath = sibling;
 			}
+			break;
 		}
 		if (!todoPath) {
 			ctx.ui.notify(
 				fileArg
 					? `Could not read ${fileArg}`
-					: 'No backlog found: start a loop or add tasks with the ralph_todo tool (or pass a file: /ralph <file.ralph>)',
+					: 'No backlog found: start a loop or add tasks with the ralph_todo tool (or pass a file: /ralph <file.db>)',
 				'error'
 			);
 			return;
@@ -3695,23 +3691,21 @@ export default function (pi: ExtensionAPI) {
 		const title = rel && !rel.startsWith('..') ? rel : basename(todoPath);
 		const loadBacklog = (): Backlog | undefined => {
 			try {
-				const text = readFileSync(todoPath!, 'utf8');
-				// The view only renders ralph-format backlogs; Markdown
-				// backlogs must be imported first (see below).
-				return isRalphBacklog(text) ? Backlog.parse(text) : undefined;
+				// The view only renders ralph backlogs; Markdown backlogs must be
+				// imported first (see below).
+				return Backlog.open(todoPath!);
 			} catch {
 				return undefined;
 			}
 		};
 		let initial: Backlog | undefined;
 		try {
-			const text = readFileSync(todoPath, 'utf8');
-			if (!isRalphBacklog(text)) {
+			initial = Backlog.open(todoPath);
+		} catch (error) {
+			if (error instanceof NotRalphBacklogError) {
 				ctx.ui.notify('Todo entries empty. Import data with /ralph import', 'info');
 				return;
 			}
-			initial = Backlog.parse(text);
-		} catch {
 			initial = undefined;
 		}
 		if (!initial) {

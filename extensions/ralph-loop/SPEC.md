@@ -15,8 +15,10 @@ repository; the pi core is untouched.
 ## 2. Evidence and source of truth
 
 - The current extension code in this repository: `index.ts` (loop engine,
-  commands, tools), `backlog.ts` (ralph-format file format + SQLite-backed
-  `Backlog` API), `todos-view.ts` / `list-picker.ts` (TUI), and their tests.
+  commands, tools), `backlog.ts` (the `Backlog` API over SQLite-backed ralph
+  files; the legacy line-oriented text format is parsed only for
+  auto-migration, in-memory baseline snapshots, and imports), `todos-view.ts`
+  / `list-picker.ts` (TUI), and their tests.
 - The pi extension SDK (tools, commands, events, `ctx.ui.custom` overlays).
 - Unknown behaviour of the pi TUI/SDK must be verified against
   `/home/raymond/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs`
@@ -66,9 +68,18 @@ Ralph decision workflow.
   detection, decisions, `maxIterations` — stays single-implemented. Only
   start validation, the done check, rotation triggers, and prompts branch on
   mode.
-- **The goal lives in the backlog file** (ralph v2 format, SQLite-backed).
-  File states: `open` → `claimed` → `done`, plus `claimed` → `open`
-  (withdraw). `Backlog` API: `goal()`, `setGoal({title, body})`,
+- **The goal lives in the backlog file.** The on-disk format is a SQLite
+  database (marker table `ralph_schema(name='ralph', version=1)`); the
+  extension marks the format — `.db` is the SQLite database, the legacy
+  `.ralph` name is the line-oriented text format (v1/v2, M/G/T/B/D/C/L
+  records), parsed only for auto-migration of old files (opening one writes
+  a `.db` file and removes the text file), in-memory baseline snapshots
+  (`render()`), and ralph-format file imports. Access is name-tolerant:
+  `Backlog.open` falls back to the format sibling (`.ralph` ↔ `.db`), and the
+  extension remaps a persisted loop state's `todoPath` (and the `/ralph`
+  home view's candidates) to the existing sibling, so loops started before
+  the migration keep operating on the migrated file. File states:
+  `open` → `claimed` → `done`, plus `claimed` → `open` (withdraw). `Backlog` API: `goal()`, `setGoal({title, body})`,
   `deleteGoal()`, `claimGoal(evidence)`, `confirmGoal()`,
   `withdrawGoal(note)`, `setGoalCheckpoint(note, iteration)`.
 - **`ralph_goal` tool** targets the active loop's backlog, else the
@@ -263,7 +274,7 @@ task/goal/auto code paths to one loop with two orthogonal axes.
 - **One backlog tool: `ralph_todo`.** `ralph_auto` is deleted; the auto loop
   uses `ralph_todo` (the per-session auto backlog). The project's `TODO.ralph`
   is gone: every loop and idle read targets the session's ralph file
-  (`<session-id>.ralph` in the global agent directory) — the active loop's
+  (`<session-id>.db` in the global agent directory) — the active loop's
   backlog when a loop is running. Scope for
   task-numbered actions: the active loop's category — except the auto loop,
   which is unscoped (all lists, one global numbering). Arming rule: idle +

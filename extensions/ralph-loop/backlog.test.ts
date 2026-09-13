@@ -1218,3 +1218,185 @@ describe('searchTasks / formatSearchResults', () => {
 		expect(backlog.searchTasks('zzz-not-there')).toEqual([]);
 	});
 });
+
+describe('file persistence (open/save)', () => {
+	const { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } = require('node:fs');
+	const { tmpdir } = require('node:os');
+	const { join } = require('node:path');
+	let dir: string;
+
+	const beforeEach = () => {
+		dir = mkdtempSync(join(tmpdir(), 'ralph-backlog-'));
+	};
+	const afterEach = () => {
+		rmSync(dir, { recursive: true, force: true });
+	};
+
+	const populated = (): Backlog => {
+		const backlog = Backlog.parse(SAMPLE);
+		backlog.setGoal({ title: 'Ship the dossier', body: 'All criteria met.' });
+		backlog.addSource('TODO.md');
+		return backlog;
+	};
+
+	test('save then open round-trips every table', () => {
+		beforeEach();
+		const path = join(dir, 'session.ralph');
+		populated().save(path);
+		const reopened = Backlog.open(path);
+		expect(reopened.render()).toBe(populated().render());
+		expect(reopened.goal()?.title).toBe('Ship the dossier');
+		expect(reopened.sources()).toEqual(['TODO.md']);
+		expect(reopened.counts()).toEqual({ open: 4, total: 5, completed: 1 });
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open throws ENOENT for a missing file', () => {
+		beforeEach();
+		expect(() => Backlog.open(join(dir, 'missing.ralph'))).toThrow(/ENOENT/);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open rejects non-ralph text', () => {
+		beforeEach();
+		const path = join(dir, 'notes.ralph');
+		writeFileSync(path, '- [ ] plain markdown\n');
+		expect(() => Backlog.open(path)).toThrow(/not a ralph backlog/);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open rejects a foreign SQLite file', () => {
+		beforeEach();
+		const { Database } = require('bun:sqlite');
+		const path = join(dir, 'foreign.db');
+		const other = new Database(path);
+		other.exec('CREATE TABLE foo (x INTEGER);');
+		other.close();
+		expect(() => Backlog.open(path)).toThrow(/not a ralph backlog/);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open rejects a corrupt SQLite file (magic header only)', () => {
+		beforeEach();
+		const path = join(dir, 'corrupt.ralph');
+		writeFileSync(path, Buffer.from('SQLite format 3\0garbage'));
+		expect(() => Backlog.open(path)).toThrow(/not a ralph backlog/);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open auto-migrates a legacy v2 text file to a .db file', () => {
+		beforeEach();
+		const path = join(dir, 'session.ralph');
+		const dbPath = join(dir, 'session.db');
+		const text = populated().render();
+		writeFileSync(path, text);
+		const migrated = Backlog.open(path);
+		// The database lands in the .db file (the extension marks the format)
+		// and the legacy text file is removed.
+		expect(existsSync(path)).toBe(false);
+		expect(readFileSync(dbPath).subarray(0, 16).toString('binary')).toBe('SQLite format 3\0');
+		expect(migrated.render()).toBe(text);
+		// Reopening by either name reads the SQLite file (no text left to parse).
+		expect(Backlog.open(dbPath).render()).toBe(text);
+		expect(Backlog.open(path).render()).toBe(text);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open auto-migrates a v1 text file, dropping legacy fields', () => {
+		beforeEach();
+		const path = join(dir, 'legacy.ralph');
+		const dbPath = join(dir, 'legacy.db');
+		const v1 = '# ralph v1\n\nS 1 backlog "all"\nT 1 1 - key1 dossier "Old task."\n';
+		writeFileSync(path, v1);
+		const migrated = Backlog.open(path);
+		expect(migrated.listTasks().map((t) => t.title)).toEqual(['Old task.']);
+		expect(existsSync(path)).toBe(false);
+		expect(readFileSync(dbPath).subarray(0, 16).toString('binary')).toBe('SQLite format 3\0');
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open falls back to the .db sibling when the .ralph name is gone', () => {
+		beforeEach();
+		const dbPath = join(dir, 'session.db');
+		const text = populated().render();
+		writeFileSync(join(dir, 'session.ralph'), text);
+		Backlog.open(join(dir, 'session.ralph')); // migrates to .db, removes .ralph
+		// The old .ralph name still resolves to the migrated database.
+		expect(Backlog.open(join(dir, 'session.ralph')).render()).toBe(text);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open by the .db name migrates an existing .ralph text file', () => {
+		beforeEach();
+		const path = join(dir, 'session.ralph');
+		const dbPath = join(dir, 'session.db');
+		const text = populated().render();
+		writeFileSync(path, text);
+		const migrated = Backlog.open(dbPath);
+		expect(migrated.render()).toBe(text);
+		expect(existsSync(path)).toBe(false);
+		expect(readFileSync(dbPath).subarray(0, 16).toString('binary')).toBe('SQLite format 3\0');
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open moves a SQLite database found under the legacy .ralph name to .db', () => {
+		beforeEach();
+		const path = join(dir, 'session.ralph');
+		const dbPath = join(dir, 'session.db');
+		const text = populated().render();
+		writeFileSync(path, text);
+		Backlog.open(path); // migrates: .db created, .ralph removed
+		// Simulate the older in-place migration: SQLite content under .ralph.
+		Backlog.open(dbPath).save(path);
+		unlinkSync(dbPath);
+		const moved = Backlog.open(path);
+		expect(moved.render()).toBe(text);
+		expect(existsSync(path)).toBe(false);
+		expect(readFileSync(dbPath).subarray(0, 16).toString('binary')).toBe('SQLite format 3\0');
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open does not overwrite an existing .db next to a legacy text file', () => {
+		beforeEach();
+		const path = join(dir, 'session.ralph');
+		const dbPath = join(dir, 'session.db');
+		const text = populated().render();
+		writeFileSync(path, text);
+		Backlog.empty().save(dbPath); // a different database already occupies .db
+		const opened = Backlog.open(path);
+		expect(opened.render()).toBe(text);
+		// Migration is deferred: both files stay, the .db is untouched.
+		expect(existsSync(path)).toBe(true);
+		expect(Backlog.open(dbPath).counts().total).toBe(0);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('formatSibling swaps the format-marking extension', () => {
+		expect(Backlog.formatSibling('/x/session.ralph')).toBe('/x/session.db');
+		expect(Backlog.formatSibling('/x/session.db')).toBe('/x/session.ralph');
+		expect(Backlog.formatSibling('/x/session.txt')).toBe('/x/session.txt');
+	});
+
+	test('save creates missing parent directories', () => {
+		beforeEach();
+		const path = join(dir, 'nested', 'deep', 'session.ralph');
+		Backlog.empty().save(path);
+		expect(existsSync(path)).toBe(true);
+		expect(Backlog.open(path).counts().total).toBe(0);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('re-saving a migrated backlog keeps the data', () => {
+		beforeEach();
+		const path = join(dir, 'session.ralph');
+		const dbPath = join(dir, 'session.db');
+		writeFileSync(path, populated().render());
+		const backlog = Backlog.open(path); // migrates to .db
+		backlog.addTask({ title: 'one more' });
+		backlog.save(dbPath);
+		const reopened = Backlog.open(dbPath);
+		expect(reopened.listTasks().map((t) => t.title)).toContain('one more');
+		expect(reopened.counts().total).toBe(6);
+		rmSync(dir, { recursive: true, force: true });
+	});
+});
