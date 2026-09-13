@@ -36,6 +36,7 @@ import {
 	type GoalStatus
 } from './backlog.ts';
 import { createTodosView, type TodosView } from './todos-view.ts';
+import { renderPrompt } from './prompt-template.ts';
 import { createRalphHome, type RalphHome } from './ralph-home.ts';
 
 const STATE_TYPE = 'ralph-loop-state';
@@ -710,15 +711,17 @@ function formatDecisionMessage(question: string, context?: string): string {
 }
 
 /**
- * Prefix for every prompt Ralph injects as a user message. It makes the
- * sender explicit so the model does not misattribute these to the human user
- * in its reasoning (e.g. narrating "The user is saying to continue.").
+ * Prefix for every prompt Ralph injects as a user message (prompts/prefix.md).
+ * It makes the sender explicit so the model does not misattribute these to the
+ * human user in its reasoning (e.g. narrating "The user is saying to
+ * continue.").
  */
-const AUTOMATED_PREFIX =
-	'[Automated Ralph loop instruction — sent by the ralph-loop extension, not typed by the human user. Do not restate or narrate this message in your thinking; just act on it.]\n\n';
+function automatedPrefix(): string {
+	return `${renderPrompt('prefix', {})}\n\n`;
+}
 
 function iterationPrompt(state: RalphState, reason?: RotationReason): string {
-	return AUTOMATED_PREFIX + iterationPromptBody(state, reason);
+	return automatedPrefix() + iterationPromptBody(state, reason);
 }
 
 function iterationPromptBody(state: RalphState, reason?: RotationReason): string {
@@ -751,19 +754,15 @@ Keep the big picture in the backlog's goal: it is the larger objective this work
 			state.rotateOn === 'task'
 				? '5. This is the last step of the iteration: stop working when the commit is made.'
 				: '5. After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.';
-		return `Run the Ralph auto loop for this repository. ${contextNote}${goalSection}
-
-The backlog (ralph format) is read and updated only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands). The backlog may contain several categories and the loop works through all of them; new todos you record go to your category "${state.category}".
-
-1. Call ralph_todo with action "next" to get the next open work task.${referenceTaskNote}
-2. If there is an open task: read the relevant code and source evidence, then implement exactly one coherent vertical slice. Add focused tests and run every quality command required by the backlog and ${state.specPath} (when present).
-3. Only after all acceptance criteria pass, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record.
-4. Commit the completed task locally in a single commit. Do not push. One commit per completed task: the commit is the durable checkpoint of finished work, so the next iteration (or a human) can always see exactly what is done.
-${closeStep}
-6. If there are no open tasks, do the work the user asks for in chat; do not invent backlog work.${bigGoalMaintenance}
-Keep the project's knowledge current as you learn: append durable debug findings (root causes, failed approaches, environment quirks) to DEBUG.md at the project root (create it if missing), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed or is not yet documented.
-
-When this iteration reaches its context budget you will be told to finish up: it is OK to leave the code in a bad state — record the remaining work and the important findings as todo entries for the next iteration with ralph_todo (action "add"), and stop. The fresh iteration continues from the backlog.`;
+		return renderPrompt('iteration-auto', {
+			contextNote,
+			goalSection,
+			category: String(state.category),
+			referenceTaskNote,
+			specPath: state.specPath,
+			closeStep,
+			bigGoalMaintenance
+		});
 	}
 
 	const contextNote =
@@ -799,80 +798,58 @@ When this iteration reaches its context budget you will be told to finish up: it
 			const categoryGuard = state.category ? ' or on a task in another category' : '';
 
 			if (phase === 'planning') {
-				return `Run the Ralph goal loop for this repository. ${contextNote}
-
-${backlogNote}
-
-${goalBlock(goal)}
-
-This is a planning iteration: the goal is open and the backlog has no tasks yet.
-
-1. Read ${state.specPath} in full.
-2. Decompose the goal into small, ordered tasks that together cover every acceptance criterion.
-3. Create a list for the plan with ralph_todo (action "new-list"), then add the whole plan to that list (action "add-many" with the list as category, or "add" per task).
-4. Do not implement the goal in this iteration: the plan is the deliverable. Do not edit ${state.todoPath} directly.
-
-${decisionNote}`;
+				return renderPrompt('iteration-goal-planning', {
+					contextNote,
+					backlogNote,
+					goalBlock: goalBlock(goal),
+					specPath: state.specPath,
+					todoPath: state.todoPath,
+					decisionNote
+				});
 			}
 			if (phase === 're-evaluation') {
-				return `Run the Ralph goal loop for this repository. ${contextNote}
-
-${backlogNote}
-
-${goalBlock(goal)}
-
-This is a re-evaluation iteration: the goal is open and every planned task is complete.
-
-1. Read ${state.specPath} in full.
-2. Re-check every acceptance criterion of the goal against the repository and run every verification command required by SPEC.md.
-3. If any criterion is not met, add tasks for the missing work with ralph_todo (the plan's list as category) and stop after recording them.
-4. If every criterion is met and verified, call ralph_goal with action "complete" and the evidence. Do not edit ${state.todoPath} directly.
-
-${decisionNote}`;
+				return renderPrompt('iteration-goal-re-evaluation', {
+					contextNote,
+					backlogNote,
+					goalBlock: goalBlock(goal),
+					specPath: state.specPath,
+					todoPath: state.todoPath,
+					decisionNote
+				});
 			}
-			return `Run the Ralph goal loop for this repository. ${contextNote}
-
-${backlogNote}
-
-${goalBlock(goal)}
-
-You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks with ralph_todo (the plan's list as category) so the backlog always reflects the remaining work.
-
-1. Read ${state.specPath} in full, then call ralph_todo with action "next" to get the next open task${categoryScope}: its number, body, and checkpoint. Use action "list" only when that task is blocked and you need the wider backlog to find an unblocked one.
-2. Do not work on a later task${categoryGuard}.
-3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
-4. Add focused tests and run every quality command required by SPEC.md and the backlog.
-5. Only after all acceptance criteria pass, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly.
-${ralphCloseStep}
-
-${decisionNote}`;
+			return renderPrompt('iteration-goal-execution', {
+				contextNote,
+				backlogNote,
+				goalBlock: goalBlock(goal),
+				specPath: state.specPath,
+				todoPath: state.todoPath,
+				categoryScope,
+				categoryGuard,
+				ralphCloseStep,
+				decisionNote
+			});
 		}
 
 		const categoryScope = state.category ? ` in category "${state.category}"` : '';
-		return `Run the Ralph loop for this repository. ${contextNote}
-
-The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.
-
-1. Read ${state.specPath} in full, then call ralph_todo with action "next" to get the next open task${categoryScope}: its number, body, and checkpoint. Use action "list" only when that task is blocked and you need the wider backlog to find an unblocked one.
-2. Do not work on a later task${state.category ? ' or on a task in another category' : ''}.
-3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
-4. Add focused tests and run every quality command required by SPEC.md and the backlog.
-5. Only after all acceptance criteria pass, call ralph_todo with action "complete", the task's number, and a concise note: outcome, changed paths, evidence, and the verification commands that were run. The note becomes the completion log entry — the single completion record — so do not call action "log" separately. Do not edit ${state.todoPath} directly.
-${ralphCloseStep}
-
-${decisionNote}`;
+		return renderPrompt('iteration-ralph', {
+			contextNote,
+			backlogNote: `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`,
+			specPath: state.specPath,
+			todoPath: state.todoPath,
+			categoryScope,
+			categoryGuard: state.category ? ' or on a task in another category' : '',
+			ralphCloseStep,
+			decisionNote
+		});
 	}
 
-	return `Run the Ralph loop for this repository. ${contextNote}
-
-1. Read ${state.specPath} and ${state.todoPath} in full.
-2. Select the highest-priority unblocked unchecked TODO item. Do not work on a later item.
-3. Read the relevant code and source evidence, then implement exactly one coherent vertical slice.
-4. Add focused tests and run every quality command required by SPEC.md and TODO.md.
-5. Only after all acceptance criteria pass, update ${state.todoPath}: check the completed item and add exactly one dated, concise entry for it to the completion log (outcome, changed paths, evidence, verification commands). The completion log is the single completion record: do not also add a completion note under the checked item itself.
-${ralphCloseStep}
-
-${decisionNote}`;
+	return renderPrompt('iteration-markdown', {
+		contextNote,
+		specPath: state.specPath,
+		todoPath: state.todoPath,
+		ralphCloseStep,
+		decisionNote
+	});
 }
 
 /**
@@ -951,7 +928,7 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
  * starting over, and the user's message is extra info for the loop.
  */
 function resumeWithExtraInfoPrompt(extraInfo: string): string {
-	return `${AUTOMATED_PREFIX}The Ralph loop was interrupted and is now resumed by the user's message. The user has extra info for the loop — take it into account. Continue the current iteration exactly where the interrupted turn left off.\n\nUser's extra info:\n${extraInfo}`;
+	return `${automatedPrefix()}${renderPrompt('resume-extra-info', { extraInfo })}`;
 }
 
 /**
@@ -966,7 +943,7 @@ function recordingPromptFor(state: RalphState): string {
 	return state.rotationReason === 'completed-task'
 		? completionRecordingPrompt(state)
 		: state.rotationReason === 'plan-updated'
-			? planRecordingPrompt(state)
+			? planRecordingPrompt()
 			: state.rotationReason === 'phase-changed'
 				? finishUpPrompt(state, 'phase-changed')
 				: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
@@ -977,7 +954,7 @@ function recordingPromptFor(state: RalphState): string {
 }
 
 function contextCheckpointPrompt(state: RalphState): string {
-	return AUTOMATED_PREFIX + contextCheckpointPromptBody(state);
+	return automatedPrefix() + contextCheckpointPromptBody(state);
 }
 
 function contextCheckpointPromptBody(state: RalphState): string {
@@ -986,31 +963,23 @@ function contextCheckpointPromptBody(state: RalphState): string {
 		// checkpoint: the goal carries the durable state instead.
 		const goalInfo = goalPhase(state);
 		if (goalInfo && goalInfo.phase !== 'execution') {
-			return `The current Ralph goal iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations}.
-
-1. Call ralph_goal with action "checkpoint" and a concise note: planning or re-evaluation evidence so far, relevant changed paths, known failures or risks, and the exact next step. The tool replaces any older checkpoint: keep only the single most recent one, because an older checkpoint's state and next step are stale.
-2. Keep a single exact next step in the checkpoint note.
-3. Do not change the goal's state, do not claim unverified work, do not modify product code, and do not commit. Do not continue work after recording the checkpoint.
-
-Report the checkpoint and the next step succinctly.`;
+			return renderPrompt('context-checkpoint-goal', {
+				iteration: String(state.iteration),
+				maxIterations: String(state.maxIterations)
+			});
 		}
-		return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
-
-1. Call ralph_todo with action "list" and identify the currently selected open task.
-2. Call ralph_todo with action "checkpoint", the task's number, and a concise note: completed implementation/test evidence, relevant changed paths, known failures or risks, and the exact next step. The tool replaces any older checkpoint: keep only the single most recent one, because an older checkpoint's state and next step are stale. Do not record this in the completion log: the task is not complete.
-3. Keep a single exact next step in the checkpoint note.
-4. Do not mark the task complete, do not claim unverified work, do not modify product code, and do not commit. Do not continue implementation after recording the checkpoint.
-
-Report the checkpoint and the next step succinctly.`;
+		return renderPrompt('context-checkpoint-ralph', {
+			iteration: String(state.iteration),
+			maxIterations: String(state.maxIterations),
+			taskIteration: String(state.taskIteration)
+		});
 	}
-	return `The current Ralph iteration has reached its configured context budget. Create a durable checkpoint now, then stop working; a fresh Ralph iteration will continue from the files. This is iteration ${state.iteration} of ${state.maxIterations} (iteration ${state.taskIteration} for the current task).
-
-1. Read ${state.todoPath} and identify the currently selected unchecked item.
-2. Update that item in ${state.todoPath} with a concise, non-checkbox “Context checkpoint (iteration ${state.iteration})” note. Include completed implementation/test evidence, relevant changed paths, known failures or risks, and the exact next step. Use the actual iteration number shown above in the label — never a placeholder. If the item already has a “Context checkpoint” note, replace it with this one: keep only the single most recent checkpoint, because an older checkpoint’s state and next step is stale. Do not put this in the completion log: the item is not complete.
-3. Keep a single exact next step in the checkpoint note.
-4. Do not mark the item complete, do not claim unverified work, do not modify product code, and do not commit. Do not continue implementation after recording the checkpoint.
-
-Report the checkpoint path and the next step succinctly.`;
+	return renderPrompt('context-checkpoint-markdown', {
+		iteration: String(state.iteration),
+		maxIterations: String(state.maxIterations),
+		taskIteration: String(state.taskIteration),
+		todoPath: state.todoPath
+	});
 }
 
 /**
@@ -1032,30 +1001,24 @@ function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-chan
 		state.category !== undefined ? ` in category "${state.category}"` : isAuto ? '' : ', and the category of the work';
 	// The findings layer is the auto loop's handoff memory; the other loops
 	// keep durable findings in DEBUG.md during the iteration instead.
-	const findings = isAuto
-			? `4. Log the important findings for the next iteration: call ralph_todo with action "add" (title "Findings: <short summary>", body as markdown bullets) for what this iteration learned that a fresh session would otherwise have to rediscover from scratch: root causes, approaches tried that failed and why, environment or tooling quirks, and key code locations with their current state. One entry per coherent cluster of findings; skip trivialities. Findings entries are reference notes, not work items. Findings of lasting value beyond the next iteration also belong in the repository: append them to DEBUG.md at the project root (create it if missing, organized by topic), and update SPEC.md (create it if missing) when the project's requirements, architecture, or quality bar has changed.
-`
-			: '';
+	const findings = isAuto ? `${renderPrompt('finish-up-findings', {})}\n` : '';
 	// From the second iteration on, the auto handoff also refreshes the
 	// big-picture layer: the first round establishes what the work is about,
 	// the later rounds keep the larger objective visible as the backlog's goal.
 	const bigPicture =
-		isAuto && state.iteration > 1
-			? `5. Keep the big picture in the backlog's goal: it is the larger objective this work serves (not the immediate next step). Check it with ralph_goal (action "show"); if it is missing or no longer describes the objective, replace it with ralph_goal (action "set", title, body with the acceptance evidence to look for). Record what advanced toward it in this iteration with ralph_goal (action "checkpoint", a concise note).
-`
-			: '';
+		isAuto && state.iteration > 1 ? `${renderPrompt('finish-up-big-picture', {})}\n` : '';
 	const opening =
 		reason === 'phase-changed'
 			? 'The goal phase changed. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
 			: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
-	return `${AUTOMATED_PREFIX}${opening} This is iteration ${state.iteration} of ${state.maxIterations}.
-
-1. Wrap up what you are doing. Finishing this handoff matters more than a clean state: it is OK to leave the code in a bad state (half-applied edits, failing builds, untested changes) — the next iteration will re-establish the facts and fix it. Mark any finished task complete with ralph_todo (action "complete", with a concise note). If completed work is not committed locally yet, commit it with a concise message. Do not push, and do not commit broken or half-done work.
-2. Ensure every task completed in this iteration has a completion log entry; if one is missing, add it with ralph_todo (action "log").
-3. Record the remaining work for the next iteration: call ralph_todo with action "add" (title, optional body${categoryClause}) for each todo entry. Each entry must be self-contained for a fresh session that has none of this conversation: what remains, why, relevant paths, the current state of the code (including anything broken or half-done), the debugging findings that bear on it (root causes found, approaches tried that failed, current build/test state), and the exact next step. If a todo recorded by an earlier iteration is stale or wrong, fix it with action "update" (task, title and/or body) instead of adding a duplicate.
-${findings}${bigPicture}Finally: do not start new work after recording the todos.
-
-Report the recorded todos and findings succinctly.`;
+	return `${automatedPrefix()}${renderPrompt('finish-up', {
+		opening,
+		iteration: String(state.iteration),
+		maxIterations: String(state.maxIterations),
+		categoryClause,
+		findings,
+		bigPicture
+	})}`;
 }
 
 /**
@@ -1064,7 +1027,7 @@ Report the recorded todos and findings succinctly.`;
  * the next iteration starts.
  */
 function completionRecordingPrompt(state: RalphState): string {
-	return AUTOMATED_PREFIX + completionRecordingPromptBody(state);
+	return automatedPrefix() + completionRecordingPromptBody(state);
 }
 
 function completionRecordingPromptBody(state: RalphState): string {
@@ -1072,21 +1035,15 @@ function completionRecordingPromptBody(state: RalphState): string {
 	if (numbers.length > 0) {
 		const singular = numbers.length === 1;
 		const target = singular ? `task ${numbers[0]}` : `tasks ${numbers.join(', ')}`;
-		return `A Ralph TODO task was just completed: ${target}. Verify its progress record now, then stop working; a fresh Ralph iteration will start after this turn.
-
-1. Call ralph_todo with action "list" and ${singular ? 'the task\'s number' : 'each task\'s number'} to check the completion log. If ${singular ? 'the task' : 'a task'} already has a completion log entry (for example, recorded by the "complete" call), do not add another. Only if the entry is missing, call ralph_todo with action "log" for ${target}, today's date, and exactly one concise ${singular ? 'entry' : 'entry per task'}: outcome, changed paths, evidence, and the verification commands that were run. Do not modify any other task.
-2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
-3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
-
-Report the completion log ${singular ? 'entry' : 'entries'} (existing or newly recorded) and the commit (if any) succinctly.`;
+		return renderPrompt('completion-recording', {
+			target,
+			numberRef: singular ? 'the task\'s number' : 'each task\'s number',
+			taskRef: singular ? 'the task' : 'a task',
+			entryWord: singular ? 'entry' : 'entry per task',
+			reportWord: singular ? 'entry' : 'entries'
+		});
 	}
-	return `A Ralph TODO task was just completed. Verify its progress record now, then stop working; a fresh Ralph iteration will start after this turn.
-
-1. Call ralph_todo with action "list" and identify the task that was just completed (the one you marked complete in the previous turn). Check its completion log: if it already has a completion log entry (for example, recorded by the "complete" call), do not add another. Only if the entry is missing, call ralph_todo with action "log", the task's number, today's date, and exactly one concise entry: outcome, changed paths, evidence, and the verification commands that were run. Do not modify any other task.
-2. Check git status. If the completed work is not committed locally, commit it with a concise message. Do not push.
-3. Do not start work on the next TODO task and do not modify product code beyond the completion record.
-
-Report the completion log entry (existing or newly recorded) and the commit (if any) succinctly.`;
+	return renderPrompt('completion-recording-identify', {});
 }
 
 /**
@@ -1095,14 +1052,8 @@ Report the completion log entry (existing or newly recorded) and the commit (if 
  * iteration starts, but no completion log entry is written because no task
  * was completed in the turn.
  */
-function planRecordingPrompt(state: RalphState): string {
-	return `${AUTOMATED_PREFIX}The Ralph plan was just updated: new tasks were added to the backlog. Commit the updated plan now, then stop working; a fresh Ralph iteration will start after this turn.
-
-1. Check git status. If the updated plan (or any other uncommitted work from this iteration) is not committed locally, commit it with a concise message. Do not push.
-2. Do not add a completion log entry: no task was completed in this iteration.
-3. Do not start work on the new tasks and do not modify product code beyond the commit.
-
-Report the commit (if any) succinctly.`;
+function planRecordingPrompt(): string {
+	return `${automatedPrefix()}${renderPrompt('plan-recording', {})}`;
 }
 
 async function readRequiredFile(path: string): Promise<string> {
@@ -1549,30 +1500,19 @@ function initPrompt(specFile: string, prompt: string, force: boolean, goal?: { t
 	const templateWarning =
 		specFile === DEFAULT_SPEC ? '; the target SPEC.md is intentionally allowed because it was explicitly selected' : '';
 	const goalNote = goal
-		? `
-
-This project runs the Ralph goal loop: the ralph-format backlog already contains the goal below (and no tasks yet). The specification must state this goal and its acceptance criteria.
-
-Goal: ${goal.title}
-${goal.body ? `${goal.body}\n` : ''}
-Keep the goal text exactly as given — it is the user's contract and is already recorded in the ralph-format backlog; do not reword it. Derive explicit, verifiable acceptance criteria for the goal from the project brief and put them with the goal in the specification. The goal loop plans from the goal, executes the planned tasks, and only stops when the goal is verified complete and approved.
-`
+		? `\n\n${renderPrompt('init-goal', {
+				goalTitle: goal.title,
+				goalBody: goal.body ? `${goal.body}\n` : ''
+			})}\n`
 		: '';
-	return `${AUTOMATED_PREFIX}Create the Ralph specification now. This is planning work only; do not implement the product brief.
-
-Project brief:
-${prompt}
-
-Output target: specification: ${specFile}.
-
-First read the bundled generic planning template in full:
-- specification template: ${INIT_TEMPLATE_SPEC}
-
-It is the authoritative example for the level of product/engineering detail, durable-spec content, acceptance criteria, decision handling, and source-evidence conventions. Adapt its structure and rigor to this project brief; do not copy its placeholder text or assume the project has an existing ${DEFAULT_SPEC}.
-
-Create exactly the target file above${force ? ', replacing the named existing file because --force was explicitly supplied,' : ''}. Do not modify any other file${templateWarning}. Use the write tool to produce a complete Markdown document, not a prose preview. Make it self-contained while linking to the Ralph backlog where useful.${goalNote}
-
-The specification must be a durable, implementation-ready product and engineering contract: purpose, scope, non-goals, source/evidence rules where applicable, architecture, domain/lifecycle and authorization constraints, user journeys and acceptance criteria, quality/security requirements, definition of done, and release gates. Derive scope, architecture, risks, quality checks, and decisions from the project brief; identify unknowns explicitly rather than inventing them. After writing, read the generated file and verify that it is complete, internally consistent, and contains no unrelated implementation changes. Then report the generated path succinctly.`;
+	return `${automatedPrefix()}${renderPrompt('init', {
+		brief: prompt,
+		specFile,
+		templateSpec: INIT_TEMPLATE_SPEC,
+		forceClause: force ? ', replacing the named existing file because --force was explicitly supplied,' : '',
+		templateWarning,
+		goalNote
+	})}`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -3182,7 +3122,7 @@ export default function (pi: ExtensionAPI) {
 				// the user's extra info into the recorded state.
 				return {
 					action: 'transform',
-					text: `${recordingPromptFor(state)}\n\nThe user provided this extra info while the loop was paused — take it into account and record it in the durable state so the next iteration sees it:\n${event.text}`
+							text: `${recordingPromptFor(state)}\n\n${renderPrompt('recording-extra-info', { extraInfo: event.text })}`
 				};
 			}
 			// No rotation was pending: continue the interrupted iteration with
@@ -3370,10 +3310,7 @@ export default function (pi: ExtensionAPI) {
 				hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state)) &&
 				openWorkTaskCount(currentTodo, countCategory(state)) > 0
 			) {
-				pi.sendUserMessage(
-					`${AUTOMATED_PREFIX}Continue the Ralph loop: call ralph_todo with action "next" and start the next open task.`,
-					{ deliverAs: 'followUp' }
-				);
+					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('continue-loop', {})}`, { deliverAs: 'followUp' });
 				return;
 			}
 

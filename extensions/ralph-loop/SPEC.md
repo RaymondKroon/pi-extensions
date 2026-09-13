@@ -18,7 +18,8 @@ repository; the pi core is untouched.
   commands, tools), `backlog.ts` (the `Backlog` API over SQLite-backed ralph
   files; the legacy line-oriented text format is parsed only for
   auto-migration, in-memory baseline snapshots, and imports), `todos-view.ts`
-  / `list-picker.ts` (TUI), and their tests.
+  / `list-picker.ts` (TUI), the `prompts/` directory (the loop prompt
+  templates, rendered by `prompt-template.ts`), and their tests.
 - The pi extension SDK (tools, commands, events, `ctx.ui.custom` overlays).
 - Unknown behaviour of the pi TUI/SDK must be verified against
   `/home/raymond/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs`
