@@ -6,7 +6,8 @@ description: Full reference for the ralph_todo, ralph_goal, and ralph_rotate too
 # Ralph backlog reference
 
 If the `ralph_todo`/`ralph_goal` tools are not available in this session,
-call `ralph_enable` first, then continue with this reference.
+start a loop with `/ralph start` so the tools are activated, then continue
+with this reference.
 
 The ralph-format backlog is a SQLite database (marker table
 `ralph_schema(name='ralph', version=1)`); the extension marks the format —

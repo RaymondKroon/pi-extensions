@@ -95,7 +95,7 @@ function rotateOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): 'tas
 }
 /** The rotation tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a rotation — and arm the auto loop — even while no loop is active yet. */
 const ROTATE_TOOL_NAME = 'ralph_rotate';
-/** Tools activated additively (defer_loading) by ralph_enable or /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
+/** Tools activated additively (defer_loading) by /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
 const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision', ROTATE_TOOL_NAME];
 /** The backlog tool name. With auto mode "on" the auto tool set is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
 const TODO_TOOL_NAME = 'ralph_todo';
@@ -1498,8 +1498,8 @@ export default function (pi: ExtensionAPI) {
 		pi.appendEntry(STATE_TYPE, next);
 	};
 
-	// The ralph tools cost zero context until activated (by ralph_enable or
-	// /ralph start). Activation is purely additive (defer_loading-friendly);
+	// The ralph tools cost zero context until activated by /ralph start.
+	// Activation is purely additive (defer_loading-friendly);
 	// deactivation only happens on session start with no active loop — once
 	// in context, the tools stay in context for the rest of the session
 	// (loop stop does not remove them, which would break the cached prefix).
@@ -1662,27 +1662,6 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 		ctx.ui.notify('Ralph is paused — reply below and we’ll decide it together.', 'info');
 	};
-
-	// ralph_enable stays active at all times (it is the unlock for the lazy
-	// ralph tools); everything else in RALPH_TOOL_NAMES is loop-gated.
-	pi.registerTool({
-		name: 'ralph_enable',
-		label: 'Enable Ralph tools',
-		description:
-			'Enable the ralph_todo, ralph_goal, ralph_rotate, and Ralph decision tools for this session. Call it when the user asks for Ralph backlog management but those tools are unavailable. Changed extension code only takes effect after a reload: with an active loop, ralph_rotate (reload: true) reloads at the rotation boundary; without a loop there is no agent-side reload — tell the user to run /reload.',
-		promptSnippet: 'Enable the Ralph tools',
-		parameters: Type.Object({}),
-		async execute() {
-			const active = pi.getActiveTools();
-			const next = [...active];
-			for (const name of RALPH_TOOL_NAMES) if (!next.includes(name)) next.push(name);
-			if (next.length !== active.length) pi.setActiveTools(next);
-			return {
-				content: [{ type: 'text', text: 'Ralph tools enabled for this session.' }],
-				details: {}
-			};
-		}
-	});
 
 	pi.registerTool({
 		name: 'ralph_request_decision',
@@ -2783,7 +2762,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// Dynamic tool loading (pi "defer_loading"): the four ralph tools stay
-	// inactive until ralph_enable or /ralph start activates them additively.
+	// inactive until /ralph start activates them additively.
 	// They carry no promptSnippet/promptGuidelines on purpose — activating a
 	// tool with prompt metadata rebuilds the system prompt and invalidates the
 	// cached prefix, even on providers with native deferred loading. All

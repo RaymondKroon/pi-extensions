@@ -3768,7 +3768,7 @@ describe('ralph-loop extension (lazy tool activation)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
 		for (const name of RALPH_TOOLS) expect(fake.activeTools).not.toContain(name);
-		expect(fake.activeTools).toEqual(['read', 'bash', 'edit', 'write', 'ralph_enable']);
+		expect(fake.activeTools).toEqual(['read', 'bash', 'edit', 'write']);
 	});
 
 	test('ralph tools are enabled while the loop runs and stay enabled after stop', async () => {
@@ -3791,21 +3791,6 @@ describe('ralph-loop extension (lazy tool activation)', () => {
 		for (const name of RALPH_TOOLS) expect(fake2.activeTools).not.toContain(name);
 	});
 
-	test('ralph_enable unlocks the lazy tools from chat without a loop', async () => {
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-		for (const name of RALPH_TOOLS) expect(fake.activeTools).not.toContain(name);
-
-		const enable = fake.tools.get('ralph_enable') as {
-			execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
-		};
-		await enable.execute('t', {}, undefined, undefined, fakeCtx.ctx);
-
-		for (const name of RALPH_TOOLS) expect(fake.activeTools).toContain(name);
-	});
-
 	test('ralph tools carry no prompt metadata (cache-safe deferred loading)', () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3825,7 +3810,7 @@ describe('ralph-loop extension (lazy tool activation)', () => {
 		expect(todo.description).toContain(refPath);
 		expect(goal.description).toContain(refPath);
 		const text = await readFile(refPath, 'utf8');
-		expect(text).toContain('call `ralph_enable` first');
+		expect(text).toContain('start a loop with `/ralph start`');
 		expect(text).toContain('## ralph_goal actions');
 	});
 });

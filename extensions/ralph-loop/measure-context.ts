@@ -1,6 +1,6 @@
 /**
  * Measures the per-turn context cost of the ralph-loop extension (v8:
- * deferred tool loading) in both states: idle (no loop — only ralph_enable
+ * deferred tool loading) in both states: idle (no loop — no ralph tools
  * active) and active (loop running — all ralph tools active).
  *
  * Counts (o200k BPE via gpt-tokenizer when installed, chars/4 fallback):
@@ -77,9 +77,9 @@ const toolDefsFor = (activeNames: string[]) => {
 	return total;
 };
 
-const ralphNames = tools.filter((t) => t.name !== 'ralph_enable').map((t) => t.name);
+const ralphNames = tools.map((t) => t.name);
 const builtinNames = ['read', 'bash', 'edit', 'write'];
-const idleNames = [...builtinNames, 'ralph_enable']; // ralph_enable is always active
+const idleNames = [...builtinNames]; // no ralph tools active
 const activeNames = [...idleNames, ...ralphNames];
 
 const baseTok = tok(promptFor(builtinNames)); // pi base, no ralph at all
@@ -89,13 +89,12 @@ const activeTok = tok(promptFor(activeNames));
 console.log('=== Tool definitions (per API request) ===');
 for (const t of tools) {
 	const n = tok(JSON.stringify({ name: t.name, description: t.description, parameters: t.parameters }));
-	const always = t.name === 'ralph_enable' ? ' (always active)' : '';
-	console.log(`  ${t.name.padEnd(24)} ${String(n).padStart(5)} tok${always}`);
+	console.log(`  ${t.name.padEnd(24)} ${String(n).padStart(5)} tok`);
 }
 
 console.log('\n=== Full system prompt (pi real buildSystemPrompt) ===');
 console.log(`  base pi prompt (4 tools):      ${String(baseTok).padStart(5)} tok`);
-console.log(`  idle (only ralph_enable):      ${String(idleTok).padStart(5)} tok  (delta ${idleTok - baseTok})`);
+console.log(`  idle (no ralph tools):         ${String(idleTok).padStart(5)} tok  (delta ${idleTok - baseTok})`);
 console.log(`  active (loop running):         ${String(activeTok).padStart(5)} tok  (delta ${activeTok - baseTok})`);
 
 const refPath = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
