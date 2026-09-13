@@ -128,3 +128,29 @@ environment quirks. Organized by topic.
   Evidence: the user's reply in this session's decision pause;
   `git log -S "Ralph loops run on ralph-format backlogs only"`.
   Approver: the user.
+- Approval record (task 19, 2026-09-13): the user approved the minified
+  `prompts/iteration-auto.md` (~1792 → ~760 bytes) via the
+  ralph_request_decision pause, with user refinements over the proposal:
+  (1) the first sentence of the backlog paragraph becomes "Read the
+  backlog." ("ralph format is old") — the "(ralph format) is read and
+  updated only through the ralph_todo tool — never … (no file tools, no
+  grep/cat/sed)" wording is dropped, but the category sentence ("The
+  backlog may contain several categories and the loop works through all of
+  them; new todos you record go to your category \"{{category}}\".") is
+  KEPT ("Do add info about categories"); (2) the last bullet is only "Keep
+  the project's knowledge current." (DEBUG.md details dropped); (3) the
+  final "When this iteration reaches its context budget …" paragraph is
+  removed ("we will tell this at the end of an iteration" — it is the
+  finish-up prompt's job). Final bullets: next / focused tests + quality
+  commands / complete with a concise note ("completion log entry") / commit
+  locally, do not push / {{closeStep}} / no-open-tasks / knowledge current.
+  Code: auto `closeStep` prefix "5." → "-" (both variants), "go back to
+  step 1" → "go back to the first step". Tests: the
+  'only through the ralph_todo tool' assertion (index.test.ts) is updated to
+  'Read the backlog.'; the 'your category "…"' assertions stay valid. Kept
+  (test-asserted): 'Run the Ralph auto loop', 'Commit the completed task
+  locally', 'Do not push', 'completion log'; 'context budget' is satisfied
+  by the contextNote on context-limit rotations. Approver: the user.
+  Rationale: trust-the-model minify style per the task-13 feedback, plus
+  the user's refinements.
+  Evidence: the user's replies in this session's decision pauses.

@@ -3935,7 +3935,7 @@ describe('ralph-loop extension (auto mode)', () => {
 
 		const prompt = fake.userMessages[0]!.text;
 		expect(prompt).toContain('Run the Ralph auto loop');
-		expect(prompt).toContain('only through the ralph_todo tool');
+		expect(prompt).toContain('Read the backlog.');
 		expect(prompt).toContain('General');
 		// The state file is created with the auto-created session category.
 		expect(readBacklog().createdLists()).toEqual(['General']);

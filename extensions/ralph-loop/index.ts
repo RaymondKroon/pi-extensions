@@ -772,8 +772,8 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 		// the model keeps working task after task until the context budget.
 		const closeStep =
 			state.rotateOn === 'task'
-				? '5. This is the last step of the iteration: stop working when the commit is made.'
-				: '5. After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.';
+				? '- This is the last step of the iteration: stop working when the commit is made.'
+				: '- After committing, immediately go back to the first step and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.';
 		return renderPrompt('iteration-auto', {
 			contextNote,
 			category: String(state.category),
