@@ -4317,9 +4317,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		await flush();
 
 		expect(fake.userMessages).toHaveLength(2);
-		expect(fake.userMessages[1]!.text).toContain('Continue the Ralph loop');
-		expect(fake.userMessages[1]!.text).toContain('ralph_todo');
-		expect(fake.userMessages[1]!.text).toContain('"next"');
+		expect(fake.userMessages[1]!.text).toContain('Continue on next task?');
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
 		expect(status).toContain('iteration 1/10');
@@ -4886,8 +4884,7 @@ M list "Plan"
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 		// …and the budget nudge keeps the loop moving to the next open task.
-		expect(fake.userMessages.at(-1)!.text).toContain('Continue the Ralph loop');
-		expect(fake.userMessages.at(-1)!.text).toContain('action "next"');
+		expect(fake.userMessages.at(-1)!.text).toContain('Continue on next task?');
 	});
 
 	test('task loop under rotateOn "budget": an exhausted backlog still stops the loop at settle', async () => {
