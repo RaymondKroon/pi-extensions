@@ -1003,11 +1003,7 @@ function contextCheckpointPromptBody(state: RalphState): string {
 		if (goalInfo && goalInfo.phase !== 'execution') {
 			return renderPrompt('context-checkpoint-goal', {});
 		}
-		return renderPrompt('context-checkpoint-ralph', {
-			iteration: String(state.iteration),
-			maxIterations: String(state.maxIterations),
-			taskIteration: String(state.taskIteration)
-		});
+		return renderPrompt('context-checkpoint-ralph', {});
 	}
 	return renderPrompt('context-checkpoint-markdown', {
 		iteration: String(state.iteration),

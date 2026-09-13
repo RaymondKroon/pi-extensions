@@ -28,19 +28,21 @@ describe('prompt-template', () => {
 	});
 
 	test('replaces repeated placeholders and keeps surrounding text', () => {
-		const text = renderPrompt('context-checkpoint-ralph', {
+		const text = renderPrompt('context-checkpoint-markdown', {
 			iteration: '3',
 			maxIterations: '10',
-			taskIteration: '2'
+			taskIteration: '2',
+			todoPath: '/tmp/todo.md'
 		});
 		expect(text).toContain('This is iteration 3 of 10 (iteration 2 for the current task).');
+		expect(text).toContain('Context checkpoint (iteration 3)');
 		expect(text).not.toContain('{{');
 	});
 
 	test('throws when a placeholder has no variable', () => {
-		expect(() => renderPrompt('context-checkpoint-ralph', { iteration: '1', maxIterations: '10' })).toThrow(
-			'Missing prompt variable "taskIteration"'
-		);
+		expect(() =>
+			renderPrompt('context-checkpoint-markdown', { iteration: '1', maxIterations: '10', taskIteration: '1' })
+		).toThrow('Missing prompt variable "todoPath"');
 	});
 
 	test('throws when the template file is missing', () => {
