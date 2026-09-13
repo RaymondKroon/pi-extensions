@@ -3494,13 +3494,23 @@ export default function (pi: ExtensionAPI) {
 			break;
 		}
 		if (!todoPath) {
-			ctx.ui.notify(
-				fileArg
-					? `Could not read ${fileArg}`
-					: 'No backlog found: start a loop or add tasks with the ralph_todo tool (or pass a file: /ralph <file.db>)',
-				'error'
-			);
-			return;
+			if (fileArg) {
+				ctx.ui.notify(`Could not read ${fileArg}`, 'error');
+				return;
+			}
+			// No backlog yet: create an empty one at the session ralph file so
+			// the home view can be used (add a goal, add tasks, start a loop).
+			const createPath = state?.enabled ? state.todoPath : autoTodoPath(ctx);
+			try {
+				Backlog.empty().save(createPath);
+			} catch (error) {
+				ctx.ui.notify(
+					`Could not create a new backlog at ${createPath}: ${error instanceof Error ? error.message : String(error)}`,
+					'error'
+				);
+				return;
+			}
+			todoPath = createPath;
 		}
 		const rel = relative(ctx.cwd, todoPath);
 		const title = rel && !rel.startsWith('..') ? rel : basename(todoPath);

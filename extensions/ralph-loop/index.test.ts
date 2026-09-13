@@ -2915,13 +2915,15 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 		const ralph = fake.commands.get('ralph')!;
 
-		// No loop, no session backlog: the view cannot open.
+		// No loop, no session backlog: an empty backlog is created and the
+		// view opens on it.
 		await ralph.handler('', fakeCtx.ctx);
-		expect(fakeCtx.customFactories.length).toBe(0);
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('No backlog found');
+		expect(fakeCtx.customFactories.length).toBe(1);
+		expect(readBacklog().categories()).toEqual([]);
 
 		// An explicit Markdown file argument has no todo entries; the view
 		// suggests importing it instead.
+		fakeCtx.customFactories.length = 0;
 		fakeCtx.notifications.length = 0;
 		await ralph.handler('TODO.md', fakeCtx.ctx);
 		expect(fakeCtx.customFactories.length).toBe(0);
