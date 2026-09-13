@@ -27,20 +27,37 @@ describe('prompt-template', () => {
 		expect(text).toContain('Automated Ralph loop instruction');
 	});
 
-	test('replaces repeated placeholders and keeps surrounding text', () => {
-		const text = renderPrompt('iteration-markdown', {
+	test('replaces placeholders and keeps surrounding text', () => {
+		const text = renderPrompt('iteration-ralph', {
 			contextNote: 'CTX',
-			decisionNote: 'DEC',
+			backlogNote: 'BLK',
+			categoryScope: ' in category "General"',
 			ralphCloseStep: 'CLOSE',
-			todoPath: '/tmp/todo.md'
+			decisionNote: 'DEC'
 		});
-		expect(text).toContain('Read /tmp/todo.md in full.');
-		expect(text).toContain('update /tmp/todo.md:');
+		expect(text).toContain('Run the Ralph loop for this repository. CTX');
+		expect(text).toContain('BLK');
+		expect(text).toContain('CLOSE');
+		expect(text).toContain('DEC');
 		expect(text).not.toContain('{{');
 	});
 
 	test('throws when a placeholder has no variable', () => {
-		expect(() => renderPrompt('context-checkpoint-markdown', {})).toThrow('Missing prompt variable "todoPath"');
+		expect(() => renderPrompt('iteration-ralph', {})).toThrow('Missing prompt variable "contextNote"');
+	});
+
+	test('every placeholder in a template referenced in index.ts is provided by its renderPrompt call', () => {
+		const source = readFileSync(join(import.meta.dirname, 'index.ts'), 'utf8');
+		const calls = [...source.matchAll(/renderPrompt\('([\w-]+)',\s*\{((?:[^{}]|\$\{[^}]*\})*)\}/g)];
+		expect(calls.length).toBeGreaterThan(0);
+		for (const call of calls) {
+			const name = call[1]!;
+			const vars = new Set([...call[2]!.matchAll(/^\s*(\w+)(?=\s*:|\s*,|\s*$)/gm)].map((match) => match[1]!));
+			const template = readFileSync(join(import.meta.dirname, 'prompts', `${name}.md`), 'utf8');
+			for (const placeholder of new Set([...template.matchAll(/\{\{(\w+)\}\}/g)].map((match) => match[1]!))) {
+				expect(vars.has(placeholder), `template ${name}.md uses {{${placeholder}}} but the renderPrompt call in index.ts does not pass it`).toBe(true);
+			}
+		}
 	});
 
 	test('throws when the template file is missing', () => {

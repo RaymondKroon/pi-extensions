@@ -751,6 +751,9 @@ function iterationPrompt(state: RalphState, reason?: RotationReason): string {
 }
 
 function iterationPromptBody(state: RalphState, reason?: RotationReason): string {
+	if (!isRalphBacklog(state.baselineTodo)) {
+		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
+	}
 	if (state.mode === 'auto') {
 		const contextNote =
 			reason === 'context-limit'
@@ -800,62 +803,50 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 			: `${number}. ${commitText} After committing, immediately go back to step 1 and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.`;
 	const commitText = `Commit the completed task locally in a single commit. Do not push.`;
 	// The closing step is a bullet in the ralph prompt (bullet steps), numbered
-	// to follow the prompt's own steps in the goal-execution (4) and markdown (6)
-	// prompts.
+	// to follow the prompt's own steps in the goal-execution (4) prompt.
 	const ralphCloseStep = closeStep('-', commitText);
 	const goalCloseStep = closeStep('4', commitText);
-	const markdownCloseStep = closeStep('6', commitText);
 
 	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, do not guess and do not use ${state.todoPath} as an unblock mechanism. Call the ralph_request_decision tool with one precise question and the relevant evidence. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution, document the decision, approver (auto-approved), rationale, and evidence in versioned documentation, then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, record the decision, approver (the user), rationale, and evidence in the appropriate versioned documentation; update any related TODO decision item only as an audit record; then call ralph_resolve_decision with the recorded path and continue the blocked work.'}`;
 
-	if (isRalphBacklog(state.baselineTodo)) {
-		const goalInfo = goalPhase(state);
-		if (goalInfo) {
-			const { phase, goal } = goalInfo;
-			const backlogNote = `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`;
-			const categoryScope = state.category ? ` in category "${state.category}"` : '';
-			const categoryGuard = state.category ? ' or on a task in another category' : '';
+	const goalInfo = goalPhase(state);
+	if (goalInfo) {
+		const { phase, goal } = goalInfo;
+		const backlogNote = `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`;
+		const categoryScope = state.category ? ` in category "${state.category}"` : '';
 
-			if (phase === 'planning') {
-				return renderPrompt('iteration-goal-planning', {
-					contextNote,
-					backlogNote,
-					goalBlock: goalBlock(goal),
-					decisionNote
-				});
-			}
-			if (phase === 're-evaluation') {
-				return renderPrompt('iteration-goal-re-evaluation', {
-					contextNote,
-					backlogNote,
-					goalBlock: goalBlock(goal),
-					decisionNote
-				});
-			}
-			return renderPrompt('iteration-goal-execution', {
+		if (phase === 'planning') {
+			return renderPrompt('iteration-goal-planning', {
 				contextNote,
 				backlogNote,
 				goalBlock: goalBlock(goal),
-				categoryScope,
-				goalCloseStep,
 				decisionNote
 			});
 		}
-
-		const categoryScope = state.category ? ` in category "${state.category}"` : '';
-		return renderPrompt('iteration-ralph', {
+		if (phase === 're-evaluation') {
+			return renderPrompt('iteration-goal-re-evaluation', {
+				contextNote,
+				backlogNote,
+				goalBlock: goalBlock(goal),
+				decisionNote
+			});
+		}
+		return renderPrompt('iteration-goal-execution', {
 			contextNote,
-			backlogNote: `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`,
+			backlogNote,
+			goalBlock: goalBlock(goal),
 			categoryScope,
-			ralphCloseStep,
+			goalCloseStep,
 			decisionNote
 		});
 	}
 
-	return renderPrompt('iteration-markdown', {
+	const categoryScope = state.category ? ` in category "${state.category}"` : '';
+	return renderPrompt('iteration-ralph', {
 		contextNote,
-		todoPath: state.todoPath,
-		markdownCloseStep,
+		backlogNote: `The backlog is the SQLite-backed file ${state.todoPath} (ralph format). Read and update it only through the ralph_todo tool — never read or modify it by any other means (no file tools, no grep/cat/sed or other shell commands on the file). Use ralph_todo action "search" to find tasks by keyword.`,
+		categoryScope,
+		ralphCloseStep,
 		decisionNote
 	});
 }
@@ -968,16 +959,16 @@ function contextCheckpointPrompt(state: RalphState): string {
 }
 
 function contextCheckpointPromptBody(state: RalphState): string {
-	if (isRalphBacklog(state.baselineTodo)) {
-		// Task-less goal iterations (planning/re-evaluation) have no task to
-		// checkpoint: the goal carries the durable state instead.
-		const goalInfo = goalPhase(state);
-		if (goalInfo && goalInfo.phase !== 'execution') {
-			return renderPrompt('context-checkpoint-goal', {});
-		}
-		return renderPrompt('context-checkpoint-ralph', {});
+	if (!isRalphBacklog(state.baselineTodo)) {
+		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
-	return renderPrompt('context-checkpoint-markdown', { todoPath: state.todoPath });
+	// Task-less goal iterations (planning/re-evaluation) have no task to
+	// checkpoint: the goal carries the durable state instead.
+	const goalInfo = goalPhase(state);
+	if (goalInfo && goalInfo.phase !== 'execution') {
+		return renderPrompt('context-checkpoint-goal', {});
+	}
+	return renderPrompt('context-checkpoint-ralph', {});
 }
 
 /**

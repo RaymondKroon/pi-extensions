@@ -111,3 +111,20 @@ environment quirks. Organized by topic.
   Evidence: the user's reply in this session's decision pause ("Approve, but
   just use bullet items ('-') instead of numbers"); bun test and the commit
   "ralph: minify iteration-ralph prompt (user-approved)".
+- Decision record (task 18, 2026-09-13): instead of minifying
+  `prompts/iteration-markdown.md`, the user decided to remove the unused
+  markdown prompt path entirely ("Remove this path if it is not used
+  anymore"). Scope: delete `prompts/iteration-markdown.md` and
+  `prompts/context-checkpoint-markdown.md`; remove the `!isRalphBacklog`
+  fallbacks in `iterationPromptBody` and `contextCheckpointPromptBody`
+  (replaced by a defensive throw for legacy restored sessions that could
+  still carry a non-ralph baseline) and the `markdownCloseStep` variable;
+  re-point the two `prompt-template.test.ts` tests that used these
+  templates to `iteration-ralph`.
+  Rationale: loops only start on ralph-format backlogs (start refuses
+  otherwise, commit ff56722), so both fallbacks are dead code; the
+  iteration-markdown template also carried a latent placeholder/variable
+  mismatch bug from task 17 ({{ralphCloseStep}} vs markdownCloseStep).
+  Evidence: the user's reply in this session's decision pause;
+  `git log -S "Ralph loops run on ralph-format backlogs only"`.
+  Approver: the user.
