@@ -1001,10 +1001,7 @@ function contextCheckpointPromptBody(state: RalphState): string {
 		// checkpoint: the goal carries the durable state instead.
 		const goalInfo = goalPhase(state);
 		if (goalInfo && goalInfo.phase !== 'execution') {
-			return renderPrompt('context-checkpoint-goal', {
-				iteration: String(state.iteration),
-				maxIterations: String(state.maxIterations)
-			});
+			return renderPrompt('context-checkpoint-goal', {});
 		}
 		return renderPrompt('context-checkpoint-ralph', {
 			iteration: String(state.iteration),

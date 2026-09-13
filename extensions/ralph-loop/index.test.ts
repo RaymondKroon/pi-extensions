@@ -2144,11 +2144,9 @@ D 2
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
 		const prompt = fake.userMessages.at(-1)!.text;
-		expect(prompt).toContain('durable checkpoint');
-		expect(prompt).toContain('iteration 1 of 10');
-		expect(prompt).toContain('ralph_goal with action "checkpoint"');
-		expect(prompt).toContain('keep only the single most recent one');
-		// The task checkpoint tool is not offered for a task-less iteration.
+		expect(prompt).toContain('context budget');
+		expect(prompt).toContain('Checkpoint the current task');
+		// No tool is named: the model picks ralph_goal / ralph_todo itself.
 		expect(prompt).not.toContain('ralph_todo');
 	});
 
