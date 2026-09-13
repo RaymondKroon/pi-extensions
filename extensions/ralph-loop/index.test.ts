@@ -2104,7 +2104,7 @@ D 2
 		expect(prompt).toContain('Port the state.');
 		expect(prompt).toContain('This is a planning iteration: the goal is open and the backlog has no tasks yet.');
 		expect(prompt).toContain('Decompose the goal into small, ordered tasks');
-		expect(prompt).toContain('action "add-many"');
+		expect(prompt).toContain('Record the plan as a new list');
 		expect(prompt).toContain('Do not implement the goal in this iteration');
 		// Planning does not select a task.
 		expect(prompt).not.toContain('action "next"');

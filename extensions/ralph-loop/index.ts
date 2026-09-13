@@ -818,7 +818,6 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 					contextNote,
 					backlogNote,
 					goalBlock: goalBlock(goal),
-					todoPath: state.todoPath,
 					decisionNote
 				});
 			}

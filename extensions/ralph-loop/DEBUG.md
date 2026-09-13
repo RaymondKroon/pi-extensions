@@ -43,3 +43,11 @@ environment quirks. Organized by topic.
     would otherwise rediscover from scratch."
   - Apply the same restraint to the remaining minify tasks (14–19): drop
     anything already established elsewhere or obvious to the model.
+- Approval record (task 14, 2026-09-13): the user approved the minified
+  `prompts/iteration-goal-planning.md` (drop the ralph_todo action mechanics
+  from step 2 — they live in the tool description — and the restated
+  "do not edit the todo file" guard from step 3 — it lives in the backlog
+  note) via the ralph_request_decision pause. Approver: the user.
+  Rationale: trust-the-model minify style per the task-13 feedback.
+  Evidence: `bun test` 411 pass / 0 fail; commit "ralph: minify
+  iteration-goal-planning prompt (user-approved)".
