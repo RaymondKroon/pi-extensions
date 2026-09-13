@@ -227,6 +227,18 @@ in one deterministic step — when **compaction mode** is enabled (config
 - **Config migration.** Saved configs without `compactionMode` (session
   entries and `.pi/ralph-loop.json` from older versions) normalize to the
   default (`true`); legacy single-threshold configs migrate the same way.
+- **Config storage.** Settings are saved in the global store
+  `<agent dir>/ralph/config.json` with a `defaults` section (the normal
+  config for directories without their own settings) and a `dirs` section
+  keyed by directory and — for git repositories — by branch (the
+  `"default"` key serves non-git directories and is the per-directory
+  fallback when a branch has no entry of its own). Load order: the
+  directory's `dirs` entry, then the project's `.pi/ralph-loop.json`
+  (legacy: still read, no longer written — the directory's own older
+  setting beats the defaults section), then `defaults`, then the built-in
+  defaults. Session start notifies while a legacy project file exists —
+  either in use (re-save with `/ralph config`, then delete) or shadowed by
+  a store entry (can be deleted) — so the files work their way out.
 - **Audit trail.** The session file stays append-only: finished iterations
   remain in `getBranch()` (and in `/tree`), only the compaction-aware context
   (`buildContextEntries`, what the TUI renders) drops them.

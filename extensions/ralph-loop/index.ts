@@ -18,7 +18,8 @@ import {
 	truncateToWidth,
 	visibleWidth
 } from '@earendil-works/pi-tui';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
@@ -40,6 +41,10 @@ import { createRalphHome, type RalphHome } from './ralph-home.ts';
 const STATE_TYPE = 'ralph-loop-state';
 const CONFIG_TYPE = 'ralph-loop-config';
 const CONFIG_FILE_NAME = 'ralph-loop.json';
+/** The global config store file (in the ralph directory of pi's global agent directory): settings per directory and, for git repositories, per branch. */
+const GLOBAL_CONFIG_FILE_NAME = 'config.json';
+/** The branch key for non-git directories and detached HEAD, and the per-directory fallback when a branch has no entry of its own. */
+const DEFAULT_BRANCH_KEY = 'default';
 /** Marks the beginning of an independent Ralph iteration in the same session. */
 const CONTEXT_BOUNDARY_TYPE = 'ralph-loop-context-boundary';
 /** Completion-summary message injected at the start of each fresh Ralph iteration. */
@@ -417,6 +422,51 @@ function contextUsageLabel(ctx: ExtensionContext, threshold: number): string {
 
 function projectConfigPath(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+}
+
+/** The global config store: a "defaults" section (the normal config for directories without their own settings) and a "dirs" section keyed by directory → branch (or "default") → saved config. */
+interface RalphConfigStore {
+	defaults?: Record<string, unknown>;
+	dirs?: Record<string, Record<string, unknown>>;
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+	!!value && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * Validate the parsed store file; undefined for an unrecognized shape (a
+ * corrupt store).
+ */
+function parseConfigStore(value: unknown): RalphConfigStore | undefined {
+	if (!isPlainObject(value)) return undefined;
+	if (value.defaults !== undefined && !isPlainObject(value.defaults)) return undefined;
+	if (value.dirs !== undefined && !isPlainObject(value.dirs)) return undefined;
+	return { defaults: value.defaults, dirs: value.dirs };
+}
+
+function globalConfigPath(): string {
+	return join(getAgentDir(), AUTO_TODO_DIR, GLOBAL_CONFIG_FILE_NAME);
+}
+
+/** The current git branch of the directory (undefined outside a repository or on a detached HEAD). */
+function gitBranch(cwd: string): string | undefined {
+	try {
+		const branch = execFileSync('git', ['branch', '--show-current'], {
+			cwd,
+			encoding: 'utf8',
+			stdio: ['ignore', 'pipe', 'ignore']
+		}).trim();
+		return branch.length > 0 ? branch : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The stored config for a directory: the git branch's entry, falling back to the directory's default entry. */
+function directoryConfigFor(store: RalphConfigStore, cwd: string, branch: string | undefined): unknown {
+	const dir = store.dirs?.[cwd];
+	if (!dir || typeof dir !== 'object') return undefined;
+	return (branch ? dir[branch] : undefined) ?? dir[DEFAULT_BRANCH_KEY];
 }
 
 /**
@@ -1580,14 +1630,34 @@ export default function (pi: ExtensionAPI) {
 
 	const persistConfig = (ctx: ExtensionContext, next: RalphConfig) => {
 		config = next;
-		// Keep the current branch's audit trail, while the project file makes the
-		// settings available to future Ralph sessions.
+		// Keep the current branch's audit trail, while the global store makes the
+		// settings available to future Ralph sessions — per directory and, for git
+		// repositories, per branch.
 		pi.appendEntry(CONFIG_TYPE, next);
-		const path = projectConfigPath(ctx.cwd);
+		const path = globalConfigPath();
+		const branchKey = gitBranch(ctx.cwd) ?? DEFAULT_BRANCH_KEY;
 		configWrite = configWrite
 			.then(async () => {
-				await mkdir(join(ctx.cwd, CONFIG_DIR_NAME), { recursive: true });
-				await writeFile(path, `${JSON.stringify(next, null, '\t')}\n`, 'utf8');
+				let store: RalphConfigStore;
+				try {
+					const parsed = parseConfigStore(JSON.parse(await readFile(path, 'utf8')));
+					if (!parsed) throw new Error('unrecognized configuration store format');
+					store = parsed;
+				} catch (error) {
+					if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+						store = {};
+					} else {
+						// A corrupt store: refuse to clobber the other directories' settings.
+						throw error;
+					}
+				}
+				const dir = store.dirs?.[ctx.cwd];
+				store.dirs = {
+					...(store.dirs ?? {}),
+					[ctx.cwd]: { ...(dir && typeof dir === 'object' ? dir : {}), [branchKey]: next }
+				};
+				await mkdir(dirname(path), { recursive: true });
+				await writeFile(path, `${JSON.stringify(store, null, '\t')}\n`, 'utf8');
 			})
 			.catch((error) => {
 				const message = error instanceof Error ? error.message : String(error);
@@ -2882,10 +2952,57 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 
-		const path = projectConfigPath(ctx.cwd);
+		// The global store (<agent dir>/ralph/config.json) keeps the settings in a
+		// "defaults" section (the normal config) and a "dirs" section per directory
+		// and, for git repositories, per branch — outside the project.
+		// Resolution: the directory's entry, then the legacy project file (the
+		// directory's own older setting), then the defaults section.
+		let store: RalphConfigStore | undefined;
+		const globalPath = globalConfigPath();
 		try {
-			const savedConfig = normalizeConfig(JSON.parse(await readFile(path, 'utf8')) as unknown);
-			if (!savedConfig) throw new Error('expected contextThreshold(s) and autoApproveDecisions');
+			store = parseConfigStore(JSON.parse(await readFile(globalPath, 'utf8')));
+		} catch (error) {
+			if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Ralph configuration could not be loaded from ${globalPath}: ${message}`, 'warning');
+			}
+		}
+		let savedConfig = store ? normalizeConfig(directoryConfigFor(store, ctx.cwd, gitBranch(ctx.cwd))) : undefined;
+		// Legacy: the project file predates the global store. It is read but never
+		// updated, so point the user at it either way — in use (it shadows the
+		// defaults section) or ignored (a store entry wins), it can go away.
+		const legacyPath = projectConfigPath(ctx.cwd);
+		if (savedConfig) {
+			try {
+				await access(legacyPath);
+				ctx.ui.notify(
+					`A legacy Ralph config exists at ${legacyPath} but is ignored while the global store has a setting for this directory — you can delete the file.`,
+					'warning'
+				);
+			} catch {
+				// No legacy file: nothing to point out.
+			}
+		} else {
+			try {
+				const legacy = normalizeConfig(JSON.parse(await readFile(legacyPath, 'utf8')) as unknown);
+				if (legacy) {
+					savedConfig = legacy;
+					ctx.ui.notify(
+						`Found a legacy Ralph config at ${legacyPath} — it is only read, never updated. Re-save your settings with /ralph config (global store: ${globalPath}), then delete the file.`,
+						'warning'
+					);
+				}
+			} catch (error) {
+				if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Ralph configuration could not be loaded from ${legacyPath}: ${message}`, 'warning');
+				}
+			}
+		}
+		if (!savedConfig) {
+			savedConfig = normalizeConfig(store?.defaults);
+		}
+		if (savedConfig) {
 			config = savedConfig;
 			if (state?.enabled) {
 				state = {
@@ -2894,11 +3011,6 @@ export default function (pi: ExtensionAPI) {
 					maxIterations: config.maxIterations,
 					contextThreshold: contextThresholdFor(config, ctx)
 				};
-			}
-		} catch (error) {
-			if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Ralph configuration could not be loaded from ${path}: ${message}`, 'warning');
 			}
 		}
 		if (state?.enabled) {

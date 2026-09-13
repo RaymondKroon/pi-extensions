@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -4739,12 +4740,12 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: off');
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop stopped (forced); auto mode is now off');
 
-		// The setting change is persisted: session audit trail and project file.
+		// The setting change is persisted: session audit trail and global store.
 		const configEntry = fake.entries.filter((entry) => entry.customType === 'ralph-loop-config').at(-1);
 		expect(configEntry?.data).toMatchObject({ autoMode: 'off' });
 		await flush();
-		const file = JSON.parse(await readFile(join(dir, '.pi', 'ralph-loop.json'), 'utf8')) as { autoMode: string };
-		expect(file.autoMode).toBe('off');
+		const store = JSON.parse(await readFile(join(agentDir, 'ralph', 'config.json'), 'utf8')) as { dirs?: Record<string, Record<string, { autoMode: string }>> };
+		expect(store.dirs![dir]!.default!.autoMode).toBe('off');
 
 		// And the intercept stays off even above the budget.
 		fakeCtx.usagePercent.value = 55;
@@ -5192,5 +5193,188 @@ M list "Plan"
 		const listed = await tool.execute('t', { action: 'list' }, undefined, undefined, fakeCtx.ctx);
 		expect(listed.content[0]!.text).toContain('Session only');
 		expect(listed.content[0]!.text).not.toContain('Task one');
+	});
+});
+
+describe('ralph-loop extension (global config store)', () => {
+	const storePath = () => join(agentDir, 'ralph', 'config.json');
+	const fullConfig = (extra: Record<string, unknown> = {}) =>
+		({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'off', rotateOn: 'default', ...extra });
+
+	const writeStore = (store: { defaults?: Record<string, unknown>; dirs?: Record<string, unknown> }) =>
+		writeFile(storePath(), `${JSON.stringify(store, null, '\t')}\n`);
+
+	const readStore = () =>
+		readFile(storePath(), 'utf8').then(
+			(raw) => JSON.parse(raw) as { defaults?: Record<string, unknown>; dirs?: Record<string, Record<string, unknown>> }
+		);
+
+	test('config changes are saved to the dirs section, keyed by directory and default branch', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({ dirs: { [dir]: { default: fullConfig({ autoMode: 'on' }) } } });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// stop --force on the auto loop persists the auto mode off.
+		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
+		await flush();
+
+		const store = await readStore();
+		expect(Object.keys(store.dirs!)).toEqual([dir]);
+		expect(store.dirs![dir]!.default).toMatchObject({ autoMode: 'off' });
+		// The legacy project file is no longer rewritten.
+		const project = JSON.parse(await readFile(join(dir, '.pi', 'ralph-loop.json'), 'utf8')) as { autoMode?: string };
+		expect(project.autoMode).toBeUndefined();
+	});
+
+	test('git repo: the setting is saved under the current branch, keeping the default entry', async () => {
+		const repo = join(dir, 'repo');
+		await mkdir(repo, { recursive: true });
+		execFileSync('git', ['init', '-q'], { cwd: repo });
+		execFileSync('git', ['checkout', '-q', '-b', 'feature'], { cwd: repo });
+		await writeFile(autoFile(), RALPH_V1);
+		// The branch has no entry of its own: the loop arms from the directory's default entry.
+		await writeStore({ dirs: { [repo]: { default: fullConfig({ autoMode: 'on' }) } } });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(repo);
+		await startLoop(fake, fakeCtx);
+
+		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
+		await flush();
+
+		const store = await readStore();
+		expect(store.dirs![repo]!.feature).toMatchObject({ autoMode: 'off' });
+		expect(store.dirs![repo]!.default).toMatchObject({ autoMode: 'on' });
+	});
+
+	test('git repo: a branch entry overrides the directory default', async () => {
+		const repo = join(dir, 'repo');
+		await mkdir(repo, { recursive: true });
+		execFileSync('git', ['init', '-q'], { cwd: repo });
+		execFileSync('git', ['checkout', '-q', '-b', 'feature'], { cwd: repo });
+		await writeFile(join(repo, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({
+			dirs: { [repo]: { default: fullConfig({ maxIterations: 7 }), feature: fullConfig({ maxIterations: 4 }) } }
+		});
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(repo);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/4');
+	});
+
+	test('git repo: a branch without its own entry falls back to the directory default', async () => {
+		const repo = join(dir, 'repo');
+		await mkdir(repo, { recursive: true });
+		execFileSync('git', ['init', '-q'], { cwd: repo });
+		execFileSync('git', ['checkout', '-q', '-b', 'feature'], { cwd: repo });
+		await writeFile(join(repo, 'SPEC.md'), '# Spec\n\nBuild the thing.\n');
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({ dirs: { [repo]: { default: fullConfig({ maxIterations: 7 }) } } });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(repo);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/7');
+	});
+
+	test('a directory without any entry falls back to the defaults section', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		await rm(join(dir, '.pi', 'ralph-loop.json')); // no legacy project file either
+		await writeStore({ defaults: fullConfig({ maxIterations: 5 }) });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/5');
+	});
+
+	test('a directory entry overrides the defaults section', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({
+			defaults: fullConfig({ maxIterations: 5 }),
+			dirs: { [dir]: { default: fullConfig({ maxIterations: 8 }) } }
+		});
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/8');
+	});
+
+	test('saving a config keeps the defaults section intact', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({
+			defaults: fullConfig({ maxIterations: 5 }),
+			dirs: { [dir]: { default: fullConfig({ autoMode: 'on' }) } }
+		});
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
+		await flush();
+
+		const store = await readStore();
+		expect(store.defaults).toMatchObject({ maxIterations: 5 });
+		expect(store.dirs![dir]!.default).toMatchObject({ autoMode: 'off' });
+	});
+
+	test('the legacy project file beats the defaults section', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify(fullConfig({ maxIterations: 3 }), null, '\t')}\n`
+		);
+		await writeStore({ defaults: fullConfig({ maxIterations: 5 }) });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/3');
+	});
+
+	test('a shadowed legacy project file is reported as ignored', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		// The outer beforeEach already wrote the legacy project file; the store entry wins.
+		await writeStore({ dirs: { [dir]: { default: fullConfig({ maxIterations: 8 }) } } });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/8');
+		const note = fakeCtx.notifications.find((n) => n.message.includes('legacy Ralph config'));
+		expect(note?.message).toContain('ignored');
+		expect(note?.message).toContain(join(dir, '.pi', 'ralph-loop.json'));
+		expect(note?.type).toBe('warning');
+	});
+
+	test('the legacy project file is loaded when the global store has no entry', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify(fullConfig({ maxIterations: 3 }), null, '\t')}\n`
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/3');
+		// The legacy file is read-only: the user is pointed at it so it can go away.
+		const note = fakeCtx.notifications.find((n) => n.message.includes('legacy Ralph config'));
+		expect(note?.message).toContain(join(dir, '.pi', 'ralph-loop.json'));
+		expect(note?.type).toBe('warning');
 	});
 });
