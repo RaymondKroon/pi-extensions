@@ -66,3 +66,22 @@ environment quirks. Organized by topic.
   renderPrompt call in index.ts. Approver: the user.
   Rationale: trust-the-model minify style per the task-13 feedback.
   Evidence: the user's reply in this session's decision pause.
+- Approval record (task 16, 2026-09-13): the user approved the minified
+  `prompts/iteration-goal-execution.md` via the ralph_request_decision pause,
+  with a further user refinement over the proposal (even shorter). Final
+  steps: (1) "Call ralph_todo with action \"next\" to get the next open
+  task{{categoryScope}}" (renumbered 1, 2, 3 per the user: "My bad: 1,2,3").
+  (2) "Add focused tests and run every quality command required by the
+  backlog." (3) "Only after all acceptance criteria pass, complete the task
+  with a concise note. The note becomes the completion log entry."
+  Intro: "add or adjust tasks to the plan's list" (per the proposal). Dropped
+  vs the original: steps 2 ("Do not work on a later task") and 3 ("implement
+  exactly one coherent vertical slice") → the `categoryGuard` var is removed
+  from the renderPrompt call in index.ts; the "wider backlog" clause and
+  "its number, body, and checkpoint" from step 1; the note-content list and
+  the restated "Do not edit {{todoPath}} directly" guard from step 5 → the
+  `todoPath` var is also removed from the renderPrompt call. Kept
+  "completion log" (tests assert it). Approver: the user.
+  Rationale: trust-the-model minify style per the task-13 feedback, pushed
+  further by the user.
+  Evidence: the user's replies in this session's decision pauses.

@@ -2117,10 +2117,10 @@ D 2
 		expect(prompt).toContain('The goal is "Rewrite the app" (status: open).');
 		expect(prompt).toContain('You are executing the goal');
 		expect(prompt).toContain('keep the plan honest');
-		expect(prompt).toContain('add or adjust tasks with ralph_todo');
+		expect(prompt).toContain("add or adjust tasks to the plan's list");
 		// The task workflow is the task prompt plus the goal context.
 		expect(prompt).toContain('action "next"');
-		expect(prompt).toContain('action "complete"');
+		expect(prompt).toContain('complete the task with a concise note');
 		expect(prompt).not.toContain('planning iteration');
 		expect(prompt).not.toContain('re-evaluation iteration');
 	});
