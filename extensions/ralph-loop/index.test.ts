@@ -370,6 +370,30 @@ describe('ralph-loop extension', () => {
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop is already active — /ralph stop to end it first');
 	});
 
+	test('appends the no-re-trigger guardrail to the system prompt only while the loop is active', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		// Loop not active: the handler must not touch the system prompt.
+		const idle = await fake.fire('before_agent_start', fakeCtx.ctx, {
+			prompt: 'hello',
+			systemPrompt: 'BASE'
+		});
+		expect(idle).toBeUndefined();
+
+		await startLoop(fake, fakeCtx);
+
+		const result = (await fake.fire('before_agent_start', fakeCtx.ctx, {
+			prompt: 'hello',
+			systemPrompt: 'BASE'
+		})) as { systemPrompt?: string } | undefined;
+		expect(result).toBeDefined();
+		expect(result!.systemPrompt.startsWith('BASE\n\n')).toBe(true);
+		expect(result!.systemPrompt).toContain('no periodic re-trigger');
+		expect(result!.systemPrompt).toContain('misperception');
+	});
+
 	test('context-limit rotation finishes up, then starts a fresh iteration with incremented counters', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);

@@ -2979,6 +2979,26 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	// Small models can confabulate a "the user resent the Ralph instruction"
+	// belief after a tool result, and pi replays the model's own thinking blocks
+	// (same-model signature replay), so the confabulation re-appears in every
+	// later request and reinforces itself. A system-prompt guardrail sits at the
+	// top of every request for the whole run, which a one-off correction steer
+	// cannot be. The text is stable while the loop runs, so the prompt cache
+	// prefix only changes at loop start/stop.
+	pi.on('before_agent_start', (event) => {
+		if (!state?.enabled) return;
+		return {
+			systemPrompt:
+				`${event.systemPrompt}\n\n` +
+				'Ralph loop: the loop never re-sends its instructions; there is no periodic re-trigger. ' +
+				'While the loop runs, the only new inputs are tool results and user messages carrying the ' +
+				'"[Automated Ralph loop instruction...]" prefix. If your earlier reasoning says an instruction ' +
+				'was "resent" or "periodically re-triggered", that is a misperception — no such message exists. ' +
+				'Continue the current task from the tool results.'
+		};
+	});
+
 	// Record whether the turn started already over budget so the mid-turn steer
 	// cannot re-trigger immediately after a rotation whose reported usage has
 	// not caught up with the fresh (filtered) context yet.
