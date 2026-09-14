@@ -198,7 +198,7 @@ export class CdpManager {
         "({ href: location.href, title: document.title })",
         { timeoutMs: 10_000 },
       );
-      return { attached: true, url: href, title };
+      return { attached: true, targetId: s.targetId, url: href, title };
     } catch {
       this.sessions.delete(key);
       s.close();
@@ -212,6 +212,7 @@ export class CdpManager {
    * restarted).
    */
   async run<T>(pattern: string | undefined, fn: (s: CdpSession) => Promise<T>): Promise<T> {
+    pattern = pattern ?? this.defaultTab;
     const key = this.keyFor(pattern);
     let session = this.sessions.get(key);
     if (session?.closed) {
@@ -223,7 +224,14 @@ export class CdpManager {
       return await fn(session);
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
-      const dead = session.closed || /connection closed|socket|websocket/i.test(msg);
+      // Socket-level death, or CDP saying the target/session is gone while
+      // the socket is still open (tab closed out-of-band) — both mean
+      // re-attach, not surface the error.
+      const dead =
+        session.closed ||
+        /connection closed|socket|websocket|unknown session|cannot find (target|context)|target (closed|crashed)|no target/i.test(
+          msg,
+        );
       if (!dead) throw e;
       this.sessions.delete(key);
       const fresh = await this.attach(pattern);
@@ -237,26 +245,83 @@ export class CdpManager {
     this.lastTargetId.clear();
   }
 
-  private async listTargets(): Promise<CdpTarget[]> {
+  /** Drop all cached state for a target that was closed (session + sticky id),
+   * so the next command re-resolves against the remaining tabs. */
+  forgetTarget(id: string): void {
+    for (const [key, s] of [...this.sessions]) {
+      if (s.targetId === id) {
+        this.sessions.delete(key);
+        s.close();
+      }
+    }
+    for (const [key, tid] of [...this.lastTargetId]) {
+      if (tid === id) this.lastTargetId.delete(key);
+    }
+  }
+
+  /** Open a NEW page tab. The URL is the RAW query string (/json/new?<url>).
+   * Chrome >= 111 requires PUT; older builds only accept GET, so fall back. */
+  async openTarget(url = "about:blank"): Promise<CdpTarget> {
+    const path = `/json/new?${url}`;
+    let res = await this.http(path, { method: "PUT" });
+    if (res.status === 405) res = await this.http(path, { method: "GET" });
+    if (!res.ok) throw new Error(`CDP /json/new failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
+    const t = (await res.json()) as CdpTarget;
+    if (!t?.id) throw new Error("CDP /json/new returned no target");
+    // Chrome reports the new tab's url as "" until the navigation commits.
+    // Wait for it so callers (and any attach-time URL gate) see the real
+    // URL — attaching to a ""-url tab races cold/slow loads.
+    const t0 = Date.now();
+    while (Date.now() - t0 < 10_000) {
+      const fresh = (await this.listTargets()).find((x) => x.id === t.id);
+      if (!fresh) break; // target already gone
+      if (fresh.url) return fresh;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return t;
+  }
+
+  /** Close a tab by exact target id. */
+  async closeTarget(id: string): Promise<void> {
+    const res = await this.http(`/json/close/${id}`);
+    // Chrome answers 200 with the plain-text body "Target is closing".
+    if (!res.ok) throw new Error(`CDP /json/close failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
+    await res.text();
+  }
+
+  /** All open page tabs (devtools pages excluded). */
+  async pageTargets(): Promise<CdpTarget[]> {
+    const targets = await this.listTargets();
+    return targets.filter((t) => t.type === "page" && !t.url.startsWith("devtools://"));
+  }
+
+  private async http(path: string, init: RequestInit = {}): Promise<Response> {
     let res: Response;
     try {
-      res = await fetch(`http://127.0.0.1:${this.port}/json`, { signal: AbortSignal.timeout(5000) });
+      res = await fetch(`http://127.0.0.1:${this.port}${path}`, { ...init, signal: AbortSignal.timeout(5000) });
     } catch (e: any) {
       throw new Error(
         `Chrome is not listening on 127.0.0.1:${this.port} — start it with --remote-debugging-port=${this.port} (${e?.message ?? e})`,
       );
     }
+    return res;
+  }
+
+  private async listTargets(): Promise<CdpTarget[]> {
+    const res = await this.http("/json");
     if (!res.ok) throw new Error(`CDP /json failed: HTTP ${res.status}`);
     return (await res.json()) as CdpTarget[];
   }
 
   private async attach(pattern?: string): Promise<CdpSession> {
-    const targets = await this.listTargets();
-    const pages = targets.filter((t) => t.type === "page" && !t.url.startsWith("devtools://"));
+    const pages = await this.pageTargets();
     // Prefer the previously attached target (it may have navigated away from
     // the pattern URL); fall back to the URL pattern.
     const remembered = this.lastTargetId.get(this.keyFor(pattern));
+    // Drop the remembered id if /json no longer lists it (tab closed
+    // out-of-band) — otherwise every attach would re-try the dead target.
     let matches = remembered ? pages.filter((t) => t.id === remembered) : [];
+    if (remembered && !matches.length) this.lastTargetId.delete(this.keyFor(pattern));
     if (!matches.length) matches = pattern ? pages.filter((t) => t.url.includes(pattern)) : pages;
     if (!matches.length) {
       throw new Error(
@@ -268,6 +333,16 @@ export class CdpManager {
     // Prefer the shortest matching URL: the app's base tab, not derived
     // file/preview tabs that share the same host pattern.
     const t = [...matches].sort((a, b) => a.url.length - b.url.length)[0];
+    return this.connect(t, this.keyFor(pattern));
+  }
+
+  /** Attach a session directly to a known target (e.g. one just created by
+   * openTarget), keyed by target id so it shows up in tab_list. */
+  async attachTarget(t: CdpTarget): Promise<CdpSession> {
+    return this.connect(t, t.id);
+  }
+
+  private async connect(t: CdpTarget, key: string): Promise<CdpSession> {
     const ws = new WebSocket(t.webSocketDebuggerUrl);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -297,8 +372,8 @@ export class CdpManager {
     });
     await s.send("Runtime.enable");
     await s.send("Page.enable");
-    this.sessions.set(this.keyFor(pattern), s);
-    this.lastTargetId.set(this.keyFor(pattern), t.id);
+    this.sessions.set(key, s);
+    this.lastTargetId.set(key, t.id);
     return s;
   }
 }

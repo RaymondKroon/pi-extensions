@@ -1,8 +1,8 @@
 // browser-interact — general interaction tools for a single website / tab.
 //
 // Drives ONE Chrome tab (already running with --remote-debugging-port=9222)
-// over raw CDP: status, evaluate, wait, screenshot, click (trusted input),
-// type, press, scroll, console, dismiss, navigate.
+// over raw CDP: status, list, evaluate, wait, screenshot, click (trusted input),
+// type, press, scroll, console, dismiss, navigate, open, close.
 //
 // Same discipline as a dedicated app bridge (one persistent attach per tab,
 // dismiss before interacting, wait after navigation, console as evidence)
@@ -20,7 +20,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { CdpManager, evaluate, screenshot } from "./cdp";
+import { CdpManager, evaluate, screenshot, type CdpTarget } from "./cdp";
 
 const DEFAULT_PORT = 9222;
 
@@ -221,7 +221,7 @@ export default function (pi: ExtensionAPI) {
     name: "tab_status",
     label: "Tab Status",
     description:
-      "Show which page the target tab is on (attached? url, title). Run this first to orient before interacting.",
+      "Show which page the target tab is on (attached? target id, url, title). Run this first to orient before interacting. The targetId is the exact handle for tab_close.",
     promptSnippet: "Show the target tab's current URL/title (CDP)",
     parameters: Type.Object({ tab: TAB }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -229,7 +229,7 @@ export default function (pi: ExtensionAPI) {
         const { href, title } = await evaluate(s, "({ href: location.href, title: document.title })", {
           timeoutMs: 10_000,
         });
-        return { attached: true, url: href, title };
+        return { attached: true, targetId: s.targetId, url: href, title };
       });
       return { content: [{ type: "text", text: text(status) }] };
     },
@@ -475,6 +475,96 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "tab_list",
+    label: "Tab List",
+    description:
+      "List the tabs this extension has ATTACHED to in the current session (pattern, target id, url, title). Only shows tabs a tab_* tool has touched — not all browser tabs. Use tab_open to open new ones.",
+    promptSnippet: "List attached browser-interact tabs",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      resolveConfig(ctx.cwd);
+      const attached = mgr.attached();
+      if (!attached.length) {
+        return { content: [{ type: "text", text: "(no attached tabs — the next tab_* tool attaches)" }] };
+      }
+      const rows = [];
+      for (const a of attached) {
+        const st = await mgr.status(a.key === "*" ? undefined : a.key);
+        rows.push({ key: a.key === "*" ? "(default)" : a.key, ...st });
+      }
+      return { content: [{ type: "text", text: text(rows) }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "tab_open",
+    label: "Tab Open",
+    description:
+      "Open a NEW tab in the debugged Chrome (does not touch existing tabs). Returns the new tab's target id and url — pass the id to tab_close to close it precisely, or target the tab by URL substring like any other tab_* tool.",
+    promptSnippet: "Open a new tab in the debugged Chrome",
+    parameters: Type.Object({
+      url: Type.Optional(Type.String({ description: "URL to open (default about:blank)" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      resolveConfig(ctx.cwd);
+      const t = await mgr.openTarget(params.url);
+      // Attach so the new tab shows up in tab_list immediately.
+      await mgr.attachTarget(t);
+      return { content: [{ type: "text", text: `opened tab ${t.id} at ${t.url}` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "tab_close",
+    label: "Tab Close",
+    description:
+      "Close a tab in the debugged Chrome. Prefer the exact target id (from tab_open or tab_status) — it always closes the right tab. Without an id, the `tab` URL substring must match EXACTLY ONE page tab (fails on zero or multiple matches, listing candidates). Refuses to close the last remaining page tab unless force: true.",
+    promptSnippet: "Close a tab in the debugged Chrome (by target id or unique URL substring)",
+    parameters: Type.Object({
+      id: Type.Optional(
+        Type.String({ description: "Exact CDP target id to close (from tab_open / tab_status); takes precedence over tab" }),
+      ),
+      tab: TAB,
+      force: Type.Optional(Type.Boolean({ description: "Allow closing the last remaining page tab" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      resolveConfig(ctx.cwd);
+      const pages = await mgr.pageTargets();
+      if (!pages.length) throw new Error("no page tabs found in Chrome on port " + mgr.port);
+      let target: CdpTarget | undefined;
+      if (params.id) {
+        target = pages.find((t) => t.id === params.id);
+        if (!target) {
+          throw new Error(
+            `no live page tab with id "${params.id}" — open tabs: ${pages.map((t) => `${t.id} (${t.url})`).join(", ")}`,
+          );
+        }
+      } else {
+        const pattern = params.tab ?? mgr.defaultTab;
+        if (!pattern) {
+          throw new Error("tab_close needs a target id or a tab URL substring — refusing to guess which tab to close");
+        }
+        const matches = pages.filter((t) => t.url.includes(pattern));
+        if (matches.length === 0) {
+          throw new Error(`no tab matching "${pattern}" — open tabs: ${pages.map((t) => t.url).join(", ")}`);
+        }
+        if (matches.length > 1) {
+          throw new Error(
+            `"${pattern}" is ambiguous — matches: ${matches.map((t) => t.url).join(", ")}. Pass the exact id instead.`,
+          );
+        }
+        target = matches[0];
+      }
+      if (pages.length === 1 && !params.force) {
+        throw new Error("refusing to close the last remaining page tab (pass force: true to override)");
+      }
+      await mgr.closeTarget(target.id);
+      mgr.forgetTarget(target.id);
+      return { content: [{ type: "text", text: `closed tab ${target.id} (${target.url})` }] };
+    },
+  });
+
   pi.on("session_shutdown", () => {
     mgr.closeAll();
   });
@@ -498,7 +588,10 @@ export default function (pi: ExtensionAPI) {
       }
       for (const a of attached) {
         const st = await mgr.status(a.key === "*" ? undefined : a.key);
-        ctx.ui.notify(`browser-interact [${a.key}]: ${st.attached ? `${st.title ?? ""} — ${st.url}` : JSON.stringify(st)}`, "info");
+        ctx.ui.notify(
+          `browser-interact [${a.key}]: ${st.attached ? `${st.title ?? ""} — ${st.url} (id ${st.targetId})` : JSON.stringify(st)}`,
+          "info",
+        );
       }
     },
   });
