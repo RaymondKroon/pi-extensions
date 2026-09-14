@@ -3057,7 +3057,7 @@ export default function (pi: ExtensionAPI) {
 			const question = state.blockedItem ?? 'the pending Ralph decision';
 			return {
 				action: 'transform',
-				text: `Ralph is paused in this session pending this decision:\n${question}\n\nThe user replied:\n${event.text}\n\nWork with the user to make the decision precise. Do not resume implementation yet. If more information or a different choice is needed, explain the exact remaining question and call ralph_request_decision again. Once the answer is sufficient, then call ralph_resolve_decision with a concise resolution. That tool unblocks the session, after which continue the previously blocked work.`
+				text: `Ralph is paused in this session pending this decision:\n${question}\n\nThe user replied:\n${event.text}\n\nWork with the user to make the decision precise. Do not resume implementation yet. If more information or a different choice is needed, explain the exact remaining question and call ralph_request_decision again. Once the answer is sufficient, then call ralph_resolve_decision with a concise resolution. A rejection is also a sufficient answer: if the user rejects the proposal, call ralph_resolve_decision with a resolution recording the rejection and the agreed follow-up — do not start implementation before resolving, and do not leave the decision pending. That tool unblocks the session, after which continue the previously blocked work.`
 			};
 		}
 
