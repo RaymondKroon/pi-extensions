@@ -570,12 +570,35 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("tab", {
-    description: "browser-interact: show tab status, or detach with /tab shutdown",
+    description:
+      "browser-interact: show tab status, check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
     handler: async (args, ctx) => {
       resolveConfig(ctx.cwd);
       if (args?.trim() === "shutdown") {
         mgr.closeAll();
         ctx.ui.notify("browser-interact: all CDP sessions closed", "info");
+        return;
+      }
+      const check = args?.trim().match(/^check\s+(.+)$/);
+      if (check) {
+        const url = check[1].trim();
+        let t;
+        try {
+          t = await mgr.openTarget(url);
+          // The CDT bridge may only block at attach time (websocket), so
+          // exercise that too — that's what the tab_* tools do.
+          await mgr.attachTarget(t);
+          await mgr.closeTarget(t.id);
+          mgr.forgetTarget(t.id);
+          ctx.ui.notify(`allowlist check: OK — ${url} opened and attached without a block`, "info");
+        } catch (e: any) {
+          if (t) await mgr.closeTarget(t.id).catch(() => {});
+          const raw = String(e?.message ?? e);
+          const msg = /not on the allowlist/i.test(raw)
+            ? `allowlist check: BLOCKED — ${url}\n  Not on the CDT allowlist. Approve it in the CDT Bridge popup, then retry.`
+            : `allowlist check: FAILED — ${url}\n  ${raw}`;
+          ctx.ui.notify(msg, "error");
+        }
         return;
       }
       const attached = mgr.attached();
