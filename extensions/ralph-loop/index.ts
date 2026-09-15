@@ -1861,7 +1861,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-			`Create, read, and update the Ralph backlog (ralph-format TODO file). Targets the active loop's backlog, else the session's ralph file (<session-id>.db in the global agent directory); a missing file is created with action "init" (empty) or "import" (from a Markdown TODO), and lists in the session backlog are created when missing. Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (task/goal loop only), add (list created when missing), add-many, new-list, update (title/body of an existing task), log, move, import, init. add/update/complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
+`Create, read, and update the Ralph backlog (ralph-format TODO file). Targets the active loop's backlog, else the session's ralph file (<session-id>.db in the global agent directory); a missing file is created with action "init" (empty) or "import" (from a Markdown TODO), and lists in the session backlog are created when missing. Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (task/goal loop only), add (list created when missing), add-many, new-list, update (title/body of an existing task; category moves it to another list), log, move, delete, import, init. add/update/complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('next'),
@@ -1875,6 +1875,7 @@ export default function (pi: ExtensionAPI) {
 				Type.Literal('update'),
 				Type.Literal('log'),
 				Type.Literal('move'),
+				Type.Literal('delete'),
 				Type.Literal('import'),
 				Type.Literal('init')
 			]),
@@ -1895,7 +1896,13 @@ export default function (pi: ExtensionAPI) {
 				)
 			),
 			name: Type.Optional(Type.String()),
-			category: Type.Optional(Type.String({ description: 'List (created when missing).' })),
+			category: Type.Optional(
+				Type.String({
+					description:
+						'List (created when missing; with update: the list to move the task to; with delete: the list the task number is resolved in).'
+				}
+			)
+			),
 			query: Type.Optional(Type.String()),
 			verbose: Type.Optional(Type.Boolean()),
 			date: Type.Optional(Type.String()),
@@ -2151,21 +2158,57 @@ export default function (pi: ExtensionAPI) {
 						output = `Created list "${params.name.trim()}". It is empty; add tasks to it with action "add" and category "${params.name.trim()}".`;
 						break;
 					}
-					case 'update': {
-						if (!params.task) throw new Error('update requires the task number.');
-						if (params.title === undefined && params.body === undefined) {
-							throw new Error('update requires a title and/or body.');
-						}
-						const changes: { title?: string; body?: string | null } = {};
-						if (params.title !== undefined) changes.title = params.title;
-						if (params.body !== undefined) changes.body = params.body;
-						const task = backlog.updateTask(params.task, changes, scope);
-						mutated = true;
-						const number = backlog.taskNumbers(scope).get(task.id) ?? backlog.taskNumbers().get(task.id) ?? task.id;
-						output = `Updated task ${number} "${task.title}".${armedNote}`;
-						break;
+				case 'update': {
+					if (!params.task) throw new Error('update requires the task number.');
+					if (params.title === undefined && params.body === undefined && params.category === undefined) {
+						throw new Error('update requires a title, body, and/or category.');
 					}
-					case 'log': {
+					const changes: { title?: string; body?: string | null; category?: string | null } = {};
+					if (params.title !== undefined) changes.title = params.title;
+					if (params.body !== undefined) changes.body = params.body;
+					let movedTo: string | undefined;
+					if (params.category !== undefined) {
+						// Move the task to another list: same list rule as "add"
+						// (the session backlog auto-creates missing lists, other
+						// backlogs need an existing one).
+						const target = params.category.trim();
+						if (!target) throw new Error('update requires a non-empty category to move the task to.');
+						if (!backlog.categories().includes(target)) {
+							if (isSession) backlog.createList(target);
+							else {
+								throw new Error(
+									`no list named "${target}" (lists: ${backlog.categories().join(', ') || 'none'}); create it first with action "new-list"`
+								);
+							}
+						}
+						changes.category = target;
+						movedTo = target;
+					}
+					const task = backlog.updateTask(params.task, changes, scope);
+					mutated = true;
+					const number = backlog.taskNumbers(scope).get(task.id) ?? backlog.taskNumbers().get(task.id) ?? task.id;
+					output = `Updated task ${number} "${task.title}"${movedTo ? ` (moved to category "${movedTo}")` : ''}.${armedNote}`;
+					break;
+				}
+				case 'delete': {
+					if (!params.task) throw new Error('delete requires the task number.');
+					// The number is resolved in the loop's scope, or in the list
+					// given via category (same override as list/search).
+					const deleteScope = params.category ?? scope;
+					if (params.category !== undefined && !backlog.categories().includes(params.category)) {
+						throw new Error(`no list named "${params.category}" (lists: ${backlog.categories().join(', ') || 'none'})`);
+					}
+					const task = backlog.findTaskByNumber(params.task, deleteScope);
+					if (!task) {
+						const known = [...backlog.taskNumbers(deleteScope).values()].join(', ');
+						throw new Error(`no task ${params.task} (tasks: ${known || 'none'})`);
+					}
+					backlog.deleteTask(params.task, deleteScope);
+					mutated = true;
+					output = `Deleted task ${params.task} "${task.title}"${task.category ? ` in category "${task.category}"` : ''} (its completion log entries were removed with it).`;
+					break;
+				}
+				case 'log': {
 						if (!params.task) throw new Error('log requires the task number.');
 						if (!params.note) throw new Error('log requires a note.');
 						const entry = backlog.addLogEntry({ task: params.task, date: params.date, note: params.note, kind: params.kind }, scope);

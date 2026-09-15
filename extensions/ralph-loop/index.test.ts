@@ -1509,6 +1509,37 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await expect(run({ action: 'move', task: '6', direction: 'down' })).rejects.toThrow(/already last/);
 		await expect(run({ action: 'move', task: '3' })).rejects.toThrow(/direction/);
 
+		// update with category moves the task to another list.
+		const recat = await run({ action: 'update', task: '5', category: 'Docs' });
+		expect(recat.content[0]!.text).toContain('Updated task 5 "Nope." (moved to category "Docs")');
+		const afterRecat = readBacklog();
+		expect(afterRecat.listTasks().find((t) => t.title === 'Nope.')?.category).toBe('Docs');
+		// Moving to a missing list auto-creates it (session backlog).
+		const recatMissing = await run({ action: 'update', task: '6', category: 'Archive' });
+		expect(recatMissing.content[0]!.text).toContain('(moved to category "Archive")');
+		expect(readBacklog().listTasks().find((t) => t.title === 'No list.')?.category).toBe('Archive');
+		// A title-only update still works; no changes at all is refused.
+		await run({ action: 'update', task: '2', title: 'Remove starter/demo surfaces (again).' });
+		await expect(run({ action: 'update', task: '2' })).rejects.toThrow(/title, body, and\/or category/);
+
+		// delete removes the task and its completion log entries.
+		await run({ action: 'log', task: '5', note: 'Before the delete.' });
+		const deleted = await run({ action: 'delete', task: '5' });
+		expect(deleted.content[0]!.text).toContain('Deleted task 5 "Nope."');
+		const afterDelete = readBacklog();
+		expect(afterDelete.listTasks().map((t) => t.title)).not.toContain('Nope.');
+		expect(afterDelete.listLogEntries().some((entry) => entry.note === 'Before the delete.')).toBe(false);
+		await expect(run({ action: 'delete', task: '99' })).rejects.toThrow(/no task 99/);
+		await expect(run({ action: 'delete' })).rejects.toThrow(/requires the task number/);
+		// category resolves the number in that list (like list/search): the
+		// Archive task 1 is "No list.", not the global task 1.
+		const scopedDelete = await run({ action: 'delete', task: '1', category: 'Archive' });
+		expect(scopedDelete.content[0]!.text).toContain('Deleted task 1 "No list." in category "Archive"');
+		const afterScopedDelete = readBacklog();
+		expect(afterScopedDelete.listTasks().map((t) => t.title)).not.toContain('No list.');
+		expect(afterScopedDelete.listTasks().map((t) => t.title)).toContain('Establish a clean local developer contract.');
+		await expect(run({ action: 'delete', task: '1', category: 'No such list' })).rejects.toThrow(/no list named/);
+
 		// checkpoint requires an active loop.
 		await expect(run({ action: 'checkpoint', task: '2', note: 'x' })).rejects.toThrow(/active Ralph loop/);
 	});
@@ -4207,7 +4238,7 @@ describe('ralph-loop extension (auto mode)', () => {
 			/update requires the task number/
 		);
 		await expect(tool.execute('t', { action: 'update', task: '1' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			/update requires a title and\/or body/
+			/update requires a title, body, and\/or category/
 		);
 	});
 

@@ -76,10 +76,12 @@ adding a task.
 
 ### update
 Changes an existing task's `title` and/or `body` (`task` number required;
-`body` replaces the whole body, an empty string clears it). Use it when a
-recorded task is stale or wrong instead of adding a duplicate — including
-planned tasks in a task/goal loop. On the session backlog it starts the auto
-loop first when auto mode is "on" and no loop is active yet.
+`body` replaces the whole body, an empty string clears it). With `category`
+it moves the task to that list (the session backlog auto-creates a missing
+list, other backlogs need an existing one). Use it when a recorded task is
+stale or wrong instead of adding a duplicate — including planned tasks in a
+task/goal loop. On the session backlog it starts the auto loop first when
+auto mode is "on" and no loop is active yet.
 
 ### log
 Records a completion entry for a task (requires `task`). `date` is
@@ -88,7 +90,15 @@ the entry with a cross instead of a check when re-opening a completed task.
 
 ### move
 Reorders a task within the list: `direction` "up" or "down", optional `by`
-(number of positions, default 1).
+(number of positions, default 1). To move a task to another list, use
+`update` with `category`.
+
+### delete
+Deletes a task (`task` number required). Works on open and completed tasks.
+The number is resolved in the loop's scope; `category` optionally resolves it
+in a different list (same override as `list`/`search`). Completion log
+entries that referred to the task are deleted with it: an entry always
+belongs to a task.
 
 ### import
 Converts a Markdown TODO file (`file`, relative to the project) into the
