@@ -101,9 +101,15 @@ Ralph decision workflow.
   tasks in the backlog = planning iteration; tasks exist but none open =
   re-evaluation iteration.
 - **Rotation triggers (goal mode):** a task completed (existing
-  completed-task rotation) or the plan grew (new open task ids in the
+  completed-task rotation), the plan grew (new open task ids in the
   baseline diff, no completions → `plan-updated` rotation with a
-  commit-only recording turn).
+  commit-only recording turn), or — under `rotateOn: "task"` — the iteration
+  ended cleanly (last assistant message `stopReason: "stop"`) with the goal
+  still open and open work tasks remaining → `iteration-ended` rotation with
+  a finish-up recording turn. The last trigger covers deliberately
+  never-completing tasks ("run until stopped"): without it the loop idles
+  forever, because completion, plan growth, and the context budget never
+  fire for a permanent task. An errored or truncated run does not rotate.
 - **Stall:** a goal-mode turn that ends with no plan growth, no completion,
   and the goal still open stops the loop with a clear notification.
 - The loop stops when the goal is `done` in the file.
@@ -285,7 +291,9 @@ task/goal/auto code paths to one loop with two orthogonal axes.
 - **One rotation policy: `rotateOn`.** Config value `"task"` | `"budget"`
   (defaults: `"task"` for task/goal loops, `"budget"` for auto), captured
   into `RalphState` at loop start. `"task"`: rotate after every completed
-  task (goal: also on plan growth). `"budget"`: work task after task; rotate
+  task (goal: also on plan growth, and — goal only — when the iteration
+  ends cleanly with open work tasks remaining, so a never-completing task
+  cannot dead-end the loop). `"budget"`: work task after task; rotate
   only at the context budget — plus, for the goal loop, on a **phase change**
   (planning → execution → re-evaluation) so a finished plan with headroom
   reaches the re-evaluation prompt instead of stalling. Stop conditions are
@@ -294,7 +302,8 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   continue nudge instead of rotating.
 - **Recording turns.** Two, not four: `completed-task`/`plan-updated` (task
   policy) send the completion/plan recording prompt; `context-limit`/
-  `phase-changed` send one merged finish-up prompt (wrap up, completion log
+  `phase-changed`/`iteration-ended` send one merged finish-up prompt (wrap
+  up, completion log
   entries, local commit of finished work only, record remaining work as
   todos; the auto loop adds the findings layer). The old
   mid-task `contextCheckpointPrompt` is kept only for task-less goal

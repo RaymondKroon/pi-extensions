@@ -104,7 +104,7 @@ const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, ROTATE_TOOL_NAME];
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
-type RotationReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested';
+type RotationReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested' | 'iteration-ended';
 
 interface RalphConfig {
 	/**
@@ -210,8 +210,10 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.rotationReason === undefined ||
 			state.rotationReason === 'completed-task' ||
 			state.rotationReason === 'plan-updated' ||
+			state.rotationReason === 'phase-changed' ||
 			state.rotationReason === 'context-limit' ||
-			state.rotationReason === 'model-requested') &&
+			state.rotationReason === 'model-requested' ||
+			state.rotationReason === 'iteration-ended') &&
 		(state.rotationNote === undefined || typeof state.rotationNote === 'string') &&
 		(state.reloadRequested === undefined || typeof state.reloadRequested === 'boolean') &&
 		(state.rotationCheckpointing === undefined || typeof state.rotationCheckpointing === 'boolean') &&
@@ -789,9 +791,11 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 				? 'A previous TODO item was completed. Start the next independent iteration with a clean review of the repository.'
 				: reason === 'plan-updated'
 					? 'The plan was just updated with new tasks. Start the next independent iteration with a clean review of the repository and the updated plan.'
-				: reason === 'phase-changed'
-						? 'The goal phase changed. Start the next independent iteration with a clean review of the repository and the backlog.'
-					: reason === 'model-requested'
+			: reason === 'phase-changed'
+					? 'The goal phase changed. Start the next independent iteration with a clean review of the repository and the backlog.'
+					: reason === 'iteration-ended'
+						? 'The previous iteration ended. Start the next independent iteration with a clean review of the repository and the backlog.'
+						: reason === 'model-requested'
 							? `The previous iteration requested a fresh iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat what the recorded checkpoint lists as already tried.`
 						: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
 	// Closing step per rotation policy: under "task" the commit ends the
@@ -942,11 +946,15 @@ function recordingPromptFor(state: RalphState): string {
 		? completionRecordingPrompt(state)
 		: state.rotationReason === 'plan-updated'
 			? planRecordingPrompt()
-			: state.rotationReason === 'model-requested'
-				? finishUpPrompt(state, 'model-requested')
-			: state.rotationReason === 'phase-changed'
-				? finishUpPrompt(state, 'phase-changed')
-			: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
+		: state.rotationReason === 'model-requested'
+			? finishUpPrompt(state, 'model-requested')
+		: state.rotationReason === 'phase-changed'
+			? finishUpPrompt(state, 'phase-changed')
+		: state.rotationReason === 'iteration-ended'
+			? state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
+				? contextCheckpointPrompt(state)
+				: finishUpPrompt(state, 'iteration-ended')
+		: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
 				? contextCheckpointPrompt(state)
 			: isRalphBacklog(state.baselineTodo)
 				? finishUpPrompt(state, 'context-limit')
@@ -980,7 +988,10 @@ function contextCheckpointPromptBody(state: RalphState): string {
  * findings layer ("Findings: " reference notes). The settled turn starts the
  * fresh iteration.
  */
-function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-changed' | 'model-requested'): string {
+function finishUpPrompt(
+	state: RalphState,
+	reason: 'context-limit' | 'phase-changed' | 'model-requested' | 'iteration-ended'
+): string {
 	const isAuto = state.mode === 'auto';
 	// The auto loop records its todos in the session category; the other loops
 	// in their scoped category (or the work's own category when unscoped).
@@ -992,9 +1003,11 @@ function finishUpPrompt(state: RalphState, reason: 'context-limit' | 'phase-chan
 	const opening =
 		reason === 'phase-changed'
 			? 'The goal phase changed. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
-			: reason === 'model-requested'
-				? `You requested a fresh Ralph iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
-			: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
+		: reason === 'model-requested'
+			? `You requested a fresh Ralph iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
+		: reason === 'iteration-ended'
+			? 'The current Ralph iteration has ended. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
+		: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
 	return `${automatedPrefix()}${renderPrompt('finish-up', {
 		opening,
 		categoryClause,
@@ -3268,6 +3281,29 @@ export default function (pi: ExtensionAPI) {
 			const contextFraction = contextUsageFraction(ctx);
 			if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
 				queueRotation(ctx, 'context-limit');
+				return;
+			}
+
+			// Goal mode under "task": the model ended the iteration cleanly
+			// (committed and stopped per the iteration prompt) without completing a
+			// task or growing the plan — e.g. a deliberately never-completing task
+			// ("re-test loop, run until stopped"). The other triggers (completion,
+			// plan growth, context budget) never fire for a permanent task, so
+			// without this rotation the loop would idle forever. Queue a rotation
+			// so the goal keeps iterating. Only a clean 'stop' qualifies: an
+			// errored or truncated run is left for the user to inspect.
+			if (
+				state.mode === 'goal' &&
+				state.rotateOn === 'task' &&
+				lastAssistantStopReason === 'stop' &&
+				goalStatus(currentTodo) === 'open' &&
+				openWorkTaskCount(currentTodo, countCategory(state)) > 0
+			) {
+				if (state.iteration >= state.maxIterations) {
+					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
+					return;
+				}
+				queueRotation(ctx, 'iteration-ended');
 				return;
 			}
 

@@ -4949,6 +4949,66 @@ M list "Plan"
 		expect(fake.userMessages.at(-1)!.text).toContain('This is a re-evaluation iteration');
 	});
 
+	const GOAL_PERMANENT_TASK = `# ralph v2
+
+G "Keep finding risks" open
+
+T 1 - "Continuous re-test loop (run until stopped)"
+`;
+
+	test('goal loop under rotateOn "task": a cleanly ended iteration with open tasks rotates instead of idling', async () => {
+		await writeConfig({ rotateOn: 'task' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), GOAL_PERMANENT_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+		const iterationCount = fake.userMessages.length;
+		expect(iterationCount).toBe(1);
+
+		// The iteration runs: the model commits and stops without completing
+		// the permanent task (it never completes) and without growing the plan.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The ended iteration is a rotation boundary: the finish-up recording
+		// turn is queued instead of the loop idling forever.
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.at(-1)!.text).toContain('The current Ralph iteration has ended');
+		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+
+		// The recording turn settles; the fresh iteration starts.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+		expect(fake.userMessages.at(-1)!.text).toContain('The previous iteration ended');
+	});
+
+	test('goal loop under rotateOn "task": an errored iteration does not rotate', async () => {
+		await writeConfig({ rotateOn: 'task' });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), GOAL_PERMANENT_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+		const iterationCount = fake.userMessages.length;
+
+		// The run ended in an error: the loop stays put for the user to inspect
+		// instead of burning iterations on a broken provider.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'error' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		expect(fake.userMessages).toHaveLength(iterationCount);
+	});
+
 	test('D1: update rewrites a planned task in the task loop (title and body)', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
