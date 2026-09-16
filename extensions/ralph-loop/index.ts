@@ -1555,10 +1555,19 @@ export default function (pi: ExtensionAPI) {
 						: state?.rotationQueued || freshIterationPending
 							? 'starting'
 							: 'on';
-		// The label reflects the active loop's mode (a stopped goal loop keeps
-		// its marker); the auto mode setting shows in the state word instead.
-		const label =
-			state?.mode === 'goal' ? 'Ralph (goal)' : state?.enabled && state.mode === 'auto' ? 'Ralph (auto)' : 'Ralph';
+		// The label reflects the active loop's mode; a stopped goal loop keeps
+		// its marker only while auto mode is off — with auto mode "on" the
+		// setting shows in the state word instead (the stale marker would hide
+		// it).
+		const label = state?.enabled
+			? state.mode === 'goal'
+				? 'Ralph (goal)'
+				: state.mode === 'auto'
+					? 'Ralph (auto)'
+					: 'Ralph'
+			: config.autoMode !== 'on' && state?.mode === 'goal'
+				? 'Ralph (goal)'
+				: 'Ralph';
 		// Idle state word: the auto mode setting itself: "auto" is armed (the
 		// loop arms itself at the context budget), not off — and distinct from
 		// "on", which means a loop is actually running.
@@ -3772,7 +3781,7 @@ export default function (pi: ExtensionAPI) {
 					state?.mode === 'goal' ? 'Ralph goal loop' : state?.mode === 'auto' ? 'Ralph auto loop' : 'Ralph loop';
 				ctx.ui.notify(
 					!state?.enabled
-						? `${loopName} is stopped`
+						? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`
 						: state.blocked
 							? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
 							: state.paused

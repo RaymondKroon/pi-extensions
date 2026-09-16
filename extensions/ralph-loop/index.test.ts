@@ -3922,6 +3922,37 @@ describe('ralph-loop extension (auto mode)', () => {
 		expect(statusLine(fakeCtx.widgets)).toContain('context: 10% / 50%');
 	});
 
+	test('a stopped goal loop shows the auto setting instead of the stale goal marker', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			autoFile(),
+			`# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+`
+		);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+
+		// Stopping the goal loop with auto mode on: the bar shows the setting
+		// (armed at the context budget), not the stale goal marker.
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph: auto');
+		expect(status).not.toContain('Ralph (goal)');
+		expect(status).toContain('context: 10% / 50%');
+
+		// /ralph status says so too.
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is stopped · auto mode: on');
+	});
+
 	test('auto mode pre-activates the auto tool set (ralph_todo + ralph_rotate) at session start so arming is cache-neutral', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
