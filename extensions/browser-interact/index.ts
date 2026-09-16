@@ -572,6 +572,15 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("tab", {
     description:
       "browser-interact: show tab status, check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
+    getArgumentCompletions: (prefix) => {
+      if (/\s/.test(prefix)) return null; // only complete the subcommand itself
+      const subs = [
+        { value: "check ", label: "check <url>", description: "check a URL against the CDT allowlist" },
+        { value: "shutdown", label: "shutdown", description: "close all CDP sessions" },
+      ];
+      const filtered = subs.filter((s) => s.value.startsWith(prefix));
+      return filtered.length > 0 ? filtered : null;
+    },
     handler: async (args, ctx) => {
       resolveConfig(ctx.cwd);
       if (args?.trim() === "shutdown") {
@@ -588,11 +597,8 @@ export default function (pi: ExtensionAPI) {
           // The CDT bridge may only block at attach time (websocket), so
           // exercise that too — that's what the tab_* tools do.
           await mgr.attachTarget(t);
-          await mgr.closeTarget(t.id);
-          mgr.forgetTarget(t.id);
-          ctx.ui.notify(`allowlist check: OK — ${url} opened and attached without a block`, "info");
+          ctx.ui.notify(`allowlist check: OK — ${url} opened and attached without a block (tab left open)`, "info");
         } catch (e: any) {
-          if (t) await mgr.closeTarget(t.id).catch(() => {});
           const raw = String(e?.message ?? e);
           const msg = /not on the allowlist/i.test(raw)
             ? `allowlist check: BLOCKED — ${url}\n  Not on the CDT allowlist. Approve it in the CDT Bridge popup, then retry.`

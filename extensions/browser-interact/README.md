@@ -79,6 +79,7 @@ the id so the model has it in context when needed.
 ## Commands
 
 - `/tab` — show attached tabs and their current page
+- `/tab check <url>` — open + attach a URL to verify the CDT allowlist (the tab is left open)
 - `/tab shutdown` — detach all CDP sessions
 
 ## Workflow
