@@ -3980,6 +3980,42 @@ GB
 		expect(fake.activeTools).toEqual(before);
 	});
 
+	test('switching auto mode on mid-session pre-activates the auto tool set so later arming is cache-neutral', async () => {
+		// The SettingsList theme needs pi's interactive theme initialized.
+		initTheme();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		// Auto mode is off by default: the auto tools stay out of context.
+		expect(fake.activeTools).not.toContain('ralph_todo');
+		expect(fake.activeTools).not.toContain('ralph_rotate');
+
+		// Flip auto mode on in the config UI (select the item, Enter cycles off→on).
+		const created: unknown[] = [];
+		fakeCtx.customControl.factoryHook = (component) => created.push(component);
+		await fake.commands.get('ralph')!.handler('config', fakeCtx.ctx);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		fakeCtx.customControl.factoryHook = undefined;
+		// The config view's factory returns a wrapper that delegates input to
+		// its SettingsList: navigate down to "Auto mode" (4th of 6 items) and
+		// press Enter to cycle off→on.
+		const view = created[0] as { handleInput: (data: string) => void };
+		expect(view).toBeDefined();
+		for (let i = 0; i < 4; i++) view.handleInput('\x1b[B');
+		view.handleInput('\r');
+
+		// The tool set changes at the switch — not at the later arming at the
+		// context budget (which would invalidate the prefix cache at the
+		// session's largest context; a command-handler activation is not
+		// eligible for pi's deferred tool loading, which only applies to
+		// additive changes recorded on a tool result).
+		expect(fake.activeTools).toContain('ralph_todo');
+		expect(fake.activeTools).toContain('ralph_rotate');
+		expect(fake.activeTools).not.toContain('ralph_goal');
+	});
+
 	test('auto mode is off by default: a plain start is the task loop', async () => {
 		// The task loop runs on the session file: seed it with tasks.
 		await writeFile(autoFile(), RALPH_V1);

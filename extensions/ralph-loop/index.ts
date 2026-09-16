@@ -1517,11 +1517,17 @@ export default function (pi: ExtensionAPI) {
 	// (loop stop does not remove them, which would break the cached prefix).
 	// An active auto loop activates the auto tool set (backlog + rotation);
 	// the task/goal loops activate the full ralph tool set.
-	// With auto mode "on", the auto tool set is pre-activated at session start: the
+	// With auto mode "on", the auto tool set is pre-activated at session start —
+	// and the moment auto mode is switched on mid-session (/ralph config): the
 	// tool definitions are part of every request (vLLM inlines them into the
 	// rendered prompt), so adding the tool when the loop arms at the context
 	// budget would invalidate the prefix cache at the largest context of the
-	// session. The tool is safe to have active without an armed loop —
+	// session. Note the switch-time activation is a command-handler change, not
+	// a tool-execution change: pi's deferred tool loading (Anthropic
+	// defer_loading/tool_reference, OpenAI tool_search_call) only applies to
+	// additive changes recorded on a tool result, so the switch pays one cold
+	// prefix re-send on every provider — at a small context, not the budget's.
+	// The tool is safe to have active without an armed loop —
 	// add/update/complete on the session backlog arm the auto loop when auto
 	// mode is on (otherwise they require an active one), next/list read the
 	// backlogs unscoped.
@@ -3500,7 +3506,16 @@ export default function (pi: ExtensionAPI) {
 							: id === 'rotateOn'
 								? { ...config, rotateOn: value as RotateOn }
 								: { ...config, autoApproveDecisions: value === 'enabled' };
+					const previousAutoMode = config.autoMode;
 					persistConfig(ctx, next);
+					if (id === 'autoMode' && next.autoMode === 'on' && previousAutoMode !== 'on') {
+						// Pre-activate the auto tool set the moment auto mode is turned
+						// on, so a mid-session switch never makes the arming at the
+						// context budget the moment the tool set changes (one cold
+						// prefix re-send, paid now on a small context instead of at
+						// the session's largest context).
+						syncToolActivation();
+					}
 					if (state?.enabled) {
 						persistState({
 							...state,
