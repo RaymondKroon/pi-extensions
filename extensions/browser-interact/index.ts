@@ -607,10 +607,28 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
+      const arg = args?.trim();
+      if (arg) {
+        ctx.ui.notify(
+          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab check <url>, or /tab shutdown`,
+          "error",
+        );
+        return;
+      }
       const attached = mgr.attached();
       if (!attached.length) {
+        if (!(await mgr.reachable())) {
+          ctx.ui.notify(
+            `browser-interact: Chrome is not reachable on 127.0.0.1:${mgr.port} — start it with --remote-debugging-port=${mgr.port}, then retry`,
+            "error",
+          );
+          return;
+        }
+        const pages = await mgr.pageTargets().catch(() => []);
         ctx.ui.notify(
-          `browser-interact: not attached (port ${mgr.port}, default tab ${mgr.defaultTab ?? "first page tab"}) — the next tab_* tool attaches`,
+          pages.length
+            ? `browser-interact: connected (port ${mgr.port}, ${pages.length} page tab${pages.length === 1 ? "" : "s"}), none attached yet — the next tab_* tool attaches${mgr.defaultTab ? ` to "${mgr.defaultTab}"` : " to the base page tab (shortest URL)"}`
+            : `browser-interact: connected (port ${mgr.port}) but no page tabs are open — open one in the browser first`,
           "info",
         );
         return;

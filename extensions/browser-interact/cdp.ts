@@ -179,6 +179,16 @@ export class CdpManager {
     return pattern ?? this.defaultTab ?? "*";
   }
 
+  /** Is Chrome reachable on the debug port? (Cheap: one /json fetch.) */
+  async reachable(): Promise<boolean> {
+    try {
+      await this.listTargets();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** All currently attached sessions (for status reporting). */
   attached(): Array<{ key: string; url: string }> {
     return [...this.sessions.entries()]
