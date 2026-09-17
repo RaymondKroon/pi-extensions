@@ -1639,12 +1639,16 @@ export default function (pi: ExtensionAPI) {
 			.filter((part): part is string => part !== undefined)
 			.join(', ');
 		const modifierSuffix = modifiers ? ` (${modifiers})` : '';
+		// The rotation policy: the active loop's resolved value, or the armed
+		// auto loop's configured value when idle (the loop that will start).
+		const rotation = state?.enabled ? state.rotateOn : config.autoMode === 'on' ? config.rotateOn.auto : undefined;
+		const rotationSuffix = rotation ? ` · rotation: ${rotation}` : '';
 		// In the idle on/auto states the context percentage is still shown: the
 		// auto loop rotates on the context budget, so the headroom matters.
 		const idleContext = idleState !== 'off' ? ` · context: ${contextUsageLabel(ctx, contextThresholdFor(config, ctx))}` : '';
 		const status = !state?.enabled
-			? `${label}: ${idleState}${modifierSuffix}${idleContext}`
-			: `${label}: ${mode}${modifierSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: ${idleState}${modifierSuffix}${rotationSuffix}${idleContext}`
+			: `${label}: ${mode}${modifierSuffix}${rotationSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status

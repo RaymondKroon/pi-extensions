@@ -357,6 +357,55 @@ describe('ralph-loop extension', () => {
 		expect(status).toContain('compaction');
 	});
 
+	test('the status bar shows the rotation policy', async () => {
+		// Active task loop: the resolved policy (built-in task).
+		{
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect(statusLine(fakeCtx.widgets)).toContain('rotation: task');
+		}
+		// A configured budget policy shows for the active loop.
+		{
+			await writeFile(
+				join(dir, '.pi', 'ralph-loop.json'),
+				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, rotateOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
+			);
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect(statusLine(fakeCtx.widgets)).toContain('rotation: budget');
+		}
+		// Idle with auto mode on: the armed auto loop's policy.
+		{
+			await writeFile(
+				join(dir, '.pi', 'ralph-loop.json'),
+				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on', rotateOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
+			);
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+			const status = statusLine(fakeCtx.widgets);
+			expect(status).toContain('Ralph: auto');
+			expect(status).toContain('rotation: task');
+		}
+		// Idle with auto mode off: no loop, no rotation segment.
+		{
+			await writeFile(
+				join(dir, '.pi', 'ralph-loop.json'),
+				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10 }, null, '\t')}\n`
+			);
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+			expect(statusLine(fakeCtx.widgets)).not.toContain('rotation:');
+		}
+	});
+
 	test('start is refused while a loop is already active', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
