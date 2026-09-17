@@ -1,6 +1,6 @@
 ---
 name: ralph-backlog
-description: Full reference for the ralph_todo, ralph_goal, and ralph_rotate tools and their parameters. Read before using an action you are unsure about.
+description: Full reference for the ralph_todo, ralph_goal, and ralph_cycle tools and their parameters. Read before using an action you are unsure about.
 ---
 
 # Ralph backlog reference
@@ -49,7 +49,7 @@ match. Use it instead of grepping the backlog file.
 ### complete
 Marks the task (number via `task`) done. With `note` it also records the
 completion log entry in the same call. In an active loop under the `task`
-rotation policy, stop working after this — the loop records the completion
+cycle policy, stop working after this — the loop records the completion
 and starts a fresh iteration. Under the `budget` policy (and in the auto
 loop), continue with the next open task.
 
@@ -151,10 +151,10 @@ dashes) or `General` for unnamed sessions (a restarted loop continues the same
 category). The loop works through **every list** in the file — `next`,
 `list`, and `complete` are unscoped (one global task numbering, each task
 shows its list) — while `add` records to the session's own list by default, so
-lists you add by hand are picked up automatically. It rotates on its context
-budget by default (see Rotation policy), tells the model to finish up and
+lists you add by hand are picked up automatically. It cycles on its context
+budget by default (see Cycle policy), tells the model to finish up and
 record todos for the next iteration, and activates the auto tool set
-(`ralph_todo` + `ralph_rotate`, not the full ralph tool set). The loop itself
+(`ralph_todo` + `ralph_cycle`, not the full ralph tool set). The loop itself
 only starts via `/ralph start`.
 
 - `off`: nothing automatic; a plain `/ralph start` runs the regular task loop.
@@ -187,9 +187,9 @@ is active yet — including right after an explicit `/ralph stop`, because the
 recorded todo is a new request that supersedes the stop (the stop only
 suspends the automatic context-budget intercept).
 
-## Rotation policy (`rotateOn`)
+## Cycle policy (`cycleOn`)
 
-`/ralph config` offers the rotation policy per loop mode (task loop, goal
+`/ralph config` offers the cycle policy per loop mode (task loop, goal
 loop, auto loop): when a fresh iteration starts.
 
 - `"task"` — a fresh iteration after every completed task (planned,
@@ -199,7 +199,7 @@ loop, auto loop): when a fresh iteration starts.
   the fresh iteration.
 - `"budget"` — work task after task, a fresh iteration only at the context
   budget (fine-grained rolling handoff todos). The throughput preset: fewer
-  rotations, less per-request overhead growth control, assumptions persist
+  cycles, less per-request overhead growth control, assumptions persist
   until the budget crossing. `maxIterations` counts budget crossings, not
   tasks — the cap weakens; that is the point of the policy.
 
@@ -208,19 +208,19 @@ auto loop. The value is captured into the loop state at start, so editing the
 config mid-loop does not change a running loop. Stop conditions are
 policy-independent: the task loop stops on an empty backlog, the goal loop
 when the goal is done, the auto loop never on an empty backlog. Under
-`"budget"` the goal loop additionally rotates on a **phase change**
+`"budget"` the goal loop additionally cycles on a **phase change**
 (planning → execution → re-evaluation) so a finished plan with context
 headroom still reaches the re-evaluation prompt instead of stalling.
 
-## ralph_rotate (model-requested rotation)
+## ralph_cycle (model-requested cycle)
 
-`ralph_rotate { note, reload? }` forces the rotation boundary now: a
+`ralph_cycle { note, reload? }` forces the cycle boundary now: a
 progress-recording (finish-up) turn runs next, then the context is cut and a
 fresh iteration continues from the backlog. `note` (required) says why — it is
 recorded in the checkpoint and shown to the fresh iteration.
 
 - **Applying a runtime change:** after changing extension code, call it with
-  `reload: true`. The extensions reload at the rotation boundary — after the
+  `reload: true`. The extensions reload at the cycle boundary — after the
   context cut, before the fresh iteration's first request — so the reload
   never re-sends the finished iteration's long context, and the fresh
   iteration runs on the new code.
@@ -229,13 +229,13 @@ recorded in the checkpoint and shown to the fresh iteration.
   recording turn forces an honest checkpoint of what was tried; the fresh
   context starts without the stuck pattern.
 
-Each rotation costs a recording turn and one iteration of `maxIterations`; do
-not rotate to avoid work. A pending rotation or a requested stop refuses the
+Each cycle costs a recording turn and one iteration of `maxIterations`; do
+not cycle to avoid work. A pending cycle or a requested stop refuses the
 call. With no active loop it arms the auto loop first when auto mode is "on"
 (no open tasks required — the note carries the reason the fresh iteration
 moves on); otherwise it fails (start a loop with `/ralph start`). After
 calling it, stop working — the recording turn follows.
 
 `/ralph reload` runs the same reload flow manually (the loop state is restored
-from the session; a pending model-requested rotation continues on the
+from the session; a pending model-requested cycle continues on the
 reloaded code).

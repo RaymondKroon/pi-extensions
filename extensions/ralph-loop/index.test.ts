@@ -9,7 +9,7 @@ import extension from './index.ts';
 
 /**
  * Drives the real extension module with a fake ExtensionAPI and asserts the
- * rotation lifecycle: context-limit checkpoints, completed-task rotations,
+ * cycle lifecycle: context-limit checkpoints, completed-task cycles,
  * iteration/task counters, the max-iterations stop, and the status widget
  * content after every transition.
  */
@@ -297,7 +297,7 @@ function statusLine(widgets: Map<string, unknown>): string {
 	return lines.join(' ').trim();
 }
 
-/** Let the detached rotation IIFE in startFreshIteration finish its file I/O. */
+/** Let the detached cycle IIFE in startFreshIteration finish its file I/O. */
 const flush = () => new Promise((resolve) => setTimeout(resolve, 25));
 
 let dir: string;
@@ -357,32 +357,32 @@ describe('ralph-loop extension', () => {
 		expect(status).toContain('compaction');
 	});
 
-	test('the status bar shows the rotation policy', async () => {
+	test('the status bar shows the cycle policy', async () => {
 		// Active task loop: the resolved policy (built-in task).
 		{
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect(statusLine(fakeCtx.widgets)).toContain('rotation: task');
+			expect(statusLine(fakeCtx.widgets)).toContain('cycle: task');
 		}
 		// A configured budget policy shows for the active loop.
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, rotateOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, cycleOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect(statusLine(fakeCtx.widgets)).toContain('rotation: budget');
+			expect(statusLine(fakeCtx.widgets)).toContain('cycle: budget');
 		}
 		// Idle with auto mode on: the armed auto loop's policy.
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on', rotateOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on', cycleOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -390,9 +390,9 @@ describe('ralph-loop extension', () => {
 			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 			const status = statusLine(fakeCtx.widgets);
 			expect(status).toContain('Ralph: auto');
-			expect(status).toContain('rotation: task');
+			expect(status).toContain('cycle: task');
 		}
-		// Idle with auto mode off: no loop, no rotation segment.
+		// Idle with auto mode off: no loop, no cycle segment.
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
@@ -402,7 +402,7 @@ describe('ralph-loop extension', () => {
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-			expect(statusLine(fakeCtx.widgets)).not.toContain('rotation:');
+			expect(statusLine(fakeCtx.widgets)).not.toContain('cycle:');
 		}
 	});
 
@@ -443,7 +443,7 @@ describe('ralph-loop extension', () => {
 		expect(result!.systemPrompt).toContain('misperception');
 	});
 
-	test('context-limit rotation finishes up, then starts a fresh iteration with incremented counters', async () => {
+	test('context-limit cycle finishes up, then starts a fresh iteration with incremented counters', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -486,7 +486,7 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.at(-1)?.text).toContain('context budget');
 	});
 
-	test('completed-task rotation increments the iteration and resets the per-task counter', async () => {
+	test('completed-task cycle increments the iteration and resets the per-task counter', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -526,7 +526,7 @@ describe('ralph-loop extension', () => {
 		expect(fake.userMessages.at(-1)?.text).toContain('The backlog is accessible with the ralph_todo tool.');
 	});
 
-	test('completed-task rotation names the completed task in the recording prompt (ralph format)', async () => {
+	test('completed-task cycle names the completed task in the recording prompt (ralph format)', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -558,7 +558,7 @@ describe('ralph-loop extension', () => {
 		expect(prompt).toContain('no completion log entry yet');
 	});
 
-	test('completed-task rotation identifies completions by timestamp when the model renumbers the backlog', async () => {
+	test('completed-task cycle identifies completions by timestamp when the model renumbers the backlog', async () => {
 		// Task one is already done at baseline. The model completes task two,
 		// then rewrites the file by hand with renumbered ids, so task two's new
 		// id points at a slot that was done at baseline — the id diff alone can
@@ -640,13 +640,13 @@ D 3 2026-01-01T00:00:00Z
 		expect(last.options).toEqual({ deliverAs: 'steer' });
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
-		// Further streaming updates do not queue a second rotation.
+		// Further streaming updates do not queue a second cycle.
 		const queued = fake.userMessages.length;
 		await fake.fire('message_update', fakeCtx.ctx);
 		expect(fake.userMessages.length).toBe(queued);
 	});
 
-	test('aborted turn: Escape pauses the loop immediately, even mid-rotation; a typed message resumes it', async () => {
+	test('aborted turn: Escape pauses the loop immediately, even mid-cycle; a typed message resumes it', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -668,7 +668,7 @@ D 3 2026-01-01T00:00:00Z
 		expect(fake.userMessages.length).toBe(queuedCount);
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
 
-		// A later settle (e.g. user chat) must not resume or rotate.
+		// A later settle (e.g. user chat) must not resume or cycle.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 		expect(fake.userMessages.length).toBe(queuedCount);
@@ -706,11 +706,11 @@ D 3 2026-01-01T00:00:00Z
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// No rotation or fresh iteration: the loop is paused.
+		// No cycle or fresh iteration: the loop is paused.
 		expect(fake.userMessages.length).toBe(1);
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
 
-		// A typed message resumes without a pending rotation: the transform
+		// A typed message resumes without a pending cycle: the transform
 		// continues the current iteration with the user's extra info.
 		const transform = (await fake.fire('input', fakeCtx.ctx, {
 			text: 'focus on the parser first',
@@ -778,7 +778,7 @@ D 3 2026-01-01T00:00:00Z
 		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
 		expect(fakeCtx.widgets.get('ralph-paused')).toBeUndefined();
 
-		// The resumed turn settles: the loop keeps running (no rotation was
+		// The resumed turn settles: the loop keeps running (no cycle was
 		// due, so nothing extra is queued).
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -802,7 +802,7 @@ D 3 2026-01-01T00:00:00Z
 		expect(transform).toBeUndefined();
 	});
 
-	test('typing while paused with a pending rotation resumes; the recording prompt carries the extra info', async () => {
+	test('typing while paused with a pending cycle resumes; the recording prompt carries the extra info', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -815,7 +815,7 @@ D 3 2026-01-01T00:00:00Z
 		const queuedCount = fake.userMessages.length;
 		expect(fake.userMessages.at(-1)?.text).toContain('completion log');
 
-		// Escape during the recording turn pauses with the rotation still pending.
+		// Escape during the recording turn pauses with the cycle still pending.
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -895,14 +895,14 @@ D 3 2026-01-01T00:00:00Z
 		expect(fake.userMessages.length).toBe(count);
 	});
 
-	test('stopping mode with a pending rotation: stops after recording, no fresh iteration', async () => {
+	test('stopping mode with a pending cycle: stops after recording, no fresh iteration', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 
 		await startLoop(fake, fakeCtx);
 
-		// A rotation is queued (over-budget settle) and the user requests a stop
+		// A cycle is queued (over-budget settle) and the user requests a stop
 		// while the recording turn is about to run.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -916,7 +916,7 @@ D 3 2026-01-01T00:00:00Z
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		// The recording turn settles: the loop must stop, not start a fresh
-		// iteration (which would carry stopRequested over and auto-rotate forever).
+		// iteration (which would carry stopRequested over and auto-cycle forever).
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -924,15 +924,15 @@ D 3 2026-01-01T00:00:00Z
 		expect(fake.userMessages.length).toBe(2); // iteration prompt + checkpoint prompt only
 	});
 
-	test('stop --force: stops a paused loop with a pending rotation immediately', async () => {
+	test('stop --force: stops a paused loop with a pending cycle immediately', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 
 		await startLoop(fake, fakeCtx);
 
-		// A rotation is queued (over-budget settle) and the recording turn is
-		// aborted (Escape): the loop is paused with the rotation still pending.
+		// A cycle is queued (over-budget settle) and the recording turn is
+		// aborted (Escape): the loop is paused with the cycle still pending.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -982,14 +982,14 @@ D 3 2026-01-01T00:00:00Z
 		expect(fake.userMessages.length).toBe(1); // the original iteration prompt only
 	});
 
-	test('stop --force: drops a pending rotation without a fresh iteration', async () => {
+	test('stop --force: drops a pending cycle without a fresh iteration', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 
 		await startLoop(fake, fakeCtx);
 
-		// A rotation is queued (over-budget settle); the recording turn has
+		// A cycle is queued (over-budget settle); the recording turn has
 		// been sent but not settled yet.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -1025,7 +1025,7 @@ D 3 2026-01-01T00:00:00Z
 		expect(statusLine(fakeCtx.widgets)).not.toContain('Ralph: off');
 	});
 
-	test('stops the loop when a context-limit rotation would exceed the maximum iterations', async () => {
+	test('stops the loop when a context-limit cycle would exceed the maximum iterations', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 2 }, null, '\t')}\n`
@@ -1037,14 +1037,14 @@ D 3 2026-01-01T00:00:00Z
 		await startLoop(fake, fakeCtx);
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/2');
 
-		// First context-limit rotation reaches iteration 2 (allowed).
+		// First context-limit cycle reaches iteration 2 (allowed).
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/2');
 
-		// Second context-limit rotation would reach iteration 3: the loop stops.
+		// Second context-limit cycle would reach iteration 3: the loop stops.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -1749,7 +1749,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		await expect(run({ action: 'import', file: 'NOPE.md' })).rejects.toThrow(/Could not read NOPE\.md/);
 		await expect(run({ action: 'import' })).rejects.toThrow(/requires the file path/);
 	});
-	test('completing a task through ralph_todo queues the completed-task rotation', async () => {
+	test('completing a task through ralph_todo queues the completed-task cycle', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -2659,7 +2659,7 @@ T 2 - "Port the state."
 		expect(result.terminate).toBe(true);
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
-		// The blocked turn settles: nothing rotates, nothing stops.
+		// The blocked turn settles: nothing cycles, nothing stops.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
@@ -2705,7 +2705,7 @@ T 2 - "Port the state."
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('made no progress');
 	});
 
-	test('agent_settled rotates a planning iteration that adds tasks into an execution iteration', async () => {
+	test('agent_settled cycles a planning iteration that adds tasks into an execution iteration', async () => {
 		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
 
 		// The planning iteration decomposes the goal into tasks (the plan grew) and settles.
@@ -2746,7 +2746,7 @@ T 2 - "Port the state."
 		expect(fakeCtx.notifications.some((n) => n.message.includes('made no progress'))).toBe(false);
 	});
 
-	test('agent_settled does not rotate when tasks are edited without changing the open set', async () => {
+	test('agent_settled does not cycle when tasks are edited without changing the open set', async () => {
 		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_EXECUTION);
 
 		// The execution iteration rewords a task (same ids, same open set) and settles.
@@ -2756,7 +2756,7 @@ T 2 - "Port the state."
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// No rotation: the open set is unchanged, so no recording turn and no fresh iteration.
+		// No cycle: the open set is unchanged, so no recording turn and no fresh iteration.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 		expect(fake.userMessages.length).toBe(1);
@@ -2767,7 +2767,7 @@ T 2 - "Port the state."
 		const { fake, fakeCtx, run, todo } = await startGoalLoopWith(GOAL_EXECUTION);
 
 		// The execution iteration settles at/above the context threshold: a
-		// context-limit rotation is queued (recording), not a stall.
+		// context-limit cycle is queued (recording), not a stall.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -2783,7 +2783,7 @@ T 2 - "Port the state."
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// The blocked turn settles: the loop waits — it does not rotate or start
+		// The blocked turn settles: the loop waits — it does not cycle or start
 		// a fresh iteration.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
@@ -3213,7 +3213,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 				todoPath: join(agentDir, 'ralph', 'test-session.ralph'),
 				baselineTodo: '',
 				contextThreshold: 0.5,
-				rotationQueued: false,
+				cycleQueued: false,
 				maxIterations: 10
 			}
 		});
@@ -3436,7 +3436,7 @@ D 1
 });
 
 // ---------------------------------------------------------------------------
-// Rotation compaction and completion summaries
+// Cycle compaction and completion summaries
 // ---------------------------------------------------------------------------
 
 const RALPH_V2_TASK_ONE_DONE_LOGGED = `# ralph v2
@@ -3477,7 +3477,7 @@ C 2 1
 T 3 - "Task three"
 `;
 
-describe('ralph-loop extension (rotation compaction and completion summaries)', () => {
+describe('ralph-loop extension (cycle compaction and completion summaries)', () => {
 	beforeEach(async () => {
 		await writeFile(autoFile(), RALPH_V1);
 		// Compaction mode defaults to on; state it explicitly for clarity.
@@ -3518,7 +3518,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
-	test('rotation: compacts the finished iteration and starts the fresh iteration only after compaction', async () => {
+	test('cycle: compacts the finished iteration and starts the fresh iteration only after compaction', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3540,7 +3540,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// The rotation requested exactly one compaction…
+		// The cycle requested exactly one compaction…
 		expect(fakeCtx.compactCalls).toHaveLength(1);
 		// …and the fresh iteration has NOT started yet (nothing was sent).
 		expect(fake.customMessages).toHaveLength(0);
@@ -3573,7 +3573,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fake.userMessages).toHaveLength(3);
 	});
 
-	test('rotation: a compaction gate failure still starts the fresh iteration', async () => {
+	test('cycle: a compaction gate failure still starts the fresh iteration', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3588,7 +3588,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fakeCtx.compactCalls).toHaveLength(1);
 
 		// The iteration is smaller than compaction.keepRecentTokens: pi refuses
-		// to prepare a compaction. The rotation must not stall.
+		// to prepare a compaction. The cycle must not stall.
 		settleCompaction(fakeCtx, 'Nothing to compact (session too small)');
 		await flush();
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
@@ -3600,7 +3600,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(gateNotes()).toHaveLength(1);
 		expect(gateNotes()[0]!.type).toBe('warning');
 
-		// …and not repeated by later gated rotations in the same loop.
+		// …and not repeated by later gated cycles in the same loop.
 		fakeCtx.usagePercent.value = 90;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -3621,7 +3621,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		).toBeUndefined();
 	});
 
-	test('rotation: an aborted compaction does not start a new turn', async () => {
+	test('cycle: an aborted compaction does not start a new turn', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3644,14 +3644,14 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fakeCtx.notifications.some((n) => n.message.includes('aborted'))).toBe(true);
 	});
 
-	test('rotation: no completed tasks yet → the compaction carries a fallback summary', async () => {
+	test('cycle: no completed tasks yet → the compaction carries a fallback summary', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		fakeCtx.compactAutoSettle.value = false;
 		await startLoop(fake, fakeCtx);
 
-		// A context-limit rotation with nothing completed yet.
+		// A context-limit cycle with nothing completed yet.
 		fakeCtx.usagePercent.value = 90;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -3672,7 +3672,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fake.userMessages).toHaveLength(3);
 	});
 
-	test('session_before_compact: user-initiated compaction is untouched (no pending rotation)', async () => {
+	test('session_before_compact: user-initiated compaction is untouched (no pending cycle)', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3702,7 +3702,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 	});
 
 	test('start: no keepRecentTokens warning at loop start', async () => {
-		// The gate is reported where it actually bites (a refused rotation
+		// The gate is reported where it actually bites (a refused cycle
 		// compaction), not speculatively at loop start — even with the
 		// (too high for small iterations) default value.
 		await writeFile(join(dir, '.pi', 'settings.json'), `${JSON.stringify({ compaction: { keepRecentTokens: 20000 } })}\n`);
@@ -3713,7 +3713,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(fakeCtx.notifications.some((n) => n.message.includes('keepRecentTokens'))).toBe(false);
 	});
 
-	test('rotation: compaction mode disabled skips the compaction and sends the fresh iteration directly', async () => {
+	test('cycle: compaction mode disabled skips the compaction and sends the fresh iteration directly', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: false }, null, '\t')}\n`
@@ -3751,7 +3751,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on (compaction)');
 	});
 
-	test('rotation: the completion summary lands before the boundary so the model context drops it', async () => {
+	test('cycle: the completion summary lands before the boundary so the model context drops it', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3775,7 +3775,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(summary?.message.content).not.toContain('Implemented task one; changed a.ts; bun test passed.');
 	});
 
-	test('rotation: completed tasks without a log entry are listed by title only', async () => {
+	test('cycle: completed tasks without a log entry are listed by title only', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3792,20 +3792,20 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(summary?.message.content).not.toContain('no completion log entry');
 	});
 
-	test('rotation: completions from earlier iterations stay in later summaries', async () => {
+	test('cycle: completions from earlier iterations stay in later summaries', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		// First rotation: task one completes.
+		// First cycle: task one completes.
 		await writeFile(autoFile(), RALPH_V2_TASK_ONE_DONE_LOGGED);
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// Second rotation: task two completes on top of task one.
+		// Second cycle: task two completes on top of task one.
 		await writeFile(autoFile(), RALPH_V2_TASKS_ONE_TWO_DONE_LOGGED);
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -3820,7 +3820,7 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(summary).toContain('2. Task two');
 	});
 
-	test('rotation: tasks completed before the loop started stay out of the summary', async () => {
+	test('cycle: tasks completed before the loop started stay out of the summary', async () => {
 		await writeFile(autoFile(), RALPH_V2_TASK_ONE_DONE_LOGGED);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3838,13 +3838,13 @@ describe('ralph-loop extension (rotation compaction and completion summaries)', 
 		expect(summary?.message.content).not.toContain('Task one');
 	});
 
-	test('rotation: checkpoints made in this loop are listed in the summary', async () => {
+	test('cycle: checkpoints made in this loop are listed in the summary', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		// A context-limit rotation with no completion but a fresh checkpoint.
+		// A context-limit cycle with no completion but a fresh checkpoint.
 		await writeFile(autoFile(), RALPH_V2_TASK_TWO_CHECKPOINTED);
 		fakeCtx.usagePercent.value = 90;
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -3966,7 +3966,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		// distinct from "on", which means a loop is actually running.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
 		expect(statusLine(fakeCtx.widgets)).toContain('(compaction)');
-		// The context percentage is shown while idle too: auto mode rotates on
+		// The context percentage is shown while idle too: auto mode cycles on
 		// the context budget, so the headroom matters before a start.
 		expect(statusLine(fakeCtx.widgets)).toContain('context: 10% / 50%');
 	});
@@ -4002,7 +4002,7 @@ GB
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is stopped · auto mode: on');
 	});
 
-	test('auto mode pre-activates the auto tool set (ralph_todo + ralph_rotate) at session start so arming is cache-neutral', async () => {
+	test('auto mode pre-activates the auto tool set (ralph_todo + ralph_cycle) at session start so arming is cache-neutral', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4010,10 +4010,10 @@ GB
 
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The auto tool set (backlog + rotation) is in context before the loop
+		// The auto tool set (backlog + cycle) is in context before the loop
 		// arms; the goal and decision tools stay out.
 		expect(fake.activeTools).toContain('ralph_todo');
-		expect(fake.activeTools).toContain('ralph_rotate');
+		expect(fake.activeTools).toContain('ralph_cycle');
 		expect(fake.activeTools).not.toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
@@ -4039,7 +4039,7 @@ GB
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 		// Auto mode is off by default: the auto tools stay out of context.
 		expect(fake.activeTools).not.toContain('ralph_todo');
-		expect(fake.activeTools).not.toContain('ralph_rotate');
+		expect(fake.activeTools).not.toContain('ralph_cycle');
 
 		// Flip auto mode on in the config UI (select the item, Enter cycles off→on).
 		const created: unknown[] = [];
@@ -4061,7 +4061,7 @@ GB
 		// eligible for pi's deferred tool loading, which only applies to
 		// additive changes recorded on a tool result).
 		expect(fake.activeTools).toContain('ralph_todo');
-		expect(fake.activeTools).toContain('ralph_rotate');
+		expect(fake.activeTools).toContain('ralph_cycle');
 		expect(fake.activeTools).not.toContain('ralph_goal');
 	});
 
@@ -4100,7 +4100,7 @@ GB
 		expect(status).toContain('category: General');
 		// The auto tool set is activated — not the full ralph tool set.
 		expect(fake.activeTools).toContain('ralph_todo');
-		expect(fake.activeTools).toContain('ralph_rotate');
+		expect(fake.activeTools).toContain('ralph_cycle');
 		expect(fake.activeTools).not.toContain('ralph_goal');
 		expect(fake.activeTools).not.toContain('ralph_request_decision');
 		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
@@ -4161,7 +4161,7 @@ GB
 		expect(missing).toBe(true);
 	});
 
-	test('auto mode context-limit rotation: finish-up prompt, then a fresh iteration', async () => {
+	test('auto mode context-limit cycle: finish-up prompt, then a fresh iteration', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4456,7 +4456,7 @@ GB
 		expect(stateEntries(fake).at(-1)!.data).toMatchObject({ enabled: true, mode: 'auto' });
 	});
 
-	test('auto mode does not rotate on task completion', async () => {
+	test('auto mode does not cycle on task completion', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4467,7 +4467,7 @@ GB
 		await tool.execute('t', { action: 'add', title: 'Small step' }, undefined, undefined, fakeCtx.ctx);
 		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
 
-		// The iteration settles with low context usage: no rotation, no fresh
+		// The iteration settles with low context usage: no cycle, no fresh
 		// prompt. Completing the last open work task also sends no continue
 		// nudge: there is no work left to start.
 		fakeCtx.usagePercent.value = 10;
@@ -4504,7 +4504,7 @@ GB
 		expect(statusLine(fakeCtx.widgets)).toContain('task: 2/2 (iteration 1)');
 	});
 
-	test('auto mode starts the next task after a completion under budget (no rotation)', async () => {
+	test('auto mode starts the next task after a completion under budget (no cycle)', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4516,7 +4516,7 @@ GB
 		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
 		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
 
-		// The iteration settles under budget: no rotation (still iteration 1),
+		// The iteration settles under budget: no cycle (still iteration 1),
 		// but the loop must not idle — it nudges the model to the next open task
 		// instead of waiting for the user to type "continue".
 		fakeCtx.usagePercent.value = 10;
@@ -4530,7 +4530,7 @@ GB
 		expect(status).toContain('iteration 1/10');
 	});
 
-	test('auto mode nudge does not fire over budget: the context-limit rotation wins', async () => {
+	test('auto mode nudge does not fire over budget: the context-limit cycle wins', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4542,7 +4542,7 @@ GB
 		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
 		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
 
-		// Settling over budget queues the finish-up rotation, not a nudge.
+		// Settling over budget queues the finish-up cycle, not a nudge.
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -4659,7 +4659,7 @@ GB
 		expect(last.options).toEqual({ deliverAs: 'steer' });
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
-		// Further streaming updates do not queue a second rotation.
+		// Further streaming updates do not queue a second cycle.
 		const queued = fake.userMessages.length;
 		await fake.fire('message_update', fakeCtx.ctx);
 		expect(fake.userMessages.length).toBe(queued);
@@ -4789,7 +4789,7 @@ GB
 		expect(last.options).toEqual({ deliverAs: 'steer' });
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
-		// Further streaming updates do not arm a second loop or queue a second rotation.
+		// Further streaming updates do not arm a second loop or queue a second cycle.
 		await fake.fire('message_update', fakeCtx.ctx);
 		await flush();
 		// One auto file for the session, and only one session category in it
@@ -4904,7 +4904,7 @@ GB
 	});
 });
 
-describe('ralph-loop extension (rotateOn policy and merged tool decisions)', () => {
+describe('ralph-loop extension (cycleOn policy and merged tool decisions)', () => {
 	const RALPH_SINGLE = `# ralph v2
 
 T 1 - "Only task"
@@ -4935,8 +4935,8 @@ M list "Plan"
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, ...extra }, null, '\t')}\n`
 		);
 
-	/** The per-mode rotation policy with one value for all modes. */
-	const allRotate = (policy: 'task' | 'budget') => ({ tasks: policy, goal: policy, auto: policy });
+	/** The per-mode cycle policy with one value for all modes. */
+	const allCycle = (policy: 'task' | 'budget') => ({ tasks: policy, goal: policy, auto: policy });
 
 	const writeAutoConfig = (extra: Record<string, unknown> = {}) => writeConfig({ autoMode: 'on', ...extra });
 
@@ -4953,23 +4953,23 @@ M list "Plan"
 		await writeFile(autoFile(), RALPH_V1);
 	});
 
-	test('rotateOn is captured into the loop state at start (built-in per-mode default when unset)', async () => {
+	test('cycleOn is captured into the loop state at start (built-in per-mode default when unset)', async () => {
 		// Unset: the task loop captures "task"…
 		{
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
 		// …an explicit config value wins for the task loop…
 		{
-			await writeConfig({ rotateOn: allRotate('budget') });
+			await writeConfig({ cycleOn: allCycle('budget') });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
 		// …and the auto loop defaults to "budget".
 		{
@@ -4978,75 +4978,96 @@ M list "Plan"
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
 	});
 
-	test('per-mode rotation policies are captured into the loop state at start', async () => {
+	test('per-mode cycle policies are captured into the loop state at start', async () => {
 		const perMode = { tasks: 'budget', goal: 'budget', auto: 'task' };
 		// Task loop: its own configured value (budget, against the built-in task).
 		{
-			await writeConfig({ rotateOn: perMode });
+			await writeConfig({ cycleOn: perMode });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
 		// Goal loop: its own configured value (budget, against the built-in task).
 		{
-			await writeConfig({ rotateOn: perMode });
+			await writeConfig({ cycleOn: perMode });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await writeFile(autoFile(), GOAL_PLANNING_WITH_LIST);
 			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 			await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
 		// Auto loop: its own configured value (task, against the built-in budget).
 		{
-			await writeAutoConfig({ rotateOn: perMode });
+			await writeAutoConfig({ cycleOn: perMode });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
 	});
 
-	test('the legacy single rotation policy migrates to the per-mode form', async () => {
+	test('the legacy single cycle policy migrates to the per-mode form', async () => {
 		// "task" → all modes…
 		{
-			await writeConfig({ rotateOn: 'task' });
+			await writeConfig({ cycleOn: 'task' });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
 		// …"budget" → all modes…
 		{
-			await writeAutoConfig({ rotateOn: 'budget' });
+			await writeAutoConfig({ cycleOn: 'budget' });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
 		// …"default" → the built-ins (task loop: task).
 		{
-			await writeConfig({ rotateOn: 'default' });
+			await writeConfig({ cycleOn: 'default' });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
 			await startLoop(fake, fakeCtx);
-			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
 	});
 
-	test('task loop under rotateOn "budget": completing a task does not rotate; the nudge starts the next task', async () => {
-		await writeConfig({ rotateOn: allRotate('budget') });
+	test('a saved config with the old rotateOn key migrates to cycleOn', async () => {
+		// The per-mode object form under the old key is used as-is…
+		{
+			await writeConfig({ rotateOn: { tasks: 'budget', goal: 'task', auto: 'budget' } });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
+		}
+		// …and the legacy string form under the old key resolves per mode.
+		{
+			await writeConfig({ rotateOn: 'budget' });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
+		}
+	});
+
+	test('task loop under cycleOn "budget": completing a task does not cycle; the nudge starts the next task', async () => {
+		await writeConfig({ cycleOn: allCycle('budget') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5062,16 +5083,16 @@ M list "Plan"
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// No rotation: the same iteration continues…
+		// No cycle: the same iteration continues…
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 		// …and the budget nudge keeps the loop moving to the next open task.
 		expect(fake.userMessages.at(-1)!.text).toContain('Continue on next task?');
 	});
 
-	test('task loop under rotateOn "budget": an exhausted backlog still stops the loop at settle', async () => {
+	test('task loop under cycleOn "budget": an exhausted backlog still stops the loop at settle', async () => {
 		await writeFile(autoFile(), RALPH_SINGLE);
-		await writeConfig({ rotateOn: allRotate('budget') });
+		await writeConfig({ cycleOn: allCycle('budget') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5090,8 +5111,8 @@ M list "Plan"
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
-	test('auto loop under rotateOn "task": completing a todo rotates with a recording turn', async () => {
-		await writeAutoConfig({ rotateOn: allRotate('task') });
+	test('auto loop under cycleOn "task": completing a todo cycles with a recording turn', async () => {
+		await writeAutoConfig({ cycleOn: allCycle('task') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5105,7 +5126,7 @@ M list "Plan"
 
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
-		// The completed todo is a rotation boundary: the recording turn is queued.
+		// The completed todo is a cycle boundary: the recording turn is queued.
 		expect(statusLine(fakeCtx.widgets)).toContain('recording');
 		expect(fake.userMessages.at(-1)!.text).toContain('A Ralph TODO task was just completed');
 
@@ -5117,8 +5138,8 @@ M list "Plan"
 		expect(fake.userMessages.at(-1)!.text).toContain('stop working when the commit is made');
 	});
 
-	test('goal loop under rotateOn "budget": phase changes rotate (planning → execution → re-evaluation), completions do not', async () => {
-		await writeConfig({ rotateOn: allRotate('budget') });
+	test('goal loop under cycleOn "budget": phase changes cycle (planning → execution → re-evaluation), completions do not', async () => {
+		await writeConfig({ cycleOn: allCycle('budget') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5128,7 +5149,7 @@ M list "Plan"
 		const tool = todoTool(fake);
 
 		// The planning iteration records the plan: the phase changes
-		// planning → execution, which rotates under the budget policy.
+		// planning → execution, which cycles under the budget policy.
 		await tool.execute(
 			't',
 			{ action: 'add-many', category: 'Plan', tasks: [{ title: 'Port the routes.' }] },
@@ -5150,7 +5171,7 @@ M list "Plan"
 		expect(fake.userMessages.at(-1)!.text).toContain('You are executing the goal');
 
 		// Completing the last task changes the phase execution → re-evaluation:
-		// without this rotation the finished plan with context headroom would
+		// without this cycle the finished plan with context headroom would
 		// never reach the re-evaluation prompt (the stall the policy fixes).
 		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
 		fakeCtx.usagePercent.value = 10;
@@ -5169,8 +5190,8 @@ G "Keep finding risks" open
 T 1 - "Continuous re-test loop (run until stopped)"
 `;
 
-	test('goal loop under rotateOn "task": a cleanly ended iteration with open tasks rotates instead of idling', async () => {
-		await writeConfig({ rotateOn: allRotate('task') });
+	test('goal loop under cycleOn "task": a cleanly ended iteration with open tasks cycles instead of idling', async () => {
+		await writeConfig({ cycleOn: allCycle('task') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5187,7 +5208,7 @@ T 1 - "Continuous re-test loop (run until stopped)"
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		// The ended iteration is a rotation boundary: the finish-up recording
+		// The ended iteration is a cycle boundary: the finish-up recording
 		// turn is queued instead of the loop idling forever.
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 		expect(fake.userMessages.at(-1)!.text).toContain('The current Ralph iteration has ended');
@@ -5200,8 +5221,8 @@ T 1 - "Continuous re-test loop (run until stopped)"
 		expect(fake.userMessages.at(-1)!.text).toContain('The previous iteration ended');
 	});
 
-	test('goal loop under rotateOn "task": an errored iteration does not rotate', async () => {
-		await writeConfig({ rotateOn: allRotate('task') });
+	test('goal loop under cycleOn "task": an errored iteration does not cycle', async () => {
+		await writeConfig({ cycleOn: allCycle('task') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5320,7 +5341,7 @@ T 1 - "Continuous re-test loop (run until stopped)"
 describe('ralph-loop extension (global config store)', () => {
 	const storePath = () => join(agentDir, 'ralph', 'config.json');
 	const fullConfig = (extra: Record<string, unknown> = {}) =>
-		({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'off', rotateOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
+		({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'off', cycleOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
 
 	const writeStore = (store: { defaults?: Record<string, unknown>; dirs?: Record<string, unknown> }) =>
 		writeFile(storePath(), `${JSON.stringify(store, null, '\t')}\n`);
@@ -5427,6 +5448,28 @@ describe('ralph-loop extension (global config store)', () => {
 		await startLoop(fake, fakeCtx);
 
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/8');
+	});
+
+	test('a store entry with the old rotateOn key migrates to cycleOn and is re-saved without the old key', async () => {
+		await writeFile(autoFile(), RALPH_V1);
+		// A config saved before the rename: the per-mode policy under the old key, no cycleOn.
+		const { cycleOn: _cycleOn, ...noCycleOn } = fullConfig({ autoMode: 'on' });
+		await writeStore({ dirs: { [dir]: { default: { ...noCycleOn, rotateOn: { tasks: 'budget', goal: 'budget', auto: 'budget' } } } } });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// The old-key policy is in effect for the loop…
+		expect(statusLine(fakeCtx.widgets)).toContain('cycle: budget');
+
+		// …and a save re-persists the migrated form without the old key.
+		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
+		await flush();
+
+		const store = await readStore();
+		expect(store.dirs![dir]!.default).toMatchObject({ autoMode: 'off', cycleOn: { tasks: 'budget', goal: 'budget', auto: 'budget' } });
+		expect(store.dirs![dir]!.default).not.toHaveProperty('rotateOn');
 	});
 
 	test('saving a config keeps the defaults section intact', async () => {
@@ -5596,7 +5639,7 @@ describe('ralph-loop extension (global config store)', () => {
 		expect(stripAnsi(lines.find((line) => line.includes('Auto mode'))!)).toMatch(/Auto mode\s+on$/);
 	});
 
-	test('the config UI edits the per-mode rotation policies', async () => {
+	test('the config UI edits the per-mode cycle policies', async () => {
 		initTheme();
 		await writeFile(autoFile(), RALPH_V1);
 		const fake = createFakePi();
@@ -5606,22 +5649,22 @@ describe('ralph-loop extension (global config store)', () => {
 
 		const view = await openConfigUi(fake, fakeCtx);
 		// Rows: Save to, Start fresh context at, Maximum iterations, Compaction
-		// mode, Auto-approve decisions, Auto mode, Rotation: task loop,
-		// Rotation: goal loop, Rotation: auto loop (last).
+		// mode, Auto-approve decisions, Auto mode, Cycle: task loop,
+		// Cycle: goal loop, Cycle: auto loop (last).
 		for (let i = 0; i < 8; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r'); // built-in auto policy budget → task
 		await flush();
 
 		const store = await readStore();
 		expect(store.dirs![dir]!.default).toMatchObject({
-			rotateOn: { tasks: 'task', goal: 'task', auto: 'task' }
+			cycleOn: { tasks: 'task', goal: 'task', auto: 'task' }
 		});
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('rotation (auto loop) task');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('cycle (auto loop) task');
 	});
 });
 
-describe('ralph-loop extension (ralph_rotate tool)', () => {
-	type RotateTool = {
+describe('ralph-loop extension (ralph_cycle tool)', () => {
+	type CycleTool = {
 		execute: (
 			id: string,
 			params: Record<string, unknown>,
@@ -5631,8 +5674,8 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		) => Promise<{ content: Array<{ type: string; text: string }>; details?: Record<string, unknown> }>;
 	};
 
-	const rotateTool = (fake: ReturnType<typeof createFakePi>): RotateTool => {
-		const tool = fake.tools.get('ralph_rotate') as RotateTool | undefined;
+	const cycleTool = (fake: ReturnType<typeof createFakePi>): CycleTool => {
+		const tool = fake.tools.get('ralph_cycle') as CycleTool | undefined;
 		expect(tool).toBeDefined();
 		return tool!;
 	};
@@ -5664,14 +5707,14 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		await writeFile(autoFile(), RALPH_V1);
 	});
 
-	test('queues a model-requested rotation with a finish-up recording prompt', async () => {
+	test('queues a model-requested cycle with a finish-up recording prompt', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		const result = await rotateTool(fake).execute('t', { note: 'stuck: repeating the same failing fix' }, undefined, undefined, fakeCtx.ctx);
-		expect(result.content[0]!.text).toContain('Rotation queued');
+		const result = await cycleTool(fake).execute('t', { note: 'stuck: repeating the same failing fix' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Cycle queued');
 		expect(result.content[0]!.text).toContain('Stop working now');
 
 		// The recording prompt is the finish-up, carrying the note.
@@ -5679,12 +5722,12 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		expect(prompt).toContain('You requested a fresh Ralph iteration because: stuck: repeating the same failing fix');
 		expect(prompt).toContain('Finish up now');
 
-		// The rotation state is durable with the note.
+		// The cycle state is durable with the note.
 		const state = lastState(fake);
-		expect(state.rotationQueued).toBe(true);
-		expect(state.rotationReason).toBe('model-requested');
-		expect(state.rotationCheckpointing).toBe(true);
-		expect(state.rotationNote).toBe('stuck: repeating the same failing fix');
+		expect(state.cycleQueued).toBe(true);
+		expect(state.cycleReason).toBe('model-requested');
+		expect(state.cycleCheckpointing).toBe(true);
+		expect(state.cycleNote).toBe('stuck: repeating the same failing fix');
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 	});
 
@@ -5694,8 +5737,8 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		await expect(rotateTool(fake).execute('t', { note: '  ' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			'A rotation note is required'
+		await expect(cycleTool(fake).execute('t', { note: '  ' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'A cycle note is required'
 		);
 	});
 
@@ -5705,26 +5748,26 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		await expect(rotateTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+		await expect(cycleTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
 			'No active Ralph loop — start one with /ralph start.'
 		);
 		// Nothing was persisted.
 		expect(stateEntries(fake).length).toBe(0);
 	});
 
-	test('refuses when a rotation is already pending', async () => {
+	test('refuses when a cycle is already pending', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		// A context-limit rotation is pending (recording turn queued).
+		// A context-limit cycle is pending (recording turn queued).
 		fakeCtx.usagePercent.value = 55;
 		await fake.fire('agent_settled', fakeCtx.ctx);
-		expect(lastState(fake).rotationQueued).toBe(true);
+		expect(lastState(fake).cycleQueued).toBe(true);
 
-		await expect(rotateTool(fake).execute('t', { note: 'again' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
-			'A rotation is already pending'
+		await expect(cycleTool(fake).execute('t', { note: 'again' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+			'A cycle is already pending'
 		);
 	});
 
@@ -5739,7 +5782,7 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
 		expect(lastState(fake).stopRequested).toBe(true);
 
-		await expect(rotateTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
+		await expect(cycleTool(fake).execute('t', { note: 'why not' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(
 			'stopping after the current iteration'
 		);
 	});
@@ -5750,7 +5793,7 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		await rotateTool(fake).execute('t', { note: 'stuck pattern' }, undefined, undefined, fakeCtx.ctx);
+		await cycleTool(fake).execute('t', { note: 'stuck pattern' }, undefined, undefined, fakeCtx.ctx);
 
 		// The recording turn settles: the fresh iteration starts directly.
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -5765,13 +5808,13 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		expect(lastState(fake).reloadRequested).toBeUndefined();
 	});
 
-	test('reload: the recording turn settles into a /ralph reload dispatch, and the reloaded instance continues the rotation', async () => {
+	test('reload: the recording turn settles into a /ralph reload dispatch, and the reloaded instance continues the cycle', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		const result = await rotateTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
+		const result = await cycleTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
 		expect(result.content[0]!.text).toContain('extensions reload at the boundary');
 		expect(lastState(fake).reloadRequested).toBe(true);
 
@@ -5785,11 +5828,11 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		// No fresh iteration yet: no boundary marker, no iteration prompt.
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(false);
 		const pending = lastState(fake);
-		expect(pending.rotationQueued).toBe(true);
-		expect(pending.rotationCheckpointing).toBe(false);
+		expect(pending.cycleQueued).toBe(true);
+		expect(pending.cycleCheckpointing).toBe(false);
 		expect(pending.reloadRequested).toBe(true);
 
-		// The reloaded instance restores the state and continues the rotation
+		// The reloaded instance restores the state and continues the cycle
 		// on the new code: compaction + boundary + fresh iteration prompt.
 		const { fake: reloaded, fakeCtx: reloadedCtx } = reloadedInstance(fake, fake.entries);
 		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'reload' });
@@ -5798,12 +5841,66 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		expect(reloaded.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 		const iteration = reloaded.userMessages.at(-1)!.text;
 		expect(iteration).toContain('requested a fresh iteration because: applying extension changes');
-		// The reload flag was consumed by this rotation.
+		// The reload flag was consumed by this cycle.
 		expect(lastState(reloaded).reloadRequested).toBeUndefined();
 		expect(statusLine(reloadedCtx.widgets)).toContain('iteration 2/10');
 	});
 
-	test('arms the auto loop and rotates when auto mode is on and the session backlog has open tasks', async () => {
+	test('restores a pre-rename state entry (rotation* fields) on session start', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const result = await cycleTool(fake).execute('t', { note: 'pre-rename checkpoint', reload: true }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Cycle queued');
+
+		// The recording turn settles: the durable "iteration pending" marker
+		// is left with the cycle fields still set.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		const pending = lastState(fake);
+		expect(pending.cycleQueued).toBe(true);
+		expect(pending.cycleCheckpointing).toBe(false);
+
+		// Rewrite the persisted state entry to the pre-rename field names.
+		const entry = stateEntries(fake).at(-1)!;
+		const { cycleOn, cycleQueued, cycleReason, cycleCheckpointing, cycleNote, ...rest } =
+			entry.data as Record<string, unknown> & {
+				cycleOn?: unknown;
+				cycleQueued?: unknown;
+				cycleReason?: unknown;
+				cycleCheckpointing?: unknown;
+				cycleNote?: unknown;
+			};
+		entry.data = {
+			...rest,
+			rotateOn: cycleOn,
+			rotationQueued: cycleQueued,
+			rotationReason: cycleReason,
+			rotationCheckpointing: cycleCheckpointing,
+			rotationNote: cycleNote
+		};
+
+		// The reloaded instance restores the old-format state under the new
+		// names and continues the cycle.
+		const { fake: reloaded, fakeCtx: reloadedCtx } = reloadedInstance(fake, fake.entries);
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'reload' });
+		await flush();
+
+		expect(reloaded.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+		expect(reloaded.userMessages.at(-1)!.text).toContain('requested a fresh iteration because: pre-rename checkpoint');
+		const restored = lastState(reloaded);
+		expect(restored.cycleOn).toBe(cycleOn);
+		// The old field names were migrated, not re-persisted.
+		expect(restored.rotateOn).toBeUndefined();
+		expect(restored.rotationQueued).toBeUndefined();
+		expect(restored.rotationReason).toBeUndefined();
+		expect(restored.rotationCheckpointing).toBeUndefined();
+		expect(restored.rotationNote).toBeUndefined();
+		expect(statusLine(reloadedCtx.widgets)).toContain('iteration 2/10');
+	});
+
+	test('arms the auto loop and cycles when auto mode is on and the session backlog has open tasks', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
@@ -5814,20 +5911,20 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The rotate tool is pre-activated with the auto tool set.
-		expect(fake.activeTools).toContain('ralph_rotate');
+		// The cycle tool is pre-activated with the auto tool set.
+		expect(fake.activeTools).toContain('ralph_cycle');
 
-		const result = await rotateTool(fake).execute('t', { note: 'checkpoint before a long task' }, undefined, undefined, fakeCtx.ctx);
-		expect(result.content[0]!.text).toContain('Rotation queued');
+		const result = await cycleTool(fake).execute('t', { note: 'checkpoint before a long task' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Cycle queued');
 
 		// The auto loop is armed (session category, iteration 1) and the
-		// model-requested rotation is pending on top of it.
+		// model-requested cycle is pending on top of it.
 		const state = lastState(fake);
 		expect(state.enabled).toBe(true);
 		expect(state.mode).toBe('auto');
 		expect(state.category).toBe('General');
-		expect(state.rotationQueued).toBe(true);
-		expect(state.rotationReason).toBe('model-requested');
+		expect(state.cycleQueued).toBe(true);
+		expect(state.cycleReason).toBe('model-requested');
 		expect(fake.userMessages.at(-1)!.text).toContain('You requested a fresh Ralph iteration because: checkpoint before a long task');
 	});
 
@@ -5836,7 +5933,7 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
-		// No session backlog at all: the rotation note is what the fresh
+		// No session backlog at all: the cycle note is what the fresh
 		// iteration moves on.
 		await rm(autoFile(), { force: true });
 		const fake = createFakePi();
@@ -5844,34 +5941,34 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		const result = await rotateTool(fake).execute('t', { note: 'verify the new extension' }, undefined, undefined, fakeCtx.ctx);
-		expect(result.content[0]!.text).toContain('Rotation queued');
+		const result = await cycleTool(fake).execute('t', { note: 'verify the new extension' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Cycle queued');
 
 		const state = lastState(fake);
 		expect(state.enabled).toBe(true);
 		expect(state.mode).toBe('auto');
-		expect(state.rotationQueued).toBe(true);
-		expect(state.rotationReason).toBe('model-requested');
+		expect(state.cycleQueued).toBe(true);
+		expect(state.cycleReason).toBe('model-requested');
 		expect(fake.userMessages.at(-1)!.text).toContain('You requested a fresh Ralph iteration because: verify the new extension');
 	});
 
-	test('self-heals when the reload dispatch is a no-op: the next settle continues the rotation', async () => {
+	test('self-heals when the reload dispatch is a no-op: the next settle continues the cycle', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		await rotateTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
+		await cycleTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
 
 		// The recording turn settles: the reload is dispatched (a no-op in a bare
 		// SDK session without a bound reload action) and the durable marker stays.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		expect(fake.userMessages.at(-1)?.text).toBe('/ralph reload');
-		expect(lastState(fake).rotationQueued).toBe(true);
-		expect(lastState(fake).rotationCheckpointing).toBe(false);
+		expect(lastState(fake).cycleQueued).toBe(true);
+		expect(lastState(fake).cycleCheckpointing).toBe(false);
 
 		// No reloaded session_start arrives. The next settle sees the
-		// "iteration pending" state and continues the rotation on the current
+		// "iteration pending" state and continues the cycle on the current
 		// code instead of stalling.
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
@@ -5887,10 +5984,10 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		await rotateTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
+		await cycleTool(fake).execute('t', { note: 'applying extension changes', reload: true }, undefined, undefined, fakeCtx.ctx);
 		expect(lastState(fake).reloadRequested).toBe(true);
 
-		// A force stop drops the pending rotation and its reload.
+		// A force stop drops the pending cycle and its reload.
 		await fake.commands.get('ralph')!.handler('stop --force', fakeCtx.ctx);
 		const state = lastState(fake);
 		expect(state.enabled).toBe(false);
@@ -5917,7 +6014,7 @@ describe('ralph-loop extension (ralph_rotate tool)', () => {
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
-		await rotateTool(fake).execute('t', { note: 'stuck pattern' }, undefined, undefined, fakeCtx.ctx);
+		await cycleTool(fake).execute('t', { note: 'stuck pattern' }, undefined, undefined, fakeCtx.ctx);
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		// /ralph status names the phase.

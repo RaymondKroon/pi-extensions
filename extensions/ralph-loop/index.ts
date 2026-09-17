@@ -80,34 +80,34 @@ const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 type AutoMode = 'off' | 'on';
 const DEFAULT_AUTO_MODE: AutoMode = 'off';
 /**
- * The rotation policy: task — a fresh iteration after every completed task
+ * The cycle policy: task — a fresh iteration after every completed task
  * (planned, feature-sized backlogs); budget — work task after task, fresh
  * iteration only at the context budget (fine-grained rolling handoff todos).
  */
-type RotateOnPolicy = 'task' | 'budget';
-/** The rotation policy per loop mode. */
-interface RotateOn {
-	tasks: RotateOnPolicy;
-	goal: RotateOnPolicy;
-	auto: RotateOnPolicy;
+type CycleOnPolicy = 'task' | 'budget';
+/** The cycle policy per loop mode. */
+interface CycleOn {
+	tasks: CycleOnPolicy;
+	goal: CycleOnPolicy;
+	auto: CycleOnPolicy;
 }
-const DEFAULT_ROTATE_ON: RotateOn = { tasks: 'task', goal: 'task', auto: 'budget' };
-/** The rotation policy for a loop mode. */
-function rotateOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): RotateOnPolicy {
-	return config.rotateOn?.[mode] ?? DEFAULT_ROTATE_ON[mode];
+const DEFAULT_CYCLE_ON: CycleOn = { tasks: 'task', goal: 'task', auto: 'budget' };
+/** The cycle policy for a loop mode. */
+function cycleOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): CycleOnPolicy {
+	return config.cycleOn?.[mode] ?? DEFAULT_CYCLE_ON[mode];
 }
-/** The rotation tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a rotation — and arm the auto loop — even while no loop is active yet. */
-const ROTATE_TOOL_NAME = 'ralph_rotate';
+/** The cycle tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a cycle — and arm the auto loop — even while no loop is active yet. */
+const CYCLE_TOOL_NAME = 'ralph_cycle';
 /** Tools activated additively (defer_loading) by /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
-const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision', ROTATE_TOOL_NAME];
+const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision', CYCLE_TOOL_NAME];
 /** The backlog tool name. With auto mode "on" the auto tool set is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
 const TODO_TOOL_NAME = 'ralph_todo';
-/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool plus the rotation tool, so a model-requested rotation (and its boundary reload) is possible from a plain auto-mode session. */
-const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, ROTATE_TOOL_NAME];
+/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool plus the cycle tool, so a model-requested cycle (and its boundary reload) is possible from a plain auto-mode session. */
+const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, CYCLE_TOOL_NAME];
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
-type RotationReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested' | 'iteration-ended';
+type CycleReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested' | 'iteration-ended';
 
 interface RalphConfig {
 	/**
@@ -118,14 +118,14 @@ interface RalphConfig {
 	autoApproveDecisions: boolean;
 	maxIterations: number;
 	/**
-	 * Hide each finished iteration from the TUI at every rotation via an
+	 * Hide each finished iteration from the TUI at every cycle via an
 	 * extension-provided compaction (no LLM call).
 	 */
 	compactionMode: boolean;
 	/**
 	 * The auto loop (state in the per-session <session-id>.db in the global
-	 * agent directory, auto-created session category, ralph_todo tool, rotation
-	 * per the rotation policy — default: the context budget): off — nothing
+	 * agent directory, auto-created session category, ralph_todo tool, cycle
+	 * per the cycle policy — default: the context budget): off — nothing
 	 * automatic; on — the loop starts at session start; auto — the loop arms
 	 * itself when the context crosses the budget (at session start or
 	 * mid-session) and records todos for the next iteration. A plain
@@ -134,7 +134,7 @@ interface RalphConfig {
 	 */
 	autoMode: AutoMode;
 	/** When a fresh iteration starts, per loop mode: task — after every completed task; budget — only at the context budget. */
-	rotateOn: RotateOn;
+	cycleOn: CycleOn;
 }
 
 interface LegacyRalphConfig {
@@ -143,26 +143,26 @@ interface LegacyRalphConfig {
 	maxIterations?: number;
 }
 
-function isRotateOnPolicy(value: unknown): value is RotateOnPolicy {
+function isCycleOnPolicy(value: unknown): value is CycleOnPolicy {
 	return value === 'task' || value === 'budget';
 }
 
-function isRotateOn(value: unknown): value is RotateOn {
+function isCycleOn(value: unknown): value is CycleOn {
 	if (!value || typeof value !== 'object') return false;
-	const v = value as Partial<RotateOn>;
-	return isRotateOnPolicy(v.tasks) && isRotateOnPolicy(v.goal) && isRotateOnPolicy(v.auto);
+	const v = value as Partial<CycleOn>;
+	return isCycleOnPolicy(v.tasks) && isCycleOnPolicy(v.goal) && isCycleOnPolicy(v.auto);
 }
 
-/** The legacy single rotation policy (pre per-mode config). */
-function isLegacyRotateOn(value: unknown): value is 'default' | 'task' | 'budget' {
+/** The legacy single cycle policy (pre per-mode config). */
+function isLegacyCycleOn(value: unknown): value is 'default' | 'task' | 'budget' {
 	return value === 'default' || value === 'task' || value === 'budget';
 }
 
-/** Migrate a stored rotation policy to the per-mode form (legacy: "task"/"budget" → all modes, "default"/missing → built-in). */
-function migrateRotateOn(value: unknown): RotateOn {
-	if (isRotateOn(value)) return value;
+/** Migrate a stored cycle policy to the per-mode form (legacy: "task"/"budget" → all modes, "default"/missing → built-in). */
+function migrateCycleOn(value: unknown): CycleOn {
+	if (isCycleOn(value)) return value;
 	if (value === 'task' || value === 'budget') return { tasks: value, goal: value, auto: value };
-	return { ...DEFAULT_ROTATE_ON };
+	return { ...DEFAULT_CYCLE_ON };
 }
 
 interface RalphState {
@@ -172,10 +172,10 @@ interface RalphState {
 	enabled: boolean;
 	/** Loop policy: the finite task backlog, the single goal, or the auto loop. */
 	mode: 'tasks' | 'goal' | 'auto';
-	/** The rotation policy resolved at loop start (the loop mode's configured value); a mid-loop config edit does not change a running loop. */
-	rotateOn: 'task' | 'budget';
+	/** The cycle policy resolved at loop start (the loop mode's configured value); a mid-loop config edit does not change a running loop. */
+	cycleOn: 'task' | 'budget';
 	todoPath: string;
-	/** Backlog snapshot at the start of the current loop (never rotated). */
+	/** Backlog snapshot at the start of the current loop (never cycled). */
 	loopStartTodo: string;
 	baselineTodo: string;
 	/** Epoch ms when baselineTodo was taken; attributes completions to the current iteration. */
@@ -187,11 +187,11 @@ interface RalphState {
 	/** The TODO task number (from countTodoTasks) that taskIteration refers to. */
 	taskNumber?: number;
 	maxIterations: number;
-	rotationQueued: boolean;
+	cycleQueued: boolean;
 	/** Why a fresh iteration is pending. Retained while a context checkpoint runs. */
-	rotationReason?: RotationReason;
+	cycleReason?: CycleReason;
 	/** The model is recording a durable checkpoint before the fresh iteration starts. */
-	rotationCheckpointing: boolean;
+	cycleCheckpointing: boolean;
 	/** A stop was requested while the current iteration is still running. */
 	stopRequested: boolean;
 	/** The loop is paused (e.g. the user pressed Escape) and waits for the next user message, which resumes it. */
@@ -202,21 +202,35 @@ interface RalphState {
 	blockedItem?: string;
 	/** Only tasks in this category count as open/complete (ralph-format backlogs). */
 	category?: string;
-	/** Task numbers that flipped to done for the pending completed-task rotation. */
+	/** Task numbers that flipped to done for the pending completed-task cycle. */
 	completedTasks?: string[];
-	/** Why the model requested the pending model-requested rotation; carried into the recording prompt and the fresh iteration's prompt. */
-	rotationNote?: string;
-	/** Queue an extension reload at the pending rotation boundary: after the recording turn and the context cut, before the fresh iteration's first request. */
+	/** Why the model requested the pending model-requested cycle; carried into the recording prompt and the fresh iteration's prompt. */
+	cycleNote?: string;
+	/** Queue an extension reload at the pending cycle boundary: after the recording turn and the context cut, before the fresh iteration's first request. */
 	reloadRequested?: boolean;
 }
 
+/** State fields persisted under the old rotation names (pre cycle rename). */
+type LegacyRalphStateFields = {
+	rotateOn?: 'task' | 'budget';
+	rotationQueued?: boolean;
+	rotationReason?: CycleReason;
+	rotationCheckpointing?: boolean;
+	rotationNote?: string;
+};
+
 function isRalphState(value: unknown): value is RalphState {
 	if (!value || typeof value !== 'object') return false;
-	const state = value as Partial<RalphState>;
+	const state = value as Partial<RalphState> & LegacyRalphStateFields;
+	const cycleOn = state.cycleOn ?? state.rotateOn;
+	const cycleQueued = state.cycleQueued ?? state.rotationQueued;
+	const cycleReason = state.cycleReason ?? state.rotationReason;
+	const cycleCheckpointing = state.cycleCheckpointing ?? state.rotationCheckpointing;
+	const cycleNote = state.cycleNote ?? state.rotationNote;
 	return (
 		typeof state.enabled === 'boolean' &&
 		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal' || state.mode === 'auto') &&
-		(state.rotateOn === undefined || state.rotateOn === 'task' || state.rotateOn === 'budget') &&
+		(cycleOn === undefined || cycleOn === 'task' || cycleOn === 'budget') &&
 		typeof state.todoPath === 'string' &&
 		(state.loopStartTodo === undefined || typeof state.loopStartTodo === 'string') &&
 		typeof state.baselineTodo === 'string' &&
@@ -227,17 +241,17 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.maxIterations === undefined || (typeof state.maxIterations === 'number' && state.maxIterations >= 1)) &&
 		typeof state.contextThreshold === 'number' &&
 		(state.autoApproveDecisions === undefined || typeof state.autoApproveDecisions === 'boolean') &&
-		typeof state.rotationQueued === 'boolean' &&
-		(state.rotationReason === undefined ||
-			state.rotationReason === 'completed-task' ||
-			state.rotationReason === 'plan-updated' ||
-			state.rotationReason === 'phase-changed' ||
-			state.rotationReason === 'context-limit' ||
-			state.rotationReason === 'model-requested' ||
-			state.rotationReason === 'iteration-ended') &&
-		(state.rotationNote === undefined || typeof state.rotationNote === 'string') &&
+		typeof cycleQueued === 'boolean' &&
+		(cycleReason === undefined ||
+			cycleReason === 'completed-task' ||
+			cycleReason === 'plan-updated' ||
+			cycleReason === 'phase-changed' ||
+			cycleReason === 'context-limit' ||
+			cycleReason === 'model-requested' ||
+			cycleReason === 'iteration-ended') &&
+		(cycleNote === undefined || typeof cycleNote === 'string') &&
 		(state.reloadRequested === undefined || typeof state.reloadRequested === 'boolean') &&
-		(state.rotationCheckpointing === undefined || typeof state.rotationCheckpointing === 'boolean') &&
+		(cycleCheckpointing === undefined || typeof cycleCheckpointing === 'boolean') &&
 		(state.stopRequested === undefined || typeof state.stopRequested === 'boolean') &&
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
 		(state.blocked === undefined || typeof state.blocked === 'boolean') &&
@@ -251,17 +265,29 @@ function isRalphState(value: unknown): value is RalphState {
 /** Keep sessions created before graceful stopping/blocking/configuration was added compatible. */
 function normalizeState(state: RalphState): RalphState {
 	const mode = state.mode ?? 'tasks';
+	// Strip the old rotation field names so they are not re-persisted.
+	const {
+		rotateOn: legacyCycleOn,
+		rotationQueued: legacyCycleQueued,
+		rotationReason: legacyCycleReason,
+		rotationCheckpointing: legacyCycleCheckpointing,
+		rotationNote: legacyCycleNote,
+		...rest
+	} = state as RalphState & LegacyRalphStateFields;
 	return {
-		...state,
+		...rest,
 		mode,
-		rotateOn: state.rotateOn ?? (mode === 'auto' ? 'budget' : 'task'),
+		cycleOn: state.cycleOn ?? legacyCycleOn ?? (mode === 'auto' ? 'budget' : 'task'),
 		autoApproveDecisions: state.autoApproveDecisions ?? DEFAULT_AUTO_APPROVE_DECISIONS,
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 		loopStartTodo: state.loopStartTodo ?? state.baselineTodo,
 		baselineTime: state.baselineTime ?? Date.now(),
-		rotationCheckpointing: state.rotationCheckpointing ?? false,
+		cycleQueued: state.cycleQueued ?? legacyCycleQueued ?? false,
+		cycleReason: state.cycleReason ?? legacyCycleReason,
+		cycleCheckpointing: state.cycleCheckpointing ?? legacyCycleCheckpointing ?? false,
+		cycleNote: state.cycleNote ?? legacyCycleNote,
 		stopRequested: state.stopRequested ?? false,
 		paused: state.paused ?? false,
 		blocked: state.blocked ?? false
@@ -298,17 +324,17 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		isMaxIterations(config.maxIterations) &&
 		typeof config.compactionMode === 'boolean' &&
 		isAutoMode(config.autoMode) &&
-		isRotateOn(config.rotateOn)
+		isCycleOn(config.cycleOn)
 	);
 }
 
 /** A saved config missing newer optional fields; normalizeConfig fills the defaults. */
 function isRalphConfigPartial(
 	value: unknown
-): value is Omit<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode' | 'rotateOn'> &
-	Partial<Pick<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode' | 'rotateOn'>> {
+): value is Omit<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode' | 'cycleOn'> &
+	Partial<Pick<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode' | 'cycleOn'>> {
 	if (!value || typeof value !== 'object') return false;
-	const config = value as Partial<RalphConfig>;
+	const config = value as Partial<RalphConfig> & { rotateOn?: unknown };
 	return (
 		!!config.contextThresholds &&
 		typeof config.contextThresholds === 'object' &&
@@ -317,7 +343,9 @@ function isRalphConfigPartial(
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
 		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean') &&
 		(config.autoMode === undefined || normalizeAutoMode(config.autoMode) !== undefined) &&
-		(config.rotateOn === undefined || isRotateOn(config.rotateOn) || isLegacyRotateOn(config.rotateOn))
+		(config.cycleOn === undefined || isCycleOn(config.cycleOn) || isLegacyCycleOn(config.cycleOn)) &&
+		// Configs saved before the cycle rename carry the per-mode policy under the old key.
+		(config.rotateOn === undefined || isCycleOn(config.rotateOn) || isLegacyCycleOn(config.rotateOn))
 	);
 }
 
@@ -334,12 +362,13 @@ function isLegacyRalphConfig(value: unknown): value is LegacyRalphConfig {
 function normalizeConfig(value: unknown): RalphConfig | undefined {
 	if (isRalphConfig(value)) return value;
 	if (isRalphConfigPartial(value)) {
+		const { rotateOn: legacyCycleOn, ...rest } = value as (typeof value) & { rotateOn?: unknown };
 		return {
-			...value,
+			...rest,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
 			autoMode: normalizeAutoMode(value.autoMode) ?? DEFAULT_AUTO_MODE,
-			rotateOn: migrateRotateOn(value.rotateOn)
+			cycleOn: migrateCycleOn(value.cycleOn ?? legacyCycleOn)
 		};
 	}
 	if (isLegacyRalphConfig(value)) {
@@ -349,7 +378,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
 			autoMode: DEFAULT_AUTO_MODE,
-			rotateOn: { ...DEFAULT_ROTATE_ON }
+			cycleOn: { ...DEFAULT_CYCLE_ON }
 		};
 	}
 }
@@ -361,7 +390,7 @@ function defaultConfig(): RalphConfig {
 		maxIterations: DEFAULT_MAX_ITERATIONS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
 		autoMode: DEFAULT_AUTO_MODE,
-		rotateOn: { ...DEFAULT_ROTATE_ON }
+		cycleOn: { ...DEFAULT_CYCLE_ON }
 	};
 }
 
@@ -634,8 +663,8 @@ function goalPhaseOf(todo: string, category?: string): GoalPhase | undefined {
 /**
  * Whether the goal phase changed between two backlog snapshots (both must be
  * ralph backlogs with a goal for a change to be detectable). The goal loop
- * under rotateOn "budget" rotates on this: the phase is detected at iteration
- * start, so without the rotation a finished plan with context headroom would
+ * under cycleOn "budget" cycles on this: the phase is detected at iteration
+ * start, so without the cycle a finished plan with context headroom would
  * never reach the re-evaluation prompt and the loop would stall.
  */
 function goalPhaseChanged(previousTodo: string, currentTodo: string, category?: string): boolean {
@@ -693,7 +722,7 @@ function goalStatus(todo: string): GoalStatus | undefined {
  * Whether the plan grew between two snapshots: a task that is open in the newer
  * snapshot but was not open in the older one (a new task, or a previously
  * completed task re-opened). The goal loop uses this to tell a progress turn
- * (the plan grew) from a stalled one, and to trigger a plan-updated rotation.
+ * (the plan grew) from a stalled one, and to trigger a plan-updated cycle.
  */
 function planGrew(previousTodo: string, currentTodo: string, category?: string): boolean {
 	if (!isRalphBacklog(previousTodo) || !isRalphBacklog(currentTodo)) return false;
@@ -769,11 +798,11 @@ function automatedPrefix(): string {
 	return `${renderPrompt('prefix', {})}\n\n`;
 }
 
-function iterationPrompt(state: RalphState, reason?: RotationReason): string {
+function iterationPrompt(state: RalphState, reason?: CycleReason): string {
 	return automatedPrefix() + iterationPromptBody(state, reason);
 }
 
-function iterationPromptBody(state: RalphState, reason?: RotationReason): string {
+function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	if (!isRalphBacklog(state.baselineTodo)) {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
@@ -782,7 +811,7 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 			reason === 'context-limit'
 				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. The backlog also carries "Findings: " entries with what the previous iteration learned, and DEBUG.md at the project root may carry durable debug findings — read them before starting work instead of rediscovering what they already establish.'
 				: reason === 'model-requested'
-				? `The previous iteration requested a fresh iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat what the recorded checkpoint lists as already tried.`
+				? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat what the recorded checkpoint lists as already tried.`
 			: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
 		// From the second iteration on, the backlog also carries the findings
 		// layer ("Findings: " reference notes from earlier iterations).
@@ -790,11 +819,11 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 			state.iteration > 1
 				? ' Tasks whose title starts with "Findings: " are not work items, and "next" skips them: they are reference notes from earlier iterations. Read the open Findings entries before starting work, then mark each one done with ralph_todo (action "complete") so the backlog does not accumulate open reference entries.'
 				: '';
-		// Closing step per rotation policy: under "task" the commit ends the
-		// iteration (the loop rotates and starts a fresh one); under "budget"
+		// Closing step per cycle policy: under "task" the commit ends the
+		// iteration (the loop cycles and starts a fresh one); under "budget"
 		// the model keeps working task after task until the context budget.
 		const closeStep =
-			state.rotateOn === 'task'
+			state.cycleOn === 'task'
 				? '- This is the last step of the iteration: stop working when the commit is made.'
 				: '- After committing, immediately go back to the first step and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.';
 		return renderPrompt('iteration-auto', {
@@ -817,13 +846,13 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
 					: reason === 'iteration-ended'
 						? 'The previous iteration ended. Start the next independent iteration with a clean review of the repository and the backlog.'
 						: reason === 'model-requested'
-							? `The previous iteration requested a fresh iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat what the recorded checkpoint lists as already tried.`
+							? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat what the recorded checkpoint lists as already tried.`
 						: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
-	// Closing step per rotation policy: under "task" the commit ends the
-	// iteration (the loop rotates and starts a fresh one); under "budget" the
+	// Closing step per cycle policy: under "task" the commit ends the
+	// iteration (the loop cycles and starts a fresh one); under "budget" the
 	// model keeps working task after task until the context budget.
 	const closeStep = (commitText: string) =>
-		state.rotateOn === 'task'
+		state.cycleOn === 'task'
 			? `- ${commitText} This is the last step of the iteration: stop working when the commit is made.`
 			: `- ${commitText} After committing, immediately go back to the first step and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.`;
 	const commitText = `Commit the completed task locally in a single commit. Do not push.`;
@@ -881,9 +910,9 @@ function iterationPromptBody(state: RalphState, reason?: RotationReason): string
  * tasks completed in this loop (titles only — the completion log entries
  * stay in the backlog), tasks checkpointed in this loop, and the goal
  * checkpoint when it changed. Tasks completed before the loop started stay
- * out. Used as the text of the ralph-provided compaction at each rotation
+ * out. Used as the text of the ralph-provided compaction at each cycle
  * and as the visible custom message injected at the start of each fresh
- * Ralph iteration. At rotations it is sent before the context boundary, so
+ * Ralph iteration. At cycles it is sent before the context boundary, so
  * it stays in the session (audit trail, TUI) but is dropped from the model
  * context — the model checks its own progress with the ralph_todo/ralph_goal
  * tools.
@@ -947,7 +976,7 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
 
 /**
  * Sent when a paused loop is resumed by a typed user message without a pending
- * rotation: the current iteration continues from the durable state instead of
+ * cycle: the current iteration continues from the durable state instead of
  * starting over, and the user's message is extra info for the loop.
  */
 function resumeWithExtraInfoPrompt(extraInfo: string): string {
@@ -955,7 +984,7 @@ function resumeWithExtraInfoPrompt(extraInfo: string): string {
 }
 
 /**
- * The progress-recording prompt for a queued rotation: the finish-up
+ * The progress-recording prompt for a queued cycle: the finish-up
  * (context budget / goal phase change) or the completion record plus local
  * commit (completed-task, plan-updated). Ralph-format loops finish up with the
  * merged finish-up prompt; goal planning / re-evaluation iterations checkpoint
@@ -963,15 +992,15 @@ function resumeWithExtraInfoPrompt(extraInfo: string): string {
  * item-note checkpoint.
  */
 function recordingPromptFor(state: RalphState): string {
-	return state.rotationReason === 'completed-task'
+	return state.cycleReason === 'completed-task'
 		? completionRecordingPrompt(state)
-		: state.rotationReason === 'plan-updated'
+		: state.cycleReason === 'plan-updated'
 			? planRecordingPrompt()
-		: state.rotationReason === 'model-requested'
+		: state.cycleReason === 'model-requested'
 			? finishUpPrompt(state, 'model-requested')
-		: state.rotationReason === 'phase-changed'
+		: state.cycleReason === 'phase-changed'
 			? finishUpPrompt(state, 'phase-changed')
-		: state.rotationReason === 'iteration-ended'
+		: state.cycleReason === 'iteration-ended'
 			? state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
 				? contextCheckpointPrompt(state)
 				: finishUpPrompt(state, 'iteration-ended')
@@ -1000,7 +1029,7 @@ function contextCheckpointPromptBody(state: RalphState): string {
 }
 
 /**
- * The rotation finish-up prompt: sent as the dedicated finish-up turn when the
+ * The cycle finish-up prompt: sent as the dedicated finish-up turn when the
  * iteration reaches its context budget, or when the goal phase changes.
  * Finishing the handoff matters more than a clean state: the model may leave
  * the code in a bad state and records the remaining work as todo entries for
@@ -1025,7 +1054,7 @@ function finishUpPrompt(
 		reason === 'phase-changed'
 			? 'The goal phase changed. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
 		: reason === 'model-requested'
-			? `You requested a fresh Ralph iteration${state.rotationNote ? ` because: ${state.rotationNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
+			? `You requested a fresh Ralph iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
 		: reason === 'iteration-ended'
 			? 'The current Ralph iteration has ended. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
 		: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
@@ -1450,11 +1479,11 @@ export default function (pi: ExtensionAPI) {
 	// editing the global defaults then applies to this session as well.
 	let configFromDefaults = false;
 	let configWrite = Promise.resolve();
-	// Cached from the TODO file at each refresh point (start, settle, rotation) so
+	// Cached from the TODO file at each refresh point (start, settle, cycle) so
 	// the status widget can show the current task number without reading the file
 	// on every streamed message update.
 	let taskCount: { current: number; total: number; done: boolean } | undefined;
-	// Cached from the TODO file at each refresh point (start, settle, rotation) so
+	// Cached from the TODO file at each refresh point (start, settle, cycle) so
 	// the status widget can show the current goal state without reading the file
 	// on every streamed message update.
 	let goalState: GoalStatus | undefined;
@@ -1462,19 +1491,19 @@ export default function (pi: ExtensionAPI) {
 	// new turn starts streaming or settles, so the status bar visibly stays in the
 	// "starting" phase instead of flipping back to "on" within milliseconds.
 	let freshIterationPending = false;
-	// Set when a turn begins already over budget (e.g. right after a rotation whose
+	// Set when a turn begins already over budget (e.g. right after a cycle whose
 	// reported usage has not caught up yet); suppresses the mid-turn checkpoint
-	// steer for that turn so a rotation cannot immediately re-trigger itself.
+	// steer for that turn so a cycle cannot immediately re-trigger itself.
 	let turnStartedOverBudget = false;
 	// Stop reason of the last assistant message of the current run; distinguishes
 	// a recording turn that finished from one the user aborted (Escape) — an
 	// aborted recording turn must not count as recorded progress.
 	let lastAssistantStopReason: string | undefined;
-	// The ralph-provided compaction pending for the in-flight rotation:
+	// The ralph-provided compaction pending for the in-flight cycle:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
 	// Once per loop: whether the keepRecentTokens gate notification was shown
-	// (a rotation compaction refused because the iteration is too small).
+	// (a cycle compaction refused because the iteration is too small).
 	let compactionGateNotified = false;
 	// Auto mode: once the auto loop is stopped in this session, the automatic
 	// context-budget intercept must not re-arm it (an explicit stop wins). An
@@ -1571,7 +1600,7 @@ export default function (pi: ExtensionAPI) {
 	// deactivation only happens on session start with no active loop — once
 	// in context, the tools stay in context for the rest of the session
 	// (loop stop does not remove them, which would break the cached prefix).
-	// An active auto loop activates the auto tool set (backlog + rotation);
+	// An active auto loop activates the auto tool set (backlog + cycle);
 	// the task/goal loops activate the full ralph tool set.
 	// With auto mode "on", the auto tool set is pre-activated at session start —
 	// and the moment auto mode is switched on mid-session (/ralph config): the
@@ -1606,15 +1635,15 @@ export default function (pi: ExtensionAPI) {
 			? 'waiting'
 			: state?.paused
 				? 'paused'
-			: state?.rotationCheckpointing
-				? state?.rotationReason === 'completed-task' || state?.rotationReason === 'plan-updated'
+			: state?.cycleCheckpointing
+				? state?.cycleReason === 'completed-task' || state?.cycleReason === 'plan-updated'
 					? 'recording'
 					: state?.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
 						? 'checkpointing'
 						: 'finishing'
 					: state?.stopRequested
 						? 'stopping'
-						: state?.rotationQueued || freshIterationPending
+						: state?.cycleQueued || freshIterationPending
 							? 'starting'
 							: 'on';
 		// The label reflects the active loop's mode; a stopped goal loop keeps
@@ -1639,16 +1668,16 @@ export default function (pi: ExtensionAPI) {
 			.filter((part): part is string => part !== undefined)
 			.join(', ');
 		const modifierSuffix = modifiers ? ` (${modifiers})` : '';
-		// The rotation policy: the active loop's resolved value, or the armed
+		// The cycle policy: the active loop's resolved value, or the armed
 		// auto loop's configured value when idle (the loop that will start).
-		const rotation = state?.enabled ? state.rotateOn : config.autoMode === 'on' ? config.rotateOn.auto : undefined;
-		const rotationSuffix = rotation ? ` · rotation: ${rotation}` : '';
+		const cycle = state?.enabled ? state.cycleOn : config.autoMode === 'on' ? config.cycleOn.auto : undefined;
+		const cycleSuffix = cycle ? ` · cycle: ${cycle}` : '';
 		// In the idle on/auto states the context percentage is still shown: the
-		// auto loop rotates on the context budget, so the headroom matters.
+		// auto loop cycles on the context budget, so the headroom matters.
 		const idleContext = idleState !== 'off' ? ` · context: ${contextUsageLabel(ctx, contextThresholdFor(config, ctx))}` : '';
 		const status = !state?.enabled
-			? `${label}: ${idleState}${modifierSuffix}${rotationSuffix}${idleContext}`
-			: `${label}: ${mode}${modifierSuffix}${rotationSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: ${idleState}${modifierSuffix}${cycleSuffix}${idleContext}`
+			: `${label}: ${mode}${modifierSuffix}${cycleSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -1705,7 +1734,7 @@ export default function (pi: ExtensionAPI) {
 		taskCount = undefined;
 		goalState = undefined;
 		freshIterationPending = false;
-		// A force stop can land while a rotation compaction is in flight; the
+		// A force stop can land while a cycle compaction is in flight; the
 		// pending ralph summary must not hijack a later, unrelated compaction
 		// (e.g. the user's own /compact).
 		pendingRalphCompaction = undefined;
@@ -1717,10 +1746,10 @@ export default function (pi: ExtensionAPI) {
 			...state,
 			enabled: false,
 			paused: false,
-			rotationQueued: false,
-			rotationReason: undefined,
-			rotationCheckpointing: false,
-			rotationNote: undefined,
+			cycleQueued: false,
+			cycleReason: undefined,
+			cycleCheckpointing: false,
+			cycleNote: undefined,
 			reloadRequested: undefined,
 			stopRequested: false,
 			blocked: false,
@@ -1736,12 +1765,12 @@ export default function (pi: ExtensionAPI) {
 		if (!state?.enabled) return;
 		persistState({
 			...state,
-			rotationQueued: false,
-			rotationReason: undefined,
-			rotationCheckpointing: false,
-			rotationNote: undefined,
-			// A dropped rotation must not leave a stale reload flag that a later,
-			// unrelated rotation would pick up.
+			cycleQueued: false,
+			cycleReason: undefined,
+			cycleCheckpointing: false,
+			cycleNote: undefined,
+			// A dropped cycle must not leave a stale reload flag that a later,
+			// unrelated cycle would pick up.
 			reloadRequested: undefined,
 			blocked: true,
 			blockedItem: question
@@ -1821,7 +1850,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Force the rotation boundary now: a progress-recording turn runs next
+	// Force the cycle boundary now: a progress-recording turn runs next
 	// (finish-up: commit finished work, record the remaining work), then the
 	// context is cut and a fresh iteration continues from the backlog. Two
 	// model-driven uses: (1) after changing extension/runtime code — with
@@ -1832,10 +1861,10 @@ export default function (pi: ExtensionAPI) {
 	// the recording turn forces an honest checkpoint of what was tried, and
 	// the fresh context starts without the stuck pattern.
 	pi.registerTool({
-		name: ROTATE_TOOL_NAME,
-		label: 'Rotate Ralph iteration',
+		name: CYCLE_TOOL_NAME,
+		label: 'Cycle Ralph iteration',
 		description:
-			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the rotation boundary, after the context cut. This is also how you extend yourself: extension files you write this iteration (project .pi/extensions/ in a trusted project, or the global agent directory) are loaded by that reload, so their tools and commands are available in the fresh iteration; your own tool list stays stale until the context cut, so say in note what the new capability is and how to verify it there — and (2) when you notice you are looping: repeating the same failing approach without progress. Each rotation costs a recording turn and one iteration of the maxIterations budget; do not rotate to avoid work or to stage a tool you do not need yet. With no active loop it arms the auto loop first when auto mode is "on" (no open tasks required: the note carries the reason the fresh iteration moves on, and the recording turn can record tasks for it). After calling it, stop working; the recording turn follows.',
+			'Force a fresh Ralph iteration now: a progress-recording turn runs next (commit finished work, record the remaining work), then the context is cut and a fresh iteration continues from the backlog. Use it (1) after changing extension or runtime code that needs a reload — pass reload: true so the extensions reload at the cycle boundary, after the context cut. This is also how you extend yourself: extension files you write this iteration (project .pi/extensions/ in a trusted project, or the global agent directory) are loaded by that reload, so their tools and commands are available in the fresh iteration; your own tool list stays stale until the context cut, so say in note what the new capability is and how to verify it there — and (2) when you notice you are looping: repeating the same failing approach without progress. Each cycle costs a recording turn and one iteration of the maxIterations budget; do not cycle to avoid work or to stage a tool you do not need yet. With no active loop it arms the auto loop first when auto mode is "on" (no open tasks required: the note carries the reason the fresh iteration moves on, and the recording turn can record tasks for it). After calling it, stop working; the recording turn follows.',
 		parameters: Type.Object({
 			note: Type.String({
 				description:
@@ -1844,13 +1873,13 @@ export default function (pi: ExtensionAPI) {
 			reload: Type.Optional(
 				Type.Boolean({
 					description:
-						'Reload extensions, skills, prompts, and themes at the rotation boundary (after the context cut, before the fresh iteration starts). Use after changing or adding extension code — new tools and commands are available in the fresh iteration.'
+						'Reload extensions, skills, prompts, and themes at the cycle boundary (after the context cut, before the fresh iteration starts). Use after changing or adding extension code — new tools and commands are available in the fresh iteration.'
 				})
 			)
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const note = params.note.trim();
-			if (!note) throw new Error('A rotation note is required: why the fresh iteration is requested.');
+			if (!note) throw new Error('A cycle note is required: why the fresh iteration is requested.');
 			const reload = params.reload === true;
 			if (!state?.enabled) {
 				// No active loop: fail — except the auto-mode case. Auto mode "on"
@@ -1861,7 +1890,7 @@ export default function (pi: ExtensionAPI) {
 				if (config.autoMode !== 'on') {
 					throw new Error('No active Ralph loop — start one with /ralph start.');
 				}
-				// No open-task requirement: the rotation note carries the reason
+				// No open-task requirement: the cycle note carries the reason
 				// the fresh iteration should move on (e.g. verifying a new
 				// extension), and the recording turn can record tasks for it.
 				// A corrupt or non-ralph backlog is surfaced by arming (it fails
@@ -1870,20 +1899,20 @@ export default function (pi: ExtensionAPI) {
 				if (!armed) throw new Error('Could not arm the Ralph auto loop.');
 			}
 			if (!state) throw new Error('No active Ralph loop — start one with /ralph start.');
-			if (state.rotationQueued) throw new Error('A rotation is already pending; it runs when the current turn ends.');
-			if (state.stopRequested) throw new Error('The loop is stopping after the current iteration; stop working instead of rotating.');
+			if (state.cycleQueued) throw new Error('A cycle is already pending; it runs when the current turn ends.');
+			if (state.stopRequested) throw new Error('The loop is stopping after the current iteration; stop working instead of cycling.');
 			const lastIteration = state.iteration + 1 > state.maxIterations;
-			// The note and the reload flag ride on the state the rotation persists:
-			// queueRotation spreads the current state into its rotation entry.
-			persistState({ ...state, rotationNote: note, reloadRequested: reload });
-			queueRotation(ctx, 'model-requested');
+			// The note and the reload flag ride on the state the cycle persists:
+			// queueCycle spreads the current state into its cycle entry.
+			persistState({ ...state, cycleNote: note, reloadRequested: reload });
+			queueCycle(ctx, 'model-requested');
 			updateStatus(ctx);
-			ctx.ui.notify(`Ralph rotation requested: ${note}`, 'info');
+			ctx.ui.notify(`Ralph cycle requested: ${note}`, 'info');
 			return {
 				content: [
 					{
 						type: 'text',
-						text: `Rotation queued${reload ? ' (extensions reload at the boundary, after the context cut)' : ''}. Stop working now; the progress-recording turn follows.${lastIteration ? ' This is the final iteration: the loop stops after the rotation.' : ''}`
+						text: `Cycle queued${reload ? ' (extensions reload at the boundary, after the context cut)' : ''}. Stop working now; the progress-recording turn follows.${lastIteration ? ' This is the final iteration: the loop stops after the cycle.' : ''}`
 					}
 				],
 				details: { note, reload }
@@ -2139,7 +2168,7 @@ export default function (pi: ExtensionAPI) {
 							recorded = true;
 						}
 						output = state?.enabled
-							? state.rotateOn === 'task'
+							? state.cycleOn === 'task'
 								? `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}. Stop working now — the iteration is finished; the loop records the completion and starts a fresh iteration.`
 								: `Marked task ${number} "${task.title}" done${recorded ? ' and recorded the completion log entry' : ''}. Continue with the next open task.${armedNote}`
 							: `Marked task ${number} "${task.title}" done in ${todoPath}${recorded ? ' and recorded the completion log entry' : ''}.${armedNote}`;
@@ -2479,9 +2508,9 @@ export default function (pi: ExtensionAPI) {
 	const startFreshIteration = (ctx: ExtensionContext) => {
 		void (async () => {
 			if (!state?.enabled) return;
-			const reason = state.rotationReason ?? 'completed-task';
+			const reason = state.cycleReason ?? 'completed-task';
 		try {
-				// The rotation logic compares text snapshots; render the on-disk
+				// The cycle logic compares text snapshots; render the on-disk
 				// backlog (SQLite file) into that form.
 				const currentTodo = Backlog.open(state.todoPath).render();
 				// Goal mode is done when the goal is done, not when the plan is
@@ -2505,14 +2534,14 @@ export default function (pi: ExtensionAPI) {
 					iteration: state.iteration + 1,
 					taskIteration: taskChanged ? 1 : state.taskIteration + 1,
 					taskNumber: currentTaskNumber(taskCount.current),
-					rotationQueued: false,
-					rotationReason: undefined,
-					rotationCheckpointing: false,
-					// The reload (if any) is dispatched at this rotation boundary;
-					// the flag must not leak into a later, unrelated rotation.
-					// (rotationNote is kept: it is descriptive, only read while the
+					cycleQueued: false,
+					cycleReason: undefined,
+					cycleCheckpointing: false,
+					// The reload (if any) is dispatched at this cycle boundary;
+					// the flag must not leak into a later, unrelated cycle.
+					// (cycleNote is kept: it is descriptive, only read while the
 					// model-requested reason is active, and overwritten by the next
-					// model-requested rotation.)
+					// model-requested cycle.)
 					reloadRequested: undefined
 				};
 				if (next.iteration > next.maxIterations) {
@@ -2538,7 +2567,7 @@ export default function (pi: ExtensionAPI) {
 				freshIterationPending = true;
 				updateStatus(ctx);
 				const completion = completionSummary(currentTodo, state.loopStartTodo, next.category);
-				const finishRotation = () => {
+				const finishCycle = () => {
 					// A pause/stop/blocked decision that landed while the compaction
 					// ran must not start a new turn; the resume/stop flow continues.
 					if (!state?.enabled || state.paused || state.blocked) return;
@@ -2562,7 +2591,7 @@ export default function (pi: ExtensionAPI) {
 					pi.sendUserMessage(iterationPrompt(next, reason), { deliverAs: 'followUp' });
 				};
 				if (!config.compactionMode) {
-					finishRotation();
+					finishCycle();
 					return;
 				}
 				const anchor = ctx.sessionManager
@@ -2575,7 +2604,7 @@ export default function (pi: ExtensionAPI) {
 					anchorId: anchor?.id
 				};
 				ctx.compact({
-					onComplete: finishRotation,
+					onComplete: finishCycle,
 					onError: (error) => {
 						// Clear the pending compaction: the hook only consumes it when
 						// pi actually runs the compaction, so a gate failure ("Nothing
@@ -2589,7 +2618,7 @@ export default function (pi: ExtensionAPI) {
 						// proceed without the TUI clear: the boundary marker still
 						// keeps the model context clean.
 						if (/abort|cancel/i.test(error.message)) {
-							ctx.ui.notify('Ralph rotation compaction was aborted; the loop continues on the next settle.', 'warning');
+							ctx.ui.notify('Ralph cycle compaction was aborted; the loop continues on the next settle.', 'warning');
 							return;
 						}
 						// The iteration was too small to compact and stays visible in
@@ -2598,11 +2627,11 @@ export default function (pi: ExtensionAPI) {
 						if (!compactionGateNotified && /nothing to compact/i.test(error.message)) {
 							compactionGateNotified = true;
 							ctx.ui.notify(
-								'Ralph rotation compaction was skipped: the finished iteration is smaller than pi\'s compaction.keepRecentTokens and stays visible in the TUI. Set "compaction": { "keepRecentTokens": 1000 } in settings.json to hide every rotation.',
+								'Ralph cycle compaction was skipped: the finished iteration is smaller than pi\'s compaction.keepRecentTokens and stays visible in the TUI. Set "compaction": { "keepRecentTokens": 1000 } in settings.json to hide every cycle.',
 								'warning'
 							);
 						}
-						finishRotation();
+						finishCycle();
 					}
 				});
 			} catch (error) {
@@ -2610,9 +2639,9 @@ export default function (pi: ExtensionAPI) {
 				if (state) {
 					persistState({
 						...state,
-						rotationQueued: false,
-						rotationReason: undefined,
-						rotationCheckpointing: false
+						cycleQueued: false,
+						cycleReason: undefined,
+						cycleCheckpointing: false
 					});
 				}
 				updateStatus(ctx);
@@ -2664,15 +2693,15 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				contextThreshold: contextThresholdFor(config, ctx),
 				autoApproveDecisions: config.autoApproveDecisions,
-				rotationQueued: false,
-				rotationReason: undefined,
-				rotationCheckpointing: false,
+				cycleQueued: false,
+				cycleReason: undefined,
+				cycleCheckpointing: false,
 				stopRequested: false,
 				paused: false,
 				blocked: false,
 				blockedItem: undefined,
 				mode: 'auto',
-				rotateOn: rotateOnFor('auto', config),
+				cycleOn: cycleOnFor('auto', config),
 				category
 			};
 			persistState(next);
@@ -2809,15 +2838,15 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				contextThreshold: contextThresholdFor(config, ctx),
 				autoApproveDecisions: config.autoApproveDecisions,
-				rotationQueued: false,
-				rotationReason: undefined,
-				rotationCheckpointing: false,
+				cycleQueued: false,
+				cycleReason: undefined,
+				cycleCheckpointing: false,
 				stopRequested: false,
 				paused: false,
 				blocked: false,
 				blockedItem: undefined,
 				mode: goal ? 'goal' : 'tasks',
-				rotateOn: rotateOnFor(goal ? 'goal' : 'tasks', config),
+				cycleOn: cycleOnFor(goal ? 'goal' : 'tasks', config),
 				category
 			};
 			persistState(next);
@@ -2836,7 +2865,7 @@ export default function (pi: ExtensionAPI) {
 
 	const sendRecordingPrompt = (ctx: ExtensionContext, options?: { midTurn?: boolean }) => {
 		if (!state) return;
-		// Every rotation first records progress in a dedicated turn. That
+		// Every cycle first records progress in a dedicated turn. That
 		// turn's settled event starts the clean context that continues from the
 		// recorded state instead of the old conversation.
 		const prompt = recordingPromptFor(state);
@@ -2846,14 +2875,14 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
 	};
 
-	const queueRotation = (
+	const queueCycle = (
 		ctx: ExtensionContext,
-		reason: RotationReason,
+		reason: CycleReason,
 		options?: { midTurn?: boolean; currentTodo?: string }
 	) => {
-		if (!state?.enabled || state.rotationQueued) return;
+		if (!state?.enabled || state.cycleQueued) return;
 
-		// For completed-task rotations, name the completed task(s) in the
+		// For completed-task cycles, name the completed task(s) in the
 		// recording prompt instead of making the model re-read the backlog to
 		// find them: completion timestamps (with the baseline diff for records
 		// without one) already identify them.
@@ -2864,14 +2893,14 @@ export default function (pi: ExtensionAPI) {
 
 		persistState({
 			...state,
-			rotationQueued: true,
-			rotationReason: reason,
-			rotationCheckpointing: true,
+			cycleQueued: true,
+			cycleReason: reason,
+			cycleCheckpointing: true,
 			completedTasks
 		});
 		updateStatus(ctx);
 
-		// Every rotation first records progress in a dedicated turn — a durable
+		// Every cycle first records progress in a dedicated turn — a durable
 		// TODO checkpoint for context-limit, a completion record plus local commit
 		// for completed-task. That turn's settled event starts the clean context
 		// that continues from the recorded state instead of the old conversation.
@@ -2937,7 +2966,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: state.maxIterations,
 				compactionMode: DEFAULT_COMPACTION_MODE,
 				autoMode: DEFAULT_AUTO_MODE,
-				rotateOn: { ...DEFAULT_ROTATE_ON }
+				cycleOn: { ...DEFAULT_CYCLE_ON }
 			};
 		}
 
@@ -3033,18 +3062,18 @@ export default function (pi: ExtensionAPI) {
 			const fraction = contextUsageFraction(ctx);
 			if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
 				const next = await setupAutoLoop(ctx);
-				if (next) queueRotation(ctx, 'context-limit');
+				if (next) queueCycle(ctx, 'context-limit');
 			}
 		}
-		// A model-requested rotation with reload: the recording turn ran in the
+		// A model-requested cycle with reload: the recording turn ran in the
 		// pre-reload instance, which dispatched /ralph reload instead of starting
-		// the fresh iteration (durable marker: rotationQueued without
-		// rotationCheckpointing). Continue the rotation on the reloaded code: the
+		// the fresh iteration (durable marker: cycleQueued without
+		// cycleCheckpointing). Continue the cycle on the reloaded code: the
 		// compaction (when enabled) and the fresh iteration now run with the new
 		// extension code, and the context is cut before the first post-reload
 		// request, so the reload never re-sends the finished iteration's long
 		// context.
-		if (state?.enabled && state.rotationQueued && !state.rotationCheckpointing) {
+		if (state?.enabled && state.cycleQueued && !state.cycleCheckpointing) {
 			startFreshIteration(ctx);
 		}
 		updateStatus(ctx);
@@ -3070,12 +3099,12 @@ export default function (pi: ExtensionAPI) {
 			state?.enabled &&
 			!state.blocked &&
 			!state.paused &&
-			!state.rotationQueued &&
+			!state.cycleQueued &&
 			!turnStartedOverBudget
 		) {
 			const fraction = contextUsageFraction(ctx);
 			if (fraction !== undefined && fraction >= state.contextThreshold) {
-				queueRotation(ctx, 'context-limit', { midTurn: true });
+				queueCycle(ctx, 'context-limit', { midTurn: true });
 			}
 		} else if (!state?.enabled && config.autoMode === 'on' && !autoInterceptSuspended && !turnStartedOverBudget) {
 			// Auto mode intercepts a plain session at its context budget: arm
@@ -3084,7 +3113,7 @@ export default function (pi: ExtensionAPI) {
 			const fraction = contextUsageFraction(ctx);
 			if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
 				void armAutoLoop(ctx).then((armed) => {
-					if (armed) queueRotation(ctx, 'context-limit', { midTurn: true });
+					if (armed) queueCycle(ctx, 'context-limit', { midTurn: true });
 				});
 			}
 		}
@@ -3133,7 +3162,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Record whether the turn started already over budget so the mid-turn steer
-	// cannot re-trigger immediately after a rotation whose reported usage has
+	// cannot re-trigger immediately after a cycle whose reported usage has
 	// not caught up with the fresh (filtered) context yet.
 	pi.on('agent_start', (_event, ctx) => {
 		lastAssistantStopReason = undefined;
@@ -3165,10 +3194,10 @@ export default function (pi: ExtensionAPI) {
 		if (boundaryIndex >= 0) return { messages: event.messages.slice(boundaryIndex + 1) };
 	});
 
-	// Ralph-provided compaction: when a rotation is in flight, supply the
+	// Ralph-provided compaction: when a cycle is in flight, supply the
 	// compaction result ourselves — pi records the entry, re-renders the TUI
 	// from the cut point, and makes NO LLM call. User-initiated and automatic
-	// compactions (no pending rotation) fall through to pi's default behaviour.
+	// compactions (no pending cycle) fall through to pi's default behaviour.
 	pi.on('session_before_compact', (event) => {
 		if (!pendingRalphCompaction) return;
 		const { summary, anchorId } = pendingRalphCompaction;
@@ -3200,7 +3229,7 @@ export default function (pi: ExtensionAPI) {
 		if (state.paused) {
 			persistState({ ...state, paused: false });
 			updateStatus(ctx);
-			if (state.rotationQueued && state.rotationCheckpointing) {
+			if (state.cycleQueued && state.cycleCheckpointing) {
 				// The progress-recording turn was interrupted: re-run it, carrying
 				// the user's extra info into the recorded state.
 				return {
@@ -3208,7 +3237,7 @@ export default function (pi: ExtensionAPI) {
 							text: `${recordingPromptFor(state)}\n\n${renderPrompt('recording-extra-info', { extraInfo: event.text })}`
 				};
 			}
-			// No rotation was pending: continue the interrupted iteration with
+			// No cycle was pending: continue the interrupted iteration with
 			// the user's extra info.
 			return {
 				action: 'transform',
@@ -3221,8 +3250,8 @@ export default function (pi: ExtensionAPI) {
 		freshIterationPending = false;
 		if (state?.blocked) return;
 		// An aborted run means the user pressed Escape: pause the loop
-		// immediately, always — even mid-rotation. Continuing (re-sending the
-		// recording prompt, queueing a rotation, or starting a fresh iteration)
+		// immediately, always — even mid-cycle. Continuing (re-sending the
+		// recording prompt, queueing a cycle, or starting a fresh iteration)
 		// would begin a new turn the user just tried to end. The runSignal /
 		// runSawAssistantMessage / runAbortedByUser guards catch aborts that land
 		// in gaps where no 'aborted' assistant message is produced (before the
@@ -3232,18 +3261,18 @@ export default function (pi: ExtensionAPI) {
 			lastAssistantStopReason === 'aborted' || runAbortedByUser || !runSawAssistantMessage || runSignal?.aborted === true;
 		if (!state?.enabled) {
 			// Auto mode intercepts a plain session at its context budget: arm
-			// the auto loop and run the finish-up (todo recording) rotation.
+			// the auto loop and run the finish-up (todo recording) cycle.
 			// An aborted run never arms — the user just tried to end the turn.
 			if (config.autoMode === 'on' && !autoInterceptSuspended && !userAborted) {
 				const fraction = contextUsageFraction(ctx);
 				if (fraction !== undefined && fraction >= contextThresholdFor(config, ctx)) {
 					const armed = await armAutoLoop(ctx);
-					if (armed) queueRotation(ctx, 'context-limit');
+					if (armed) queueCycle(ctx, 'context-limit');
 				}
 			}
 			return;
 		}
-		// A paused loop stays paused: settles must not queue rotations or fresh
+		// A paused loop stays paused: settles must not queue cycles or fresh
 		// iterations (a typed message resumes the loop before its turn runs).
 		if (state.paused) return;
 		if (userAborted) {
@@ -3254,16 +3283,16 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
-		if (state.rotationQueued) {
+		if (state.cycleQueued) {
 			// The progress-recording turn (context checkpoint or completion record)
 			// is an intentionally separate, docs-only turn. Once it settles, start
 			// the fresh iteration from that durable state rather than compacting or
 			// retaining the old conversation — unless a stop was requested, in which
 			// case the recorded progress is the last thing the loop does. Without
-			// this check a stop requested while a rotation was pending would be
+			// this check a stop requested while a cycle was pending would be
 			// ignored: the fresh iteration would carry stopRequested over and the
-			// loop would auto-rotate forever.
-			if (state.rotationCheckpointing) {
+			// loop would auto-cycle forever.
+			if (state.cycleCheckpointing) {
 				if (state.stopRequested) {
 					stopLoop(ctx, 'Ralph loop stopped after recording progress');
 				} else if (state.reloadRequested) {
@@ -3271,29 +3300,29 @@ export default function (pi: ExtensionAPI) {
 					// fresh iteration must start on the RELOADED code with the cut
 					// context — reloading now would pay the finished iteration's
 					// long context with a cold prefix. Persist the durable
-					// "recording done, iteration pending" marker (rotationQueued
-					// without rotationCheckpointing) and dispatch the reload command
+					// "recording done, iteration pending" marker (cycleQueued
+					// without cycleCheckpointing) and dispatch the reload command
 					// (the session is idle at settle, so it runs now): the reloaded
-					// instance's session_start continues the rotation (compaction +
+					// instance's session_start continues the cycle (compaction +
 					// fresh iteration) on the new code. Treat the reload as terminal:
 					// this instance is stale after it.
-					persistState({ ...state, rotationCheckpointing: false });
+					persistState({ ...state, cycleCheckpointing: false });
 					await pi.sendUserMessage('/ralph reload', { expandPromptTemplates: true });
 				} else {
-					persistState({ ...state, rotationCheckpointing: false });
+					persistState({ ...state, cycleCheckpointing: false });
 					startFreshIteration(ctx);
 				}
 			} else {
 				// "Iteration pending" without a checkpoint: the reload dispatch was
 				// a no-op (e.g. a bare SDK session without a bound reload action)
-				// and no reloaded session_start will continue the rotation —
+				// and no reloaded session_start will continue the cycle —
 				// continue it on the current code instead of stalling.
 				startFreshIteration(ctx);
 			}
 			return;
 		}
 		if (state.stopRequested) {
-			// Stopping still honors the current iteration's rotation boundary:
+			// Stopping still honors the current iteration's cycle boundary:
 			// a just-completed task gets its completion record + local commit, and
 			// an over-budget context gets a durable checkpoint, before the loop
 			// ends. Otherwise progress would be lost with the old conversation.
@@ -3307,19 +3336,19 @@ export default function (pi: ExtensionAPI) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				if (state.rotateOn === 'task' && hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state))) {
-					queueRotation(ctx, 'completed-task', { currentTodo });
+				if (state.cycleOn === 'task' && hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state))) {
+					queueCycle(ctx, 'completed-task', { currentTodo });
 					return;
 				}
 				// Goal mode: a grown plan (task policy) or a phase change (budget
 				// policy) is a progress boundary too — the plan update gets its
 				// commit before the loop ends.
-				if (state.mode === 'goal' && state.rotateOn === 'task' && planGrew(state.baselineTodo, currentTodo, state.category)) {
-					queueRotation(ctx, 'plan-updated');
+				if (state.mode === 'goal' && state.cycleOn === 'task' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+					queueCycle(ctx, 'plan-updated');
 					return;
 				}
-				if (state.mode === 'goal' && state.rotateOn === 'budget' && goalPhaseChanged(state.baselineTodo, currentTodo, state.category)) {
-					queueRotation(ctx, 'phase-changed');
+				if (state.mode === 'goal' && state.cycleOn === 'budget' && goalPhaseChanged(state.baselineTodo, currentTodo, state.category)) {
+					queueCycle(ctx, 'phase-changed');
 					return;
 				}
 			} catch (error) {
@@ -3329,7 +3358,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const contextFraction = contextUsageFraction(ctx);
 			if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
-				queueRotation(ctx, 'context-limit');
+				queueCycle(ctx, 'context-limit');
 				return;
 			}
 			stopLoop(ctx, 'Ralph loop stopped after the current iteration');
@@ -3355,43 +3384,43 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Rotation per the loop's policy (rotateOn, resolved at loop start).
+			// Cycle per the loop's policy (cycleOn, resolved at loop start).
 			// Under "task", completing an item is a hard context boundary: it must
-			// win over the proactive threshold check below, because each rotation
+			// win over the proactive threshold check below, because each cycle
 			// inserts a marker that removes preceding turns from model context,
 		// while context-limit first records the finish-up. Under "budget",
 		// completions are progress, not a boundary (the nudge below keeps the
 		// loop moving).
-			if (state.rotateOn === 'task' && hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state))) {
+			if (state.cycleOn === 'task' && hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state))) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
 				}
-				queueRotation(ctx, 'completed-task', { currentTodo });
+				queueCycle(ctx, 'completed-task', { currentTodo });
 				return;
 			}
 
 			// Goal mode: under "task" a grown plan (new open tasks, no
-			// completions) is a progress boundary that rotates with a checkpoint-only
+			// completions) is a progress boundary that cycles with a checkpoint-only
 			// recording turn; under "budget" the model keeps working on the new
 			// tasks in the same iteration, and only a phase change (planning →
-			// execution → re-evaluation) rotates — without it a finished plan with
+			// execution → re-evaluation) cycles — without it a finished plan with
 			// context headroom would never reach the re-evaluation prompt and the
 			// loop would stall.
-			if (state.mode === 'goal' && state.rotateOn === 'task' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+			if (state.mode === 'goal' && state.cycleOn === 'task' && planGrew(state.baselineTodo, currentTodo, state.category)) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
 				}
-				queueRotation(ctx, 'plan-updated');
+				queueCycle(ctx, 'plan-updated');
 				return;
 			}
-			if (state.mode === 'goal' && state.rotateOn === 'budget' && goalPhaseChanged(state.baselineTodo, currentTodo, state.category)) {
+			if (state.mode === 'goal' && state.cycleOn === 'budget' && goalPhaseChanged(state.baselineTodo, currentTodo, state.category)) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
 				}
-				queueRotation(ctx, 'phase-changed');
+				queueCycle(ctx, 'phase-changed');
 				return;
 			}
 
@@ -3400,7 +3429,7 @@ export default function (pi: ExtensionAPI) {
 			// checkpoint followed by a fresh model context.
 			const contextFraction = contextUsageFraction(ctx);
 			if (contextFraction !== undefined && contextFraction >= state.contextThreshold) {
-				queueRotation(ctx, 'context-limit');
+				queueCycle(ctx, 'context-limit');
 				return;
 			}
 
@@ -3409,12 +3438,12 @@ export default function (pi: ExtensionAPI) {
 			// task or growing the plan — e.g. a deliberately never-completing task
 			// ("re-test loop, run until stopped"). The other triggers (completion,
 			// plan growth, context budget) never fire for a permanent task, so
-			// without this rotation the loop would idle forever. Queue a rotation
+			// without this cycle the loop would idle forever. Queue a cycle
 			// so the goal keeps iterating. Only a clean 'stop' qualifies: an
 			// errored or truncated run is left for the user to inspect.
 			if (
 				state.mode === 'goal' &&
-				state.rotateOn === 'task' &&
+				state.cycleOn === 'task' &&
 				lastAssistantStopReason === 'stop' &&
 				goalStatus(currentTodo) === 'open' &&
 				openWorkTaskCount(currentTodo, countCategory(state)) > 0
@@ -3423,15 +3452,15 @@ export default function (pi: ExtensionAPI) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
 				}
-				queueRotation(ctx, 'iteration-ended');
+				queueCycle(ctx, 'iteration-ended');
 				return;
 			}
 
-			// A budget-rotating loop must not idle after a completion — start the
+			// A budget-cycling loop must not idle after a completion — start the
 			// next open work task instead of waiting for the user to type
 			// "continue".
 			if (
-				state.rotateOn === 'budget' &&
+				state.cycleOn === 'budget' &&
 				hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state)) &&
 				openWorkTaskCount(currentTodo, countCategory(state)) > 0
 			) {
@@ -3441,7 +3470,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Goal mode: a turn that made no progress — the goal is still open, no
 			// task is open, nothing was completed, and the plan did not grow — and
-			// did not rotate (under budget) is a stall. Stop with a clear notice
+			// did not cycle (under budget) is a stall. Stop with a clear notice
 			// instead of looping on an empty plan.
 			if (
 				state.mode === 'goal' &&
@@ -3496,11 +3525,11 @@ export default function (pi: ExtensionAPI) {
 								: 'disabled'
 						: id === 'autoMode'
 							? cfg.autoMode
-							: id === 'rotateOnTasks'
-								? cfg.rotateOn.tasks
-								: id === 'rotateOnGoal'
-									? cfg.rotateOn.goal
-									: cfg.rotateOn.auto;
+							: id === 'cycleOnTasks'
+								? cfg.cycleOn.tasks
+								: id === 'cycleOnGoal'
+									? cfg.cycleOn.goal
+									: cfg.cycleOn.auto;
 		const applySetting = (cfg: RalphConfig, id: string, value: string): RalphConfig =>
 			id === 'contextThreshold'
 				? {
@@ -3516,12 +3545,12 @@ export default function (pi: ExtensionAPI) {
 						? { ...cfg, compactionMode: value === 'enabled' }
 					: id === 'autoMode'
 							? { ...cfg, autoMode: value as AutoMode }
-							: id === 'rotateOnTasks'
-								? { ...cfg, rotateOn: { ...cfg.rotateOn, tasks: value as RotateOnPolicy } }
-								: id === 'rotateOnGoal'
-									? { ...cfg, rotateOn: { ...cfg.rotateOn, goal: value as RotateOnPolicy } }
-									: id === 'rotateOnAuto'
-										? { ...cfg, rotateOn: { ...cfg.rotateOn, auto: value as RotateOnPolicy } }
+							: id === 'cycleOnTasks'
+								? { ...cfg, cycleOn: { ...cfg.cycleOn, tasks: value as CycleOnPolicy } }
+								: id === 'cycleOnGoal'
+									? { ...cfg, cycleOn: { ...cfg.cycleOn, goal: value as CycleOnPolicy } }
+									: id === 'cycleOnAuto'
+										? { ...cfg, cycleOn: { ...cfg.cycleOn, auto: value as CycleOnPolicy } }
 									: { ...cfg, autoApproveDecisions: value === 'enabled' };
 		const savedDescription = (id: string, next: RalphConfig): string =>
 			id === 'contextThreshold'
@@ -3532,12 +3561,12 @@ export default function (pi: ExtensionAPI) {
 						? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
 				: id === 'autoMode'
 						? `auto mode ${next.autoMode}`
-					: id === 'rotateOnTasks'
-						? `rotation (task loop) ${next.rotateOn.tasks}`
-					: id === 'rotateOnGoal'
-						? `rotation (goal loop) ${next.rotateOn.goal}`
-					: id === 'rotateOnAuto'
-						? `rotation (auto loop) ${next.rotateOn.auto}`
+					: id === 'cycleOnTasks'
+						? `cycle (task loop) ${next.cycleOn.tasks}`
+					: id === 'cycleOnGoal'
+						? `cycle (goal loop) ${next.cycleOn.goal}`
+					: id === 'cycleOnAuto'
+						? `cycle (auto loop) ${next.cycleOn.auto}`
 						: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
 
 		const items: SettingItem[] = [
@@ -3593,7 +3622,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'compactionMode',
 				label: 'Compaction mode',
 				description:
-					'Hide each finished iteration from the TUI when the loop rotates: an extension-provided compaction (no LLM call) cuts the session at the recording prompt and shows the completion summary in the compaction box. Off: finished iterations stay visible.',
+					'Hide each finished iteration from the TUI when the loop cycles: an extension-provided compaction (no LLM call) cuts the session at the recording prompt and shows the completion summary in the compaction box. Off: finished iterations stay visible.',
 				currentValue: config.compactionMode ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
 			},
@@ -3608,32 +3637,32 @@ export default function (pi: ExtensionAPI) {
 				id: 'autoMode',
 				label: 'Auto mode',
 				description:
-					`The auto loop stores its state in a per-session file in the ralph directory of pi's global agent directory (<session-id>.db) with an auto-created session category, rotates per the rotation policy (default: the context budget — the model finishes up and records todos for the next iteration), and uses the ralph_todo tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session) or on the first ralph_todo add/complete on the session backlog. /ralph start begins the auto loop immediately with an iteration prompt unless the mode is off (an explicit --goal start is unaffected).`,
+					`The auto loop stores its state in a per-session file in the ralph directory of pi's global agent directory (<session-id>.db) with an auto-created session category, cycles per the cycle policy (default: the context budget — the model finishes up and records todos for the next iteration), and uses the ralph_todo tool. off: nothing automatic. on: the loop arms itself when the context crosses the budget (at session start or mid-session) or on the first ralph_todo add/complete on the session backlog. /ralph start begins the auto loop immediately with an iteration prompt unless the mode is off (an explicit --goal start is unaffected).`,
 				currentValue: config.autoMode,
 				values: ['off', 'on']
 			},
 			{
-				id: 'rotateOnTasks',
-				label: 'Rotation: task loop',
+				id: 'cycleOnTasks',
+				label: 'Cycle: task loop',
 				description:
 					'When a fresh iteration starts for the task loop: task — after every completed task (planned, feature-sized backlogs); budget — only at the context budget, working task after task (fine-grained rolling handoff todos). Applies to loops started after the change.',
-				currentValue: config.rotateOn.tasks,
+				currentValue: config.cycleOn.tasks,
 				values: ['task', 'budget']
 			},
 			{
-				id: 'rotateOnGoal',
-				label: 'Rotation: goal loop',
+				id: 'cycleOnGoal',
+				label: 'Cycle: goal loop',
 				description:
 					'When a fresh iteration starts for the goal loop: task — after every completed task (and on plan growth); budget — only at the context budget (plus goal phase changes). Applies to loops started after the change.',
-				currentValue: config.rotateOn.goal,
+				currentValue: config.cycleOn.goal,
 				values: ['task', 'budget']
 			},
 			{
-				id: 'rotateOnAuto',
-				label: 'Rotation: auto loop',
+				id: 'cycleOnAuto',
+				label: 'Cycle: auto loop',
 				description:
 					'When a fresh iteration starts for the auto loop: task — after every completed task; budget — only at the context budget, working task after task. Applies to loops started after the change.',
-				currentValue: config.rotateOn.auto,
+				currentValue: config.cycleOn.auto,
 				values: ['task', 'budget']
 			}
 		];
@@ -3885,10 +3914,10 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into the session\'s ralph file, merging into an existing backlog. Each source file is only imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
-			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the rotation/finish-up boundary.' },
-			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested rotation continues on the reloaded code.' },
+			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
+			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested cycle continues on the reloaded code.' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
-				{ value: 'config', label: 'config', description: 'Configure Ralph settings (fresh-context threshold, max iterations, compaction, decision approval, auto mode, rotation policy). The "Save to" row switches the scope: this directory (branch) or the global defaults (the general settings for directories without their own setting).' }
+				{ value: 'config', label: 'config', description: 'Configure Ralph settings (fresh-context threshold, max iterations, compaction, decision approval, auto mode, cycle policy). The "Save to" row switches the scope: this directory (branch) or the global defaults (the general settings for directories without their own setting).' }
 			];
 			const matches = options.filter((option) => option.value.startsWith(prefix.toLowerCase()));
 			return matches.length > 0 ? matches : null;
@@ -3911,8 +3940,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (stopArgs[0] === '--force') {
 					// Force stop: end the loop immediately instead of waiting for the
-					// iteration/rotation boundary — abort the in-flight run (iteration,
-					// recording turn, or compaction) and drop the pending rotation.
+					// iteration/cycle boundary — abort the in-flight run (iteration,
+					// recording turn, or compaction) and drop the pending cycle.
 					// Progress since the last recording turn is not recorded; the
 					// durable state is the backlog and the repository.
 					if (!ctx.isIdle()) ctx.abort();
@@ -3927,11 +3956,11 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				// A checkpoint/fresh-context rotation can be queued after the prior agent
+				// A checkpoint/fresh-context cycle can be queued after the prior agent
 				// turn settles, so Pi can report idle despite Ralph having a continuation
-				// pending. Treat that queued rotation as part of the current iteration and
+				// pending. Treat that queued cycle as part of the current iteration and
 				// stop at the next agent_settled event.
-				if (ctx.isIdle() && !state.rotationQueued) {
+				if (ctx.isIdle() && !state.cycleQueued) {
 					stopLoop(ctx, 'Ralph loop stopped');
 				} else {
 					persistState({ ...state, stopRequested: true });
@@ -3954,19 +3983,19 @@ export default function (pi: ExtensionAPI) {
 							? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
 							: state.paused
 								? `${loopName} is paused — type a message to resume it with extra info`
-				: state.rotationCheckpointing
-					? state.rotationReason === 'completed-task'
+				: state.cycleCheckpointing
+					? state.cycleReason === 'completed-task'
 						? `${loopName} is recording the completed task’s progress`
-						: state.rotationReason === 'plan-updated'
+						: state.cycleReason === 'plan-updated'
 							? `${loopName} is committing the updated plan`
-							: state.rotationReason === 'phase-changed'
+							: state.cycleReason === 'phase-changed'
 								? `${loopName} is finishing up after the goal phase change`
-								: state.rotationReason === 'model-requested'
+								: state.cycleReason === 'model-requested'
 								? `${loopName} is finishing up before the requested fresh iteration`
 								: `${loopName} is finishing up and recording todos for the next iteration`
 									: state.stopRequested
 										? `${loopName} will stop after the current iteration`
-										: state.rotationQueued
+										: state.cycleQueued
 											? `${loopName} is starting a fresh iteration`
 											: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}`,
 					'info'
@@ -3996,7 +4025,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === 'reload') {
 				// The reload entrypoint: manual use and the queued reload of a
-				// model-requested rotation (ralph_rotate with reload: true). ctx.reload()
+				// model-requested cycle (ralph_cycle with reload: true). ctx.reload()
 				// runs the /reload flow (session_shutdown, extension/resource reload,
 				// session_start with reason "reload"); the loop state is restored from
 				// the session entries. Treat the reload as terminal — code after it

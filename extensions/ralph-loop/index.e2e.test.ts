@@ -22,10 +22,10 @@ import { join, resolve } from 'node:path';
  * Note on trigger semantics: the extension evaluates the context threshold on
  * `message_update` (mid-turn — it steers the finish-up into the running turn)
  * and on `agent_settled` (end of turn — it queues the finish-up as a follow-up).
- * Every rotation first runs a dedicated progress-recording turn (finish-up
+ * Every cycle first runs a dedicated progress-recording turn (finish-up
  * or completion record) before the fresh iteration starts. An
  * aborted run (Escape) always pauses the loop immediately — no re-sent
- * recording prompt, no queued rotation, no fresh iteration — until the next
+ * recording prompt, no queued cycle, no fresh iteration — until the next
  * typed user message resumes it (as extra info for the loop).
  */
 
@@ -456,7 +456,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'rotation: the finished iteration is compacted out of the TUI context; the fresh iteration\'s model context drops the completion summary',
+		'cycle: the finished iteration is compacted out of the TUI context; the fresh iteration\'s model context drops the completion summary',
 		{ timeout: 60000 },
 		async () => {
 			const todoPath = join(agentDir, 'ralph', 'e2e-session.db');
@@ -487,7 +487,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
 			expect(Backlog.open(todoPath).listTasks()[0]?.done).toBe(true);
 
-			// The recording turn runs, then the rotation compacts the finished
+			// The recording turn runs, then the cycle compacts the finished
 			// iteration (extension-provided: no LLM call) and starts the fresh one.
 			await waitFor(() => endpoint!.requests.length >= 4, 30000);
 
@@ -573,7 +573,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		async () => {
 			const scratchPath = join(projectDir, 'scratch.txt');
 			const endlessWork = writeToolCallResponder(scratchPath, 'more work', { prompt_tokens: 1500, completion_tokens: 800 });
-			// After the resumed rotation, the recording prompt and the fresh
+			// After the resumed cycle, the recording prompt and the fresh
 			// iteration prompt get plain text answers so the session settles.
 			const smartFallback: ScriptedResponder = (body) => {
 				const text = lastUserText(body);
@@ -597,7 +597,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 
 			// Wait until the high-usage response has fully completed (the next
 			// request proves it), then the user presses escape. The turn is
-			// over budget, so without the fix the settle would queue a rotation
+			// over budget, so without the fix the settle would queue a cycle
 			// and start a new turn the user just tried to end.
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
 			const countAtAbort = endpoint!.requests.length;
@@ -615,7 +615,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 
 			// A typed message resumes the loop: a post-abort request is triggered
 			// by the pending recording prompt (mid-turn steer had queued the
-			// rotation) or the resume-continue prompt (no rotation was pending).
+			// cycle) or the resume-continue prompt (no cycle was pending).
 			await sess.prompt('extra info: keep going');
 			await waitFor(
 				() =>
@@ -696,7 +696,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
 			expect(requestText(endpoint!.requests[2]!)).toContain('add-many');
 
-			// The grown plan triggers a plan-updated rotation with a checkpoint-only
+			// The grown plan triggers a plan-updated cycle with a checkpoint-only
 			// recording turn (no completion log: no task was completed).
 			await waitFor(() => endpoint!.requests.length >= 4, 30000);
 			expect(requestText(endpoint!.requests[3]!)).toContain('The Ralph plan was just updated');
@@ -766,7 +766,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'auto mode: context-limit rotation finishes up, then a fresh iteration runs with a clean context',
+		'auto mode: context-limit cycle finishes up, then a fresh iteration runs with a clean context',
 		{ timeout: 60000 },
 		async () => {
 			// The auto mode is a config setting: a plain /ralph start stores its
@@ -812,15 +812,15 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'ralph_rotate with reload: the rotation reloads the extensions at the boundary, after the context cut',
+		'ralph_cycle with reload: the cycle reloads the extensions at the boundary, after the context cut',
 		{ timeout: 60000 },
 		async () => {
 			endpoint = startMockEndpoint([
 				// Iteration 1: the model changes "extension code" and requests a
-				// rotation with a boundary reload.
-				toolCallResponder('ralph_rotate', { note: 'applying extension changes', reload: true }),
+				// cycle with a boundary reload.
+				toolCallResponder('ralph_cycle', { note: 'applying extension changes', reload: true }),
 				// The model reacts to the tool result and ends the turn.
-				textResponder('Rotation queued; stopping now.'),
+				textResponder('Cycle queued; stopping now.'),
 				// The progress-recording turn.
 				textResponder('Finished up; todos recorded.'),
 				// The fresh iteration, running on the reloaded extension code.
@@ -847,7 +847,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 
 			await sess.prompt('/ralph start');
 
-			// Iteration 1: the mock model calls the real ralph_rotate tool.
+			// Iteration 1: the mock model calls the real ralph_cycle tool.
 			await waitFor(() => (endpoint!.requests.length >= 1), 'iteration 1 request');
 			expect(requestText(endpoint!.requests[0]!)).toContain('Run the Ralph loop');
 
@@ -855,7 +855,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// extension then dispatches /ralph reload (the session is idle at
 			// settle), which runs the real reload flow: a new extension runner.
 			await waitFor(() => endpoint!.requests.length >= 2, 30000);
-			expect(requestText(endpoint!.requests[1]!)).toContain('Rotation queued');
+			expect(requestText(endpoint!.requests[1]!)).toContain('Cycle queued');
 
 			// The recording turn runs on the old code…
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
@@ -864,7 +864,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(requestText(recordingRequest)).toContain('Finish up now');
 
 			// …settles, the reload runs, and the RELOADED instance continues the
-			// rotation: the fresh iteration starts on the new extension code with
+			// cycle: the fresh iteration starts on the new extension code with
 			// the context cut at the boundary (the reload never re-sends the
 			// finished iteration's context).
 			await waitFor(() => endpoint!.requests.length >= 4, 30000);

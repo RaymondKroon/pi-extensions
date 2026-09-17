@@ -62,9 +62,9 @@ Ralph decision workflow.
 
 - **One engine, two policies.** `RalphState` gains `mode: 'tasks' | 'goal'`
   (default `'tasks'`; persisted old sessions normalize to it). All shared
-  machinery — context rotation, checkpoints, pause/stop/block, abort
+  machinery — context cycle, checkpoints, pause/stop/block, abort
   detection, decisions, `maxIterations` — stays single-implemented. Only
-  start validation, the done check, rotation triggers, and prompts branch on
+  start validation, the done check, cycle triggers, and prompts branch on
   mode.
 - **The goal lives in the backlog file.** The on-disk format is a SQLite
   database (marker table `ralph_schema(name='ralph', version=1)`); the
@@ -100,16 +100,16 @@ Ralph decision workflow.
 - **Planning vs re-evaluation** (both are "goal open, no open tasks"): zero
   tasks in the backlog = planning iteration; tasks exist but none open =
   re-evaluation iteration.
-- **Rotation triggers (goal mode):** a task completed (existing
-  completed-task rotation), the plan grew (new open task ids in the
-  baseline diff, no completions → `plan-updated` rotation with a
-  commit-only recording turn), or — under `rotateOn: "task"` — the iteration
+- **Cycle triggers (goal mode):** a task completed (existing
+  completed-task cycle), the plan grew (new open task ids in the
+  baseline diff, no completions → `plan-updated` cycle with a
+  commit-only recording turn), or — under `cycleOn: "task"` — the iteration
   ended cleanly (last assistant message `stopReason: "stop"`) with the goal
-  still open and open work tasks remaining → `iteration-ended` rotation with
+  still open and open work tasks remaining → `iteration-ended` cycle with
   a finish-up recording turn. The last trigger covers deliberately
   never-completing tasks ("run until stopped"): without it the loop idles
   forever, because completion, plan growth, and the context budget never
-  fire for a permanent task. An errored or truncated run does not rotate.
+  fire for a permanent task. An errored or truncated run does not cycle.
 - **Stall:** a goal-mode turn that ends with no plan growth, no completion,
   and the goal still open stops the loop with a clear notification.
 - The loop stops when the goal is `done` in the file.
@@ -182,29 +182,29 @@ unrelated changes or secrets.
 - The user has reviewed the home GUI and the approval flow in a real
   session before the work is considered releasable.
 
-## 11. Rotation compaction and completion summaries
+## 11. Cycle compaction and completion summaries
 
 Long runs must not accumulate finished iterations in the TUI or the model
 context. The current iteration stays fully visible and intact everywhere
 (the user watches the agent work). When an iteration finishes and the loop
-rotates, the finished iteration is hidden from the TUI and the model context
+cycles, the finished iteration is hidden from the TUI and the model context
 in one deterministic step — when **compaction mode** is enabled (config
 `compactionMode`, default `true`, toggleable in `/ralph config`).
 
-- **Rotation compaction.** With compaction mode on, when a fresh iteration
+- **Cycle compaction.** With compaction mode on, when a fresh iteration
   starts (`startFreshIteration`), the loop calls `ctx.compact()` and supplies
   the compaction result itself via the `session_before_compact` hook
   (`details.source === 'ralph-loop'`, `fromHook: true`). Pi records the
   compaction entry, re-renders the TUI from the cut point, and makes **no LLM
   call** — there is no "compact action". The cut point (`firstKeptEntryId`)
   is the recording prompt's entry (the last user message in the branch at
-  rotation time), so the retained tail is the small, informative recording
+  cycle time), so the retained tail is the small, informative recording
   turn; the fallback is pi's prepared cut point. With compaction mode off,
   no compaction is attempted: the finished iteration stays visible in the TUI
   and the summary/boundary/prompt messages are sent directly.
 - **Compaction summary text.** The compaction entry's summary is the
   completion summary (below); when nothing is completed yet it is a fallback
-  note naming the rotation reason. The TUI shows it as the collapsed
+  note naming the cycle reason. The TUI shows it as the collapsed
   `[compaction]` box (tab to expand).
 - **Fresh iteration.** Only after the compaction settles (or fails) does the
   loop send, in order: the completion-summary custom message (`display: true`,
@@ -218,7 +218,7 @@ in one deterministic step — when **compaction mode** is enabled (config
   context clean.
 - **Completion summary.** Scoped to the current loop: re-derived by diffing
   the backlog against the snapshot taken when the loop started (retained in
-  the loop state as `loopStartTodo`, never rotated like `baselineTodo`). It
+  the loop state as `loopStartTodo`, never cycled like `baselineTodo`). It
   lists the tasks completed in this loop (task number, title, and the
   completion log entries added in this loop; completions without a new log
   entry are listed as such) and the task and goal checkpoints made or changed
@@ -227,19 +227,19 @@ in one deterministic step — when **compaction mode** is enabled (config
   fresh iteration (before the boundary marker); the first iteration sends no
   summary. No summary is sent when the loop has no completions or checkpoints
   yet.
-- **Model context.** After the rotation the model context is
+- **Model context.** After the cycle the model context is
   `[compactionSummary, retained tail, summary, boundary, prompt, …]`; the
   existing context-boundary slice drops everything before the boundary —
   including the completion summary — so the model sees only the current
   iteration.
 - **The keepRecentTokens gate.** pi refuses to prepare a compaction when less
   than `compaction.keepRecentTokens` (settings.json, default 20000) of content
-  would be discarded. A gated rotation degrades gracefully: the finished
+  would be discarded. A gated cycle degrades gracefully: the finished
   iteration stays visible in the TUI, the model context is still clean, and
-  the next rotation's window includes it. The extension notifies **once per
-  loop** when a rotation compaction is actually refused ("Nothing to
+  the next cycle's window includes it. The extension notifies **once per
+  loop** when a cycle compaction is actually refused ("Nothing to
   compact"), suggesting `"compaction": { "keepRecentTokens": 1000 }` to hide
-  every rotation — there is no speculative warning at loop start.
+  every cycle — there is no speculative warning at loop start.
 - **Config migration.** Saved configs without `compactionMode` (session
   entries and `.pi/ralph-loop.json` from older versions) normalize to the
   default (`true`); legacy single-threshold configs migrate the same way.
@@ -266,17 +266,17 @@ in one deterministic step — when **compaction mode** is enabled (config
   (`buildContextEntries`, what the TUI renders) drops them.
 - **No interference.** User-initiated (`/compact`) and automatic pi
   compactions run their default LLM path: the `session_before_compact` handler
-  only acts while a rotation compaction is pending, and clears the pending
+  only acts while a cycle compaction is pending, and clears the pending
   state on failure so it cannot leak into an unrelated compaction.
 - Acceptance: within an iteration the TUI and the model receive full content;
-  with compaction mode on, after a rotation the TUI context and the fresh
+  with compaction mode on, after a cycle the TUI context and the fresh
   iteration's model request contain the completion summary and none of the
   previous iteration's content, and the compaction entry is extension-provided
   (`fromHook`, `details.source`); with compaction mode off, no compaction is
   attempted and the finished iteration stays visible; the first iteration is
   never compacted; a gated or aborted compaction never stalls the loop.
 
-## 12. Loop consolidation: one backlog tool, one rotation policy
+## 12. Loop consolidation: one backlog tool, one cycle policy
 
 The detailed spec is `docs/consolidation-spec.md`; the user-facing reference
 is `docs/ralph-backlog.md`. The consolidation collapsed the parallel
@@ -291,23 +291,23 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   which is unscoped (all lists, one global numbering). Arming rule: idle +
   `autoMode: "on"` + mutating action (`add`, `add-many`,
   `update`, `complete`) → `setupAutoLoop()` first, then execute. The auto tool
-  set (`ralph_todo` + `ralph_rotate`) is pre-activated at session start when
+  set (`ralph_todo` + `ralph_cycle`) is pre-activated at session start when
   auto mode is "on" (cache-neutral arming). `next` skips `Findings: `
   reference entries (the session backlog is the only backlog).
-- **Rotation policy: `rotateOn`.** Per loop mode, each `"task"` | `"budget"`
+- **Cycle policy: `cycleOn`.** Per loop mode, each `"task"` | `"budget"`
   (built in: `"task"` for task/goal loops, `"budget"` for auto), configurable
   per mode in `/ralph config`, captured into `RalphState` at loop start.
   Legacy single values migrate: `"task"`/`"budget"` → all modes, `"default"`
-  (or missing) → the built-ins. `"task"`: rotate after every completed
+  (or missing) → the built-ins. `"task"`: cycle after every completed
   task (goal: also on plan growth, and — goal only — when the iteration
   ends cleanly with open work tasks remaining, so a never-completing task
-  cannot dead-end the loop). `"budget"`: work task after task; rotate
+  cannot dead-end the loop). `"budget"`: work task after task; cycle
   only at the context budget — plus, for the goal loop, on a **phase change**
   (planning → execution → re-evaluation) so a finished plan with headroom
   reaches the re-evaluation prompt instead of stalling. Stop conditions are
   policy-independent (task: empty backlog; goal: goal done; auto: never on an
   empty backlog). Under `"budget"` a completion that leaves open work sends a
-  continue nudge instead of rotating.
+  continue nudge instead of cycling.
 - **Recording turns.** Two, not four: `completed-task`/`plan-updated` (task
   policy) send the completion/plan recording prompt; `context-limit`/
   `phase-changed`/`iteration-ended` send one merged finish-up prompt (wrap
@@ -319,29 +319,29 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   `ralph_goal checkpoint`) and Markdown backlogs.
 - Quality bar unchanged: `bun test` in full (all suites).
 
-## 13. Model-requested rotations and boundary reloads (`ralph_rotate`)
+## 13. Model-requested cycles and boundary reloads (`ralph_cycle`)
 
-A `ralph_rotate` tool lets the model force the rotation boundary now, and —
+A `ralph_cycle` tool lets the model force the cycle boundary now, and —
 with `reload: true` — reload the pi extensions at that boundary.
 
-- **Tool: `ralph_rotate { note: string, reload?: boolean }`.** `note` is
+- **Tool: `ralph_cycle { note: string, reload?: boolean }`.** `note` is
   required (why: the stuck pattern being broken, or the runtime change being
   applied); it is carried into the recording prompt and the fresh iteration's
   prompt. Part of `RALPH_TOOL_NAMES` and of `AUTO_TOOL_NAMES` (pre-activated
   at session start in auto mode, so it is callable before a loop is armed —
   activation stays at session start, keeping arming cache-neutral).
 - **Two model-driven uses.** (1) After changing extension/runtime code:
-  `reload: true` queues the extension reload at the rotation boundary. (2)
+  `reload: true` queues the extension reload at the cycle boundary. (2)
   An escape hatch when the model notices it is looping (repeating the same
   failing approach): the finish-up recording turn forces an honest checkpoint
   of what was tried, and the fresh context starts without the stuck pattern.
-- **The reload lands after the context cut.** The rotation runs the
+- **The reload lands after the context cut.** The cycle runs the
   progress-recording turn first; when it settles with `reloadRequested`, the
   settle handler persists the durable "recording done, iteration pending"
-  marker (`rotationQueued` without `rotationCheckpointing`) and dispatches
+  marker (`cycleQueued` without `cycleCheckpointing`) and dispatches
   `/ralph reload` (the session is idle at settle, so the command runs now).
   The reloaded instance's `session_start` sees the marker and continues the
-  rotation (`startFreshIteration`: compaction when enabled, boundary marker,
+  cycle (`startFreshIteration`: compaction when enabled, boundary marker,
   fresh iteration prompt) on the new code. The first post-reload model
   request is the fresh iteration's — small, boundary-sliced context — so the
   reload never re-sends the finished iteration's long context with a cold
@@ -354,18 +354,18 @@ with `reload: true` — reload the pi extensions at that boundary.
 - **No active loop.** The tool fails with a `/ralph start` pointer — except
   the auto-mode case: `autoMode: "on"` arms the auto loop first (`armAutoLoop`,
   the same explicit-action-supersedes-stop semantics as a `ralph_todo`
-  mutation), then rotates. No open tasks are required: the rotation note
+  mutation), then cycles. No open tasks are required: the cycle note
   carries the reason the fresh iteration moves on, and the recording turn
   can record tasks for it. A corrupt backlog fails the arming (nothing
   persisted).
-- **Guards.** A pending rotation (`rotationQueued`) or a requested stop
-  (`stopRequested`) refuses the call. Each rotation costs a recording turn
+- **Guards.** A pending cycle (`cycleQueued`) or a requested stop
+  (`stopRequested`) refuses the call. Each cycle costs a recording turn
   and one iteration of `maxIterations` (the tool warns on the final one).
   `stopLoop` and `blockLoop` clear the pending `reloadRequested` flag so a
-  dropped rotation cannot leak a reload into a later, unrelated rotation.
-- **State.** `RalphState` gains `rotationNote?` (descriptive; only read while
+  dropped cycle cannot leak a reload into a later, unrelated cycle.
+- **State.** `RalphState` gains `cycleNote?` (descriptive; only read while
   the `model-requested` reason is active) and `reloadRequested?` (action
-  flag; cleared by `startFreshIteration` when the rotation runs). The
-  `model-requested` rotation reuses the finish-up recording prompt (new
+  flag; cleared by `startFreshIteration` when the cycle runs). The
+  `model-requested` cycle reuses the finish-up recording prompt (new
   opening carrying the note) and the existing settle → `startFreshIteration`
   path; the fresh iteration prompt gets a `model-requested` context note.
