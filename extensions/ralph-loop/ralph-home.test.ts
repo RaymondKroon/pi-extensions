@@ -357,6 +357,32 @@ describe('home view goal confirms', () => {
 		expect(lastBacklog()!.goal()).toBeUndefined();
 	});
 
+	test('rendering while the goal delete save is pending does not crash', async () => {
+		// Mirrors the host persist: fn applies to the shared backlog before the
+		// save settles. A render in that window must not read the deleted goal
+		// off the live backlog (regression: uncaught TypeError in renderGoalRow).
+		let resolveSave: (ok: boolean) => void = () => {};
+		const save = new Promise<boolean>((resolve) => {
+			resolveSave = resolve;
+		});
+		const { view, lines } = createHomeWith({
+			mutate: (backlog, fn) => {
+				fn(backlog);
+				return save;
+			}
+		});
+		view.handleInput('D');
+		view.handleInput('y');
+		// Save still pending: the goal row is stale but must render without crashing,
+		// footer included (it is derived from the same stale rows).
+		const text = lines().join('\n');
+		expect(text).toContain('Goal:');
+		expect(text).toContain('D: delete goal');
+		resolveSave(true);
+		await flush();
+		expect(lines().join('\n')).not.toContain('Goal:');
+	});
+
 	test('D with n keeps the goal', async () => {
 		const { view, lines } = createHome();
 		view.handleInput('D');

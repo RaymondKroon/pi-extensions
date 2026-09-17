@@ -83,6 +83,13 @@ interface SelectableRow {
 	kind: 'goal' | 'list';
 	/** List name; undefined for the (all) row. */
 	category?: string;
+	/**
+	 * Snapshot of the goal at rebuild time. Rendering must not re-read the
+	 * live backlog: a mutation (e.g. delete) applies to the shared backlog
+	 * before the async save settles, so a render in that window would see a
+	 * goal row whose goal no longer exists.
+	 */
+	goal?: Goal;
 }
 
 /** A line inside the expanded goal row (criteria, evidence, checkpoint). */
@@ -132,7 +139,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 		const rowLineOf = new Map<SelectableRow, number>();
 		const goal = backlog.goal();
 		if (goal) {
-			const goalRow: SelectableRow = { kind: 'goal' };
+			const goalRow: SelectableRow = { kind: 'goal', goal };
 			selectable.push(goalRow);
 			rowLineOf.set(goalRow, rows.length);
 			rows.push(goalRow);
@@ -296,7 +303,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 
 	const footerSegments = (): string[] => {
 		const segments = ['jk: move', 'enter: open list'];
-		const hasGoal = backlog.goal() !== undefined;
+		const hasGoal = state.selectable.some((row) => row.kind === 'goal');
 		if (hasGoal) segments.push('O: goal detail');
 		if (options.mutate) {
 			segments.push('A: add/edit goal');
@@ -311,8 +318,8 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 	const footerLines = (width: number): string[] =>
 		layoutFooter(footerSegments(), width, (text) => theme.fg('dim', text));
 
-	const renderGoalRow = (highlighted: boolean, width: number): string[] => {
-		const goal = backlog.goal()!;
+	const renderGoalRow = (goal: Goal | undefined, highlighted: boolean, width: number): string[] => {
+		if (!goal) return [];
 		const { marker, color } = goalStatusStyle(goal.status);
 		const cursorMark = highlighted ? '> ' : '  ';
 		const prefix = `  ${cursorMark}${marker} `;
@@ -367,7 +374,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 				return out;
 			}
 			case 'goal':
-				return renderGoalRow(row === state.selectable[cursor], width);
+				return renderGoalRow(row.goal, row === state.selectable[cursor], width);
 			case 'list':
 				return renderListRow(row, row === state.selectable[cursor], width);
 		}
