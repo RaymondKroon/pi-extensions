@@ -83,15 +83,18 @@ const DEFAULT_AUTO_MODE: AutoMode = 'off';
  * The rotation policy: task — a fresh iteration after every completed task
  * (planned, feature-sized backlogs); budget — work task after task, fresh
  * iteration only at the context budget (fine-grained rolling handoff todos).
- * default — the per-mode default: task for the task/goal loops, budget for
- * the auto loop.
  */
-type RotateOn = 'default' | 'task' | 'budget';
-const DEFAULT_ROTATE_ON: RotateOn = 'default';
-/** The rotation policy resolved for a loop mode ("default" keeps the per-mode default). */
-function rotateOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): 'task' | 'budget' {
-	if (config.rotateOn === 'task' || config.rotateOn === 'budget') return config.rotateOn;
-	return mode === 'auto' ? 'budget' : 'task';
+type RotateOnPolicy = 'task' | 'budget';
+/** The rotation policy per loop mode. */
+interface RotateOn {
+	tasks: RotateOnPolicy;
+	goal: RotateOnPolicy;
+	auto: RotateOnPolicy;
+}
+const DEFAULT_ROTATE_ON: RotateOn = { tasks: 'task', goal: 'task', auto: 'budget' };
+/** The rotation policy for a loop mode. */
+function rotateOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): RotateOnPolicy {
+	return config.rotateOn?.[mode] ?? DEFAULT_ROTATE_ON[mode];
 }
 /** The rotation tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a rotation — and arm the auto loop — even while no loop is active yet. */
 const ROTATE_TOOL_NAME = 'ralph_rotate';
@@ -130,7 +133,7 @@ interface RalphConfig {
 	 * --goal start is unaffected).
 	 */
 	autoMode: AutoMode;
-	/** When a fresh iteration starts: task — after every completed task; budget — only at the context budget; default — per-mode default (task for tasks/goal, budget for auto). */
+	/** When a fresh iteration starts, per loop mode: task — after every completed task; budget — only at the context budget. */
 	rotateOn: RotateOn;
 }
 
@@ -140,8 +143,26 @@ interface LegacyRalphConfig {
 	maxIterations?: number;
 }
 
+function isRotateOnPolicy(value: unknown): value is RotateOnPolicy {
+	return value === 'task' || value === 'budget';
+}
+
 function isRotateOn(value: unknown): value is RotateOn {
+	if (!value || typeof value !== 'object') return false;
+	const v = value as Partial<RotateOn>;
+	return isRotateOnPolicy(v.tasks) && isRotateOnPolicy(v.goal) && isRotateOnPolicy(v.auto);
+}
+
+/** The legacy single rotation policy (pre per-mode config). */
+function isLegacyRotateOn(value: unknown): value is 'default' | 'task' | 'budget' {
 	return value === 'default' || value === 'task' || value === 'budget';
+}
+
+/** Migrate a stored rotation policy to the per-mode form (legacy: "task"/"budget" → all modes, "default"/missing → built-in). */
+function migrateRotateOn(value: unknown): RotateOn {
+	if (isRotateOn(value)) return value;
+	if (value === 'task' || value === 'budget') return { tasks: value, goal: value, auto: value };
+	return { ...DEFAULT_ROTATE_ON };
 }
 
 interface RalphState {
@@ -151,7 +172,7 @@ interface RalphState {
 	enabled: boolean;
 	/** Loop policy: the finite task backlog, the single goal, or the auto loop. */
 	mode: 'tasks' | 'goal' | 'auto';
-	/** The rotation policy resolved at loop start (config "default" → per-mode default); a mid-loop config edit does not change a running loop. */
+	/** The rotation policy resolved at loop start (the loop mode's configured value); a mid-loop config edit does not change a running loop. */
 	rotateOn: 'task' | 'budget';
 	todoPath: string;
 	/** Backlog snapshot at the start of the current loop (never rotated). */
@@ -296,7 +317,7 @@ function isRalphConfigPartial(
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
 		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean') &&
 		(config.autoMode === undefined || normalizeAutoMode(config.autoMode) !== undefined) &&
-		(config.rotateOn === undefined || isRotateOn(config.rotateOn))
+		(config.rotateOn === undefined || isRotateOn(config.rotateOn) || isLegacyRotateOn(config.rotateOn))
 	);
 }
 
@@ -318,7 +339,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
 			autoMode: normalizeAutoMode(value.autoMode) ?? DEFAULT_AUTO_MODE,
-			rotateOn: value.rotateOn ?? DEFAULT_ROTATE_ON
+			rotateOn: migrateRotateOn(value.rotateOn)
 		};
 	}
 	if (isLegacyRalphConfig(value)) {
@@ -328,7 +349,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
 			autoMode: DEFAULT_AUTO_MODE,
-			rotateOn: DEFAULT_ROTATE_ON
+			rotateOn: { ...DEFAULT_ROTATE_ON }
 		};
 	}
 }
@@ -340,7 +361,7 @@ function defaultConfig(): RalphConfig {
 		maxIterations: DEFAULT_MAX_ITERATIONS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
 		autoMode: DEFAULT_AUTO_MODE,
-		rotateOn: DEFAULT_ROTATE_ON
+		rotateOn: { ...DEFAULT_ROTATE_ON }
 	};
 }
 
@@ -1424,6 +1445,10 @@ async function importMarkdownBacklog(
 export default function (pi: ExtensionAPI) {
 	let state: RalphState | undefined;
 	let config = defaultConfig();
+	// True while the current directory resolves its settings from the global
+	// store's defaults section (no directory entry, no legacy project file):
+	// editing the global defaults then applies to this session as well.
+	let configFromDefaults = false;
 	let configWrite = Promise.resolve();
 	// Cached from the TODO file at each refresh point (start, settle, rotation) so
 	// the status widget can show the current task number without reading the file
@@ -1470,6 +1495,9 @@ export default function (pi: ExtensionAPI) {
 
 	const persistConfig = (ctx: ExtensionContext, next: RalphConfig) => {
 		config = next;
+		// The directory now has its own setting: the global defaults no longer
+		// resolve for it.
+		configFromDefaults = false;
 		// Keep the current branch's audit trail, while the global store makes the
 		// settings available to future Ralph sessions — per directory and, for git
 		// repositories, per branch.
@@ -1502,6 +1530,34 @@ export default function (pi: ExtensionAPI) {
 			.catch((error) => {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Ralph configuration could not be saved to ${path}: ${message}`, 'error');
+			});
+	};
+
+	/** Persist the global defaults section (the general settings for directories without their own settings). */
+	const persistConfigDefaults = (ctx: ExtensionContext, next: RalphConfig) => {
+		const path = globalConfigPath();
+		configWrite = configWrite
+			.then(async () => {
+				let store: RalphConfigStore;
+				try {
+					const parsed = parseConfigStore(JSON.parse(await readFile(path, 'utf8')));
+					if (!parsed) throw new Error('unrecognized configuration store format');
+					store = parsed;
+				} catch (error) {
+					if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+						store = {};
+					} else {
+						// A corrupt store: refuse to clobber the other directories' settings.
+						throw error;
+					}
+				}
+				store.defaults = { ...next };
+				await mkdir(dirname(path), { recursive: true });
+				await writeFile(path, `${JSON.stringify(store, null, '\t')}\n`, 'utf8');
+			})
+			.catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Ralph global defaults could not be saved to ${path}: ${message}`, 'error');
 			});
 	};
 
@@ -2844,6 +2900,7 @@ export default function (pi: ExtensionAPI) {
 		runAbortedByUser = false;
 		runSignal = undefined;
 		config = defaultConfig();
+		configFromDefaults = false;
 		let hasSessionConfig = false;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== 'custom') continue;
@@ -2876,7 +2933,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: state.maxIterations,
 				compactionMode: DEFAULT_COMPACTION_MODE,
 				autoMode: DEFAULT_AUTO_MODE,
-				rotateOn: DEFAULT_ROTATE_ON
+				rotateOn: { ...DEFAULT_ROTATE_ON }
 			};
 		}
 
@@ -2929,6 +2986,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!savedConfig) {
 			savedConfig = normalizeConfig(store?.defaults);
+			configFromDefaults = savedConfig !== undefined;
 		}
 		if (savedConfig) {
 			config = savedConfig;
@@ -3406,7 +3464,87 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// The global defaults section (the general settings for directories
+		// without their own settings); the built-in defaults when it has none.
+		let defaultsConfig: RalphConfig;
+		try {
+			const store = parseConfigStore(JSON.parse(await readFile(globalConfigPath(), 'utf8')));
+			defaultsConfig = (store && normalizeConfig(store.defaults)) ?? defaultConfig();
+		} catch {
+			defaultsConfig = defaultConfig();
+		}
+		// Where the next change is saved: the current directory's entry (per
+		// branch in git repositories) or the global defaults section.
+		let scope: 'directory' | 'defaults' = 'directory';
+		const sourceConfig = () => (scope === 'defaults' ? defaultsConfig : config);
+		const displayValue = (id: string, cfg: RalphConfig): string =>
+			id === 'contextThreshold'
+				? contextThresholdLabel(contextThresholdFor(cfg, ctx))
+				: id === 'maxIterations'
+					? String(cfg.maxIterations)
+					: id === 'compactionMode'
+						? cfg.compactionMode
+							? 'enabled'
+							: 'disabled'
+						: id === 'autoApproveDecisions'
+							? cfg.autoApproveDecisions
+								? 'enabled'
+								: 'disabled'
+						: id === 'autoMode'
+							? cfg.autoMode
+							: id === 'rotateOnTasks'
+								? cfg.rotateOn.tasks
+								: id === 'rotateOnGoal'
+									? cfg.rotateOn.goal
+									: cfg.rotateOn.auto;
+		const applySetting = (cfg: RalphConfig, id: string, value: string): RalphConfig =>
+			id === 'contextThreshold'
+				? {
+						...cfg,
+						contextThresholds: {
+							...cfg.contextThresholds,
+							[modelConfigKey(ctx)]: Number.parseInt(value, 10) / 100
+						}
+					}
+				: id === 'maxIterations'
+					? { ...cfg, maxIterations: Number.parseInt(value, 10) }
+					: id === 'compactionMode'
+						? { ...cfg, compactionMode: value === 'enabled' }
+					: id === 'autoMode'
+							? { ...cfg, autoMode: value as AutoMode }
+							: id === 'rotateOnTasks'
+								? { ...cfg, rotateOn: { ...cfg.rotateOn, tasks: value as RotateOnPolicy } }
+								: id === 'rotateOnGoal'
+									? { ...cfg, rotateOn: { ...cfg.rotateOn, goal: value as RotateOnPolicy } }
+									: id === 'rotateOnAuto'
+										? { ...cfg, rotateOn: { ...cfg.rotateOn, auto: value as RotateOnPolicy } }
+									: { ...cfg, autoApproveDecisions: value === 'enabled' };
+		const savedDescription = (id: string, next: RalphConfig): string =>
+			id === 'contextThreshold'
+				? contextThresholdLabel(contextThresholdFor(next, ctx))
+				: id === 'maxIterations'
+					? `maximum iterations ${next.maxIterations}`
+					: id === 'compactionMode'
+						? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
+				: id === 'autoMode'
+						? `auto mode ${next.autoMode}`
+					: id === 'rotateOnTasks'
+						? `rotation (task loop) ${next.rotateOn.tasks}`
+					: id === 'rotateOnGoal'
+						? `rotation (goal loop) ${next.rotateOn.goal}`
+					: id === 'rotateOnAuto'
+						? `rotation (auto loop) ${next.rotateOn.auto}`
+						: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
+
 		const items: SettingItem[] = [
+			{
+				id: 'scope',
+				label: 'Save to',
+				description:
+					'Where changes are saved. This directory (branch): only this directory — and, in git repositories, only this branch. Global defaults: the general settings for every directory without its own setting; they also apply to this session when this directory has no setting of its own.',
+				currentValue: 'this directory (branch)',
+				values: ['this directory (branch)', 'global defaults']
+			},
 			{
 				id: 'contextThreshold',
 				label: 'Start fresh context at',
@@ -3471,12 +3609,28 @@ export default function (pi: ExtensionAPI) {
 				values: ['off', 'on']
 			},
 			{
-				id: 'rotateOn',
-				label: 'Rotation policy',
+				id: 'rotateOnTasks',
+				label: 'Rotation: task loop',
 				description:
-					'When a fresh iteration starts: task — after every completed task (planned, feature-sized backlogs); budget — only at the context budget, working task after task (fine-grained rolling handoff todos); default — task for the task/goal loops, budget for the auto loop. Applies to loops started after the change.',
-				currentValue: config.rotateOn,
-				values: ['default', 'task', 'budget']
+					'When a fresh iteration starts for the task loop: task — after every completed task (planned, feature-sized backlogs); budget — only at the context budget, working task after task (fine-grained rolling handoff todos). Applies to loops started after the change.',
+				currentValue: config.rotateOn.tasks,
+				values: ['task', 'budget']
+			},
+			{
+				id: 'rotateOnGoal',
+				label: 'Rotation: goal loop',
+				description:
+					'When a fresh iteration starts for the goal loop: task — after every completed task (and on plan growth); budget — only at the context budget (plus goal phase changes). Applies to loops started after the change.',
+				currentValue: config.rotateOn.goal,
+				values: ['task', 'budget']
+			},
+			{
+				id: 'rotateOnAuto',
+				label: 'Rotation: auto loop',
+				description:
+					'When a fresh iteration starts for the auto loop: task — after every completed task; budget — only at the context budget, working task after task. Applies to loops started after the change.',
+				currentValue: config.rotateOn.auto,
+				values: ['task', 'budget']
 			}
 		];
 
@@ -3488,58 +3642,53 @@ export default function (pi: ExtensionAPI) {
 				items.length + 2,
 				getSettingsListTheme(),
 				(id, value) => {
-					const next: RalphConfig =
-						id === 'contextThreshold'
-							? {
-								...config,
-								contextThresholds: {
-									...config.contextThresholds,
-									[modelConfigKey(ctx)]: Number.parseInt(value, 10) / 100
-								}
-							}
-							: id === 'maxIterations'
-								? { ...config, maxIterations: Number.parseInt(value, 10) }
-								: id === 'compactionMode'
-									? { ...config, compactionMode: value === 'enabled' }
-						: id === 'autoMode'
-							? { ...config, autoMode: value as AutoMode }
-							: id === 'rotateOn'
-								? { ...config, rotateOn: value as RotateOn }
-								: { ...config, autoApproveDecisions: value === 'enabled' };
+					if (id === 'scope') {
+						scope = value === 'global defaults' ? 'defaults' : 'directory';
+						// Show the selected source's values in the other rows.
+						for (const item of items) {
+							if (item.id !== 'scope') settingsList.updateValue(item.id, displayValue(item.id, sourceConfig()));
+						}
+						return;
+					}
+					const applyToSession = (next: RalphConfig, previousAutoMode: string) => {
+						if (id === 'autoMode' && next.autoMode === 'on' && previousAutoMode !== 'on') {
+							// Pre-activate the auto tool set the moment auto mode is turned
+							// on, so a mid-session switch never makes the arming at the
+							// context budget the moment the tool set changes (one cold
+							// prefix re-send, paid now on a small context instead of at
+							// the session's largest context).
+							syncToolActivation();
+						}
+						if (state?.enabled) {
+							persistState({
+								...state,
+								autoApproveDecisions: next.autoApproveDecisions,
+								maxIterations: next.maxIterations,
+								contextThreshold: contextThresholdFor(next, ctx)
+							});
+						}
+						// The status widget captures its label when updateStatus runs. Refresh it
+						// here so an active loop immediately reflects a changed threshold.
+						updateStatus(ctx);
+					};
 					const previousAutoMode = config.autoMode;
+					if (scope === 'defaults') {
+						const next = applySetting(defaultsConfig, id, value);
+						defaultsConfig = next;
+						persistConfigDefaults(ctx, next);
+						if (configFromDefaults) {
+							// This directory has no setting of its own: the new
+							// defaults are this session's settings as well.
+							config = next;
+							applyToSession(next, previousAutoMode);
+						}
+						ctx.ui.notify(`Ralph global defaults saved: ${savedDescription(id, next)}`, 'info');
+						return;
+					}
+					const next = applySetting(config, id, value);
 					persistConfig(ctx, next);
-					if (id === 'autoMode' && next.autoMode === 'on' && previousAutoMode !== 'on') {
-						// Pre-activate the auto tool set the moment auto mode is turned
-						// on, so a mid-session switch never makes the arming at the
-						// context budget the moment the tool set changes (one cold
-						// prefix re-send, paid now on a small context instead of at
-						// the session's largest context).
-						syncToolActivation();
-					}
-					if (state?.enabled) {
-						persistState({
-							...state,
-							autoApproveDecisions: next.autoApproveDecisions,
-							maxIterations: next.maxIterations,
-							contextThreshold: contextThresholdFor(next, ctx)
-						});
-					}
-					// The status widget captures its label when updateStatus runs. Refresh it
-					// here so an active loop immediately reflects a changed threshold.
-					updateStatus(ctx);
-					const savedDescription =
-						id === 'contextThreshold'
-							? contextThresholdLabel(contextThresholdFor(next, ctx))
-							: id === 'maxIterations'
-								? `maximum iterations ${next.maxIterations}`
-								: id === 'compactionMode'
-									? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
-						: id === 'autoMode'
-							? `auto mode ${next.autoMode}`
-							: id === 'rotateOn'
-								? `rotation policy ${next.rotateOn}`
-								: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
-					ctx.ui.notify(`Ralph configuration saved: ${savedDescription}`, 'info');
+					applyToSession(next, previousAutoMode);
+					ctx.ui.notify(`Ralph configuration saved: ${savedDescription(id, next)}`, 'info');
 				},
 				() => done(undefined)
 			);
@@ -3735,7 +3884,7 @@ export default function (pi: ExtensionAPI) {
 			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the rotation/finish-up boundary.' },
 			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested rotation continues on the reloaded code.' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
-				{ value: 'config', label: 'config', description: 'Configure fresh-context rotation and decision approval.' }
+				{ value: 'config', label: 'config', description: 'Configure Ralph settings (fresh-context threshold, max iterations, compaction, decision approval, auto mode, rotation policy). The "Save to" row switches the scope: this directory (branch) or the global defaults (the general settings for directories without their own setting).' }
 			];
 			const matches = options.filter((option) => option.value.startsWith(prefix.toLowerCase()));
 			return matches.length > 0 ? matches : null;

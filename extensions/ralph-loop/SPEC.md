@@ -255,6 +255,12 @@ in one deterministic step — when **compaction mode** is enabled (config
   defaults. Session start notifies while a legacy project file exists —
   either in use (re-save with `/ralph config`, then delete) or shadowed by
   a store entry (can be deleted) — so the files work their way out.
+  `/ralph config` edits either scope: the "Save to" row switches between
+  the current directory's entry (per branch in git repositories) and the
+  global `defaults` section, and the other rows show the selected source's
+  values. A defaults edit applies to the running session as well when the
+  current directory has no setting of its own (it resolves from the
+  defaults); it never creates a `dirs` entry.
 - **Audit trail.** The session file stays append-only: finished iterations
   remain in `getBranch()` (and in `/tree`), only the compaction-aware context
   (`buildContextEntries`, what the TUI renders) drops them.
@@ -288,9 +294,11 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   set (`ralph_todo` + `ralph_rotate`) is pre-activated at session start when
   auto mode is "on" (cache-neutral arming). `next` skips `Findings: `
   reference entries (the session backlog is the only backlog).
-- **One rotation policy: `rotateOn`.** Config value `"task"` | `"budget"`
-  (defaults: `"task"` for task/goal loops, `"budget"` for auto), captured
-  into `RalphState` at loop start. `"task"`: rotate after every completed
+- **Rotation policy: `rotateOn`.** Per loop mode, each `"task"` | `"budget"`
+  (built in: `"task"` for task/goal loops, `"budget"` for auto), configurable
+  per mode in `/ralph config`, captured into `RalphState` at loop start.
+  Legacy single values migrate: `"task"`/`"budget"` → all modes, `"default"`
+  (or missing) → the built-ins. `"task"`: rotate after every completed
   task (goal: also on plan growth, and — goal only — when the iteration
   ends cleanly with open work tasks remaining, so a never-completing task
   cannot dead-end the loop). `"budget"`: work task after task; rotate

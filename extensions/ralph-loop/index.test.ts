@@ -3999,11 +3999,11 @@ GB
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		fakeCtx.customControl.factoryHook = undefined;
 		// The config view's factory returns a wrapper that delegates input to
-		// its SettingsList: navigate down to "Auto mode" (4th of 6 items) and
-		// press Enter to cycle off→on.
+		// its SettingsList: navigate down to "Auto mode" (5th of 7 items, the
+		// "Save to" scope row first) and press Enter to cycle off→on.
 		const view = created[0] as { handleInput: (data: string) => void };
 		expect(view).toBeDefined();
-		for (let i = 0; i < 4; i++) view.handleInput('\x1b[B');
+		for (let i = 0; i < 5; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r');
 
 		// The tool set changes at the switch — not at the later arming at the
@@ -4886,6 +4886,9 @@ M list "Plan"
 			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, ...extra }, null, '\t')}\n`
 		);
 
+	/** The per-mode rotation policy with one value for all modes. */
+	const allRotate = (policy: 'task' | 'budget') => ({ tasks: policy, goal: policy, auto: policy });
+
 	const writeAutoConfig = (extra: Record<string, unknown> = {}) => writeConfig({ autoMode: 'on', ...extra });
 
 	const todoTool = (fake: ReturnType<typeof createFakePi>) => fake.tools.get('ralph_todo') as Tool;
@@ -4901,7 +4904,7 @@ M list "Plan"
 		await writeFile(autoFile(), RALPH_V1);
 	});
 
-	test('rotateOn is captured into the loop state at start (per-mode default when unset)', async () => {
+	test('rotateOn is captured into the loop state at start (built-in per-mode default when unset)', async () => {
 		// Unset: the task loop captures "task"…
 		{
 			const fake = createFakePi();
@@ -4912,7 +4915,7 @@ M list "Plan"
 		}
 		// …an explicit config value wins for the task loop…
 		{
-			await writeConfig({ rotateOn: 'budget' });
+			await writeConfig({ rotateOn: allRotate('budget') });
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
@@ -4930,8 +4933,71 @@ M list "Plan"
 		}
 	});
 
+	test('per-mode rotation policies are captured into the loop state at start', async () => {
+		const perMode = { tasks: 'budget', goal: 'budget', auto: 'task' };
+		// Task loop: its own configured value (budget, against the built-in task).
+		{
+			await writeConfig({ rotateOn: perMode });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+		}
+		// Goal loop: its own configured value (budget, against the built-in task).
+		{
+			await writeConfig({ rotateOn: perMode });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), GOAL_PLANNING_WITH_LIST);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+			await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+		}
+		// Auto loop: its own configured value (task, against the built-in budget).
+		{
+			await writeAutoConfig({ rotateOn: perMode });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+		}
+	});
+
+	test('the legacy single rotation policy migrates to the per-mode form', async () => {
+		// "task" → all modes…
+		{
+			await writeConfig({ rotateOn: 'task' });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+		}
+		// …"budget" → all modes…
+		{
+			await writeAutoConfig({ rotateOn: 'budget' });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('budget');
+		}
+		// …"default" → the built-ins (task loop: task).
+		{
+			await writeConfig({ rotateOn: 'default' });
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await startLoop(fake, fakeCtx);
+			expect((stateEntries(fake).at(-1)!.data as { rotateOn: string }).rotateOn).toBe('task');
+		}
+	});
+
 	test('task loop under rotateOn "budget": completing a task does not rotate; the nudge starts the next task', async () => {
-		await writeConfig({ rotateOn: 'budget' });
+		await writeConfig({ rotateOn: allRotate('budget') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -4956,7 +5022,7 @@ M list "Plan"
 
 	test('task loop under rotateOn "budget": an exhausted backlog still stops the loop at settle', async () => {
 		await writeFile(autoFile(), RALPH_SINGLE);
-		await writeConfig({ rotateOn: 'budget' });
+		await writeConfig({ rotateOn: allRotate('budget') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -4976,7 +5042,7 @@ M list "Plan"
 	});
 
 	test('auto loop under rotateOn "task": completing a todo rotates with a recording turn', async () => {
-		await writeAutoConfig({ rotateOn: 'task' });
+		await writeAutoConfig({ rotateOn: allRotate('task') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5003,7 +5069,7 @@ M list "Plan"
 	});
 
 	test('goal loop under rotateOn "budget": phase changes rotate (planning → execution → re-evaluation), completions do not', async () => {
-		await writeConfig({ rotateOn: 'budget' });
+		await writeConfig({ rotateOn: allRotate('budget') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5055,7 +5121,7 @@ T 1 - "Continuous re-test loop (run until stopped)"
 `;
 
 	test('goal loop under rotateOn "task": a cleanly ended iteration with open tasks rotates instead of idling', async () => {
-		await writeConfig({ rotateOn: 'task' });
+		await writeConfig({ rotateOn: allRotate('task') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5086,7 +5152,7 @@ T 1 - "Continuous re-test loop (run until stopped)"
 	});
 
 	test('goal loop under rotateOn "task": an errored iteration does not rotate', async () => {
-		await writeConfig({ rotateOn: 'task' });
+		await writeConfig({ rotateOn: allRotate('task') });
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -5205,7 +5271,7 @@ T 1 - "Continuous re-test loop (run until stopped)"
 describe('ralph-loop extension (global config store)', () => {
 	const storePath = () => join(agentDir, 'ralph', 'config.json');
 	const fullConfig = (extra: Record<string, unknown> = {}) =>
-		({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'off', rotateOn: 'default', ...extra });
+		({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'off', rotateOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
 
 	const writeStore = (store: { defaults?: Record<string, unknown>; dirs?: Record<string, unknown> }) =>
 		writeFile(storePath(), `${JSON.stringify(store, null, '\t')}\n`);
@@ -5380,6 +5446,128 @@ describe('ralph-loop extension (global config store)', () => {
 		const note = fakeCtx.notifications.find((n) => n.message.includes('legacy Ralph config'));
 		expect(note?.message).toContain(join(dir, '.pi', 'ralph-loop.json'));
 		expect(note?.type).toBe('warning');
+	});
+
+	/** Open the config UI and return its input/render handle. */
+	const openConfigUi = async (
+		fake: ReturnType<typeof createFakePi>,
+		fakeCtx: FakeCtx
+	): Promise<{ render: (width: number) => string[]; handleInput: (data: string) => void }> => {
+		const created: unknown[] = [];
+		fakeCtx.customControl.factoryHook = (component) => created.push(component);
+		await fake.commands.get('ralph')!.handler('config', fakeCtx.ctx);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		fakeCtx.customControl.factoryHook = undefined;
+		const view = created[0] as { render: (width: number) => string[]; handleInput: (data: string) => void };
+		expect(view).toBeDefined();
+		return view;
+	};
+
+	/** Switch the scope to the global defaults and set Maximum iterations to value. */
+	const setMaxIterationsInDefaults = (view: { handleInput: (data: string) => void }, value: string) => {
+		view.handleInput('\r'); // Save to: this directory (branch) → global defaults
+		view.handleInput('\x1b[B'); // down past Start fresh context at
+		view.handleInput('\x1b[B'); // down to Maximum iterations
+		view.handleInput('\r'); // open the numeric submenu (seeded with the defaults value)
+		view.handleInput('\x15'); // clear the input (ctrl+u)
+		view.handleInput(value);
+		view.handleInput('\r'); // submit
+	};
+
+	test('the config UI saves to the defaults section in the global scope', async () => {
+		// The SettingsList theme needs pi's interactive theme initialized.
+		initTheme();
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({
+			defaults: fullConfig({ maxIterations: 5 }),
+			dirs: { [dir]: { default: fullConfig({ maxIterations: 8 }) } }
+		});
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/8');
+
+		const view = await openConfigUi(fake, fakeCtx);
+		setMaxIterationsInDefaults(view, '7');
+		await flush();
+
+		const store = await readStore();
+		expect(store.defaults).toMatchObject({ maxIterations: 7 });
+		// The directory's own setting is untouched.
+		expect(store.dirs![dir]!.default).toMatchObject({ maxIterations: 8 });
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph global defaults saved');
+		// The directory has its own setting: this session keeps it.
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/8');
+	});
+
+	test('editing the global defaults applies to a directory without its own setting', async () => {
+		initTheme();
+		await writeFile(autoFile(), RALPH_V1);
+		await rm(join(dir, '.pi', 'ralph-loop.json')); // no legacy project file either
+		await writeStore({ defaults: fullConfig({ maxIterations: 5 }) });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/5');
+
+		const view = await openConfigUi(fake, fakeCtx);
+		setMaxIterationsInDefaults(view, '7');
+		await flush();
+
+		// The directory resolves from the defaults: the change applies here too.
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/7');
+		const store = await readStore();
+		expect(store.defaults).toMatchObject({ maxIterations: 7 });
+		// No directory entry was created by the defaults edit.
+		expect(store.dirs).toBeUndefined();
+	});
+
+	test('switching the config UI scope shows the defaults section values', async () => {
+		initTheme();
+		await writeFile(autoFile(), RALPH_V1);
+		await writeStore({
+			defaults: fullConfig({ maxIterations: 5, autoMode: 'on' }),
+			dirs: { [dir]: { default: fullConfig({ maxIterations: 8 }) } }
+		});
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const view = await openConfigUi(fake, fakeCtx);
+		const stripAnsi = (line: string) => line.replace(/\u001b\[[0-9;]*m/g, '');
+		const maxLine = (lines: string[]) => stripAnsi(lines.find((line) => line.includes('Maximum iterations'))!);
+		// The directory scope shows the directory's values.
+		expect(maxLine(view.render(200))).toMatch(/Maximum iterations\s+8$/);
+		view.handleInput('\r'); // Save to → global defaults
+		const lines = view.render(200);
+		expect(maxLine(lines)).toMatch(/Maximum iterations\s+5$/);
+		expect(stripAnsi(lines.find((line) => line.includes('Auto mode'))!)).toMatch(/Auto mode\s+on$/);
+	});
+
+	test('the config UI edits the per-mode rotation policies', async () => {
+		initTheme();
+		await writeFile(autoFile(), RALPH_V1);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const view = await openConfigUi(fake, fakeCtx);
+		// Rows: Save to, Start fresh context at, Maximum iterations, Compaction
+		// mode, Auto-approve decisions, Auto mode, Rotation: task loop,
+		// Rotation: goal loop, Rotation: auto loop (last).
+		for (let i = 0; i < 8; i++) view.handleInput('\x1b[B');
+		view.handleInput('\r'); // built-in auto policy budget → task
+		await flush();
+
+		const store = await readStore();
+		expect(store.dirs![dir]!.default).toMatchObject({
+			rotateOn: { tasks: 'task', goal: 'task', auto: 'task' }
+		});
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('rotation (auto loop) task');
 	});
 });
 

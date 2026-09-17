@@ -189,7 +189,8 @@ suspends the automatic context-budget intercept).
 
 ## Rotation policy (`rotateOn`)
 
-`/ralph config` offers `rotateOn`: when a fresh iteration starts.
+`/ralph config` offers the rotation policy per loop mode (task loop, goal
+loop, auto loop): when a fresh iteration starts.
 
 - `"task"` — a fresh iteration after every completed task (planned,
   feature-sized backlogs). The quality preset: per-task context isolation, a
@@ -202,7 +203,7 @@ suspends the automatic context-budget intercept).
   until the budget crossing. `maxIterations` counts budget crossings, not
   tasks — the cap weakens; that is the point of the policy.
 
-Defaults per mode: `"task"` for the task and goal loops, `"budget"` for the
+Built-in per mode: `"task"` for the task and goal loops, `"budget"` for the
 auto loop. The value is captured into the loop state at start, so editing the
 config mid-loop does not change a running loop. Stop conditions are
 policy-independent: the task loop stops on an empty backlog, the goal loop
