@@ -152,6 +152,8 @@ interface FakeCtx {
 	usagePercent: { value: number };
 	/** Abort the current run, like the user pressing Escape. */
 	abortRun: () => void;
+	/** Start a new run: a fresh abort controller, like pi's per-run signal. */
+	newRun: () => void;
 	/** ctx.abort() calls (e.g. /ralph stop --force on a non-idle session). */
 	abortCalls: { value: number };
 	/** Whether the fake session reports itself idle (for /ralph stop). */
@@ -191,7 +193,7 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const notifications: FakeNotification[] = [];
 	const usagePercent = { value: 10 };
 	const idle = { value: true };
-	const runAbortController = new AbortController();
+	let runAbortController = new AbortController();
 	const abortCalls = { value: 0 };
 	const customFactories: FakeCtx['customFactories'] = [];
 	const customOptions: FakeCtx['customOptions'] = [];
@@ -215,8 +217,12 @@ function createFakeCtx(cwd: string): FakeCtx {
 			abortCalls.value += 1;
 			runAbortController.abort();
 		},
-		// The run's abort signal, like pi's ExtensionContext.signal.
-		signal: runAbortController.signal,
+		// The current run's abort signal, like pi's ExtensionContext.signal.
+		// Each run has its own controller (newRun), so a signal aborted by an
+		// earlier run does not taint the next one.
+		get signal() {
+			return runAbortController.signal;
+		},
 		getContextUsage: () => ({
 			percent: usagePercent.value,
 			tokens: Math.round((200_000 * usagePercent.value) / 100)
@@ -273,7 +279,12 @@ function createFakeCtx(cwd: string): FakeCtx {
 		widgets,
 		notifications,
 		usagePercent,
-		abortRun: () => runAbortController.abort(),
+		abortRun: () => {
+			runAbortController.abort();
+		},
+		newRun: () => {
+			runAbortController = new AbortController();
+		},
 		abortCalls,
 		idle,
 		customFactories,
@@ -552,6 +563,108 @@ describe('ralph-loop extension', () => {
 		// new message (only the start's iteration prompt was sent).
 		expect(statusLine(fakeCtx.widgets)).not.toContain('Ralph (auto)');
 		expect(fake.userMessages.length).toBe(1);
+	});
+
+	test('an ignored cycle instruction is enforced at settle when the model never calls ralph_cycle', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(2); // iteration prompt + intercept
+
+		// The model ignores the instruction; the turn settles without a cycle.
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		// The extension queues the escape cycle itself: the context cut does
+		// not depend on the stuck model's cooperation.
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.length).toBe(3);
+		expect(fake.userMessages[2].text).toContain('A reasoning loop was detected');
+		expect(fake.userMessages[2].text).toContain('Finish up now');
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
+	});
+
+	test('a renewed detection enforces the escape: the stuck run is aborted and the cycle queued', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+
+		// First detection: the model is asked to call ralph_cycle.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(2);
+		expect(fakeCtx.abortCalls.value).toBe(0);
+
+		// The model ignores it and loops on: the renewed detection enforces —
+		// the stuck run is aborted and the escape cycle is queued, so the
+		// recording prompt starts as soon as the abort lands.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fakeCtx.abortCalls.value).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.length).toBe(3);
+		expect(fake.userMessages[2].text).toContain('A reasoning loop was detected');
+		expect(fake.userMessages[2].text).toContain('Finish up now');
+		expect(fake.userMessages[2].options).toEqual({ deliverAs: 'followUp' });
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
+
+		// The aborted run settles: the self-abort must not pause the loop.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+
+		// The recording turn runs with a fresh run signal (like pi: each run
+		// has its own abort signal) and settles: the fresh iteration starts
+		// from the cut.
+		fakeCtx.newRun();
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+	});
+
+	test('a complied ralph_cycle clears the pending escape: no enforcement, and a later detection asks again', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		const cycle = fake.tools.get('ralph_cycle') as {
+			execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
+		};
+		await cycle.execute('t', { note: 'stuck' }, undefined, undefined, fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(3); // iteration prompt + intercept + recording prompt
+
+		// A renewed detection while the cycle is pending is suppressed: no
+		// abort, no second cycle.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fakeCtx.abortCalls.value).toBe(0);
+		expect(fake.userMessages.length).toBe(3);
+
+		// The recording turn settles: the fresh iteration starts.
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+
+		// A detection in the fresh iteration starts a new ask — not an
+		// enforcement (the pending flag was cleared by the complied cycle).
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fakeCtx.abortCalls.value).toBe(0);
+		expect(fake.userMessages.at(-1)?.text).toContain('ralph_cycle');
 	});
 
 	test('context-limit cycle finishes up, then starts a fresh iteration with incremented counters', async () => {

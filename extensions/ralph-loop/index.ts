@@ -1536,6 +1536,18 @@ export default function (pi: ExtensionAPI) {
 	// loop-police detection event carries no ctx, but arming the auto loop on
 	// a loop-escape detection needs one (session manager, UI, cwd).
 	let lastCtx: ExtensionContext | undefined;
+	// Set when the cycle instruction was steered into a running turn: a
+	// looping model sometimes ignores it, so a renewed detection enforces the
+	// escape (abort + cycle) and the next settle queues the escape cycle as a
+	// fallback — the context cut must not depend on the stuck model's
+	// cooperation. Cleared when any cycle is queued, when the loop stops, and
+	// at the settle that consumes it.
+	let loopEscapePending = false;
+	// Set when the extension itself aborts the run to enforce a loop escape:
+	// the settle must not treat that abort as a user Escape (which would pause
+	// the loop) — the escape cycle is already queued and its recording turn
+	// follows. Cleared at the next agent_start (the recording turn).
+	let selfEscapeAbort = false;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -1757,6 +1769,7 @@ export default function (pi: ExtensionAPI) {
 		taskCount = undefined;
 		goalState = undefined;
 		freshIterationPending = false;
+		loopEscapePending = false;
 		// A force stop can land while a cycle compaction is in flight; the
 		// pending ralph summary must not hijack a later, unrelated compaction
 		// (e.g. the user's own /compact).
@@ -1922,7 +1935,7 @@ export default function (pi: ExtensionAPI) {
 				if (!armed) throw new Error('Could not arm the Ralph auto loop.');
 			}
 			if (!state) throw new Error('No active Ralph loop — start one with /ralph start.');
-			if (state.cycleQueued) throw new Error('A cycle is already pending; it runs when the current turn ends.');
+			if (state.cycleQueued) throw new Error('A cycle is already pending. Stop working now — do not call ralph_cycle again; the progress-recording turn follows when this turn ends.');
 			if (state.stopRequested) throw new Error('The loop is stopping after the current iteration; stop working instead of cycling.');
 			const lastIteration = state.iteration + 1 > state.maxIterations;
 			// The note and the reload flag ride on the state the cycle persists:
@@ -2903,6 +2916,10 @@ export default function (pi: ExtensionAPI) {
 		reason: CycleReason,
 		options?: { midTurn?: boolean; currentTodo?: string }
 	) => {
+		// Any queued cycle resolves a pending loop escape: the model complied
+		// (or a cycle ran for another reason), so neither the enforcement nor
+		// the settle fallback may fire on top of it.
+		loopEscapePending = false;
 		if (!state?.enabled || state.cycleQueued) return;
 
 		// For completed-task cycles, name the completed task(s) in the
@@ -2952,6 +2969,8 @@ export default function (pi: ExtensionAPI) {
 		freshIterationPending = false;
 		turnStartedOverBudget = false;
 		lastCtx = undefined;
+		loopEscapePending = false;
+		selfEscapeAbort = false;
 		lastAssistantStopReason = undefined;
 		runSawAssistantMessage = true;
 		runAbortedByUser = false;
@@ -3190,6 +3209,7 @@ export default function (pi: ExtensionAPI) {
 	// not caught up with the fresh (filtered) context yet.
 	pi.on('agent_start', (_event, ctx) => {
 		lastCtx = ctx;
+		selfEscapeAbort = false;
 		lastAssistantStopReason = undefined;
 		runSawAssistantMessage = false;
 		runAbortedByUser = false;
@@ -3227,6 +3247,21 @@ export default function (pi: ExtensionAPI) {
 		if (!event || !LOOP_POLICE_REASONING_EVENTS.has(event)) return;
 		if (state?.enabled) {
 			if (state.cycleQueued || state.stopRequested) return;
+			const ctx = lastCtx;
+			if (loopEscapePending && ctx) {
+				// The previous intercept was ignored and the model is looping
+				// again: enforce the escape — abort the stuck run and queue the
+				// cycle ourselves, so the context cut no longer depends on the
+				// stuck model's cooperation. The recording prompt (followUp)
+				// starts the recording turn as soon as the abort lands.
+				loopEscapePending = false;
+				selfEscapeAbort = true;
+				ctx.abort();
+				ctx.ui.notify('Ralph: the model ignored the loop-escape instruction — aborting the stuck turn and cutting to a fresh iteration', 'warning');
+				queueCycle(ctx, 'loop-escape');
+				return;
+			}
+			loopEscapePending = true;
 			pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('cycle-on-loop', { event })}`, { deliverAs: 'steer' });
 			return;
 		}
@@ -3329,12 +3364,35 @@ export default function (pi: ExtensionAPI) {
 		// iterations (a typed message resumes the loop before its turn runs).
 		if (state.paused) return;
 		if (userAborted) {
+			// The user took the wheel: the intercept's chance to self-correct is
+			// void, so the pending escape is dropped — a renewed detection re-arms
+			// it instead of firing a cut right after a manual resume.
+			loopEscapePending = false;
+			if (selfEscapeAbort) {
+				// Our own enforcement abort, not a user Escape: the escape cycle
+				// is already queued and its recording prompt pending — continue
+				// the cycle instead of pausing.
+				selfEscapeAbort = false;
+				return;
+			}
 			if (state.stopRequested) {
 				stopLoop(ctx, 'Ralph loop stopped after the current iteration');
 			} else {
 				pauseLoop(ctx, 'Ralph loop paused (Escape) — type a message to resume it with extra info');
 			}
 			return;
+		}
+		// Loop-escape fallback: the intercept instructed the model to call
+		// ralph_cycle, but a looping model sometimes ignores it — if the turn
+		// settles without a queued cycle, queue the escape cycle ourselves.
+		// The model-requested cycle (with its stuck-pattern note) always wins
+		// when the model did comply; a requested stop still ends the loop.
+		if (loopEscapePending) {
+			loopEscapePending = false;
+			if (!state.cycleQueued && !state.stopRequested) {
+				queueCycle(ctx, 'loop-escape');
+				return;
+			}
 		}
 		if (state.cycleQueued) {
 			// The progress-recording turn (context checkpoint or completion record)
