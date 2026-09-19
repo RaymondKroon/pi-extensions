@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createLocalBashOperations, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 /**
@@ -614,6 +615,19 @@ interface AlarmEntry {
   timer?: NodeJS.Timeout;
 }
 
+/** Details the wait_for tool attaches to its result, for rendering. */
+interface WaitDetails {
+  met: boolean;
+  timedOut?: boolean;
+  cancelled?: boolean;
+  elapsedSec?: number;
+}
+
+/** Truncate a command for a single-line tool-call display. */
+function clipCommand(cmd: string, max = 80): string {
+  return cmd.length > max ? `${cmd.slice(0, max - 1)}…` : cmd;
+}
+
 export default function (pi: ExtensionAPI) {
   const GUARDED_TOOLS = ["bash", "powershell"] as const;
 
@@ -652,6 +666,20 @@ export default function (pi: ExtensionAPI) {
       timeout: Type.Optional(Type.Number({ description: `Max seconds to wait (default and max ${MAX_TIMEOUT_SECONDS}).` })),
       interval: Type.Optional(Type.Number({ description: "Seconds between checks (default 2, min 1)." })),
     }),
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("wait_for "));
+      text += theme.fg("accent", clipCommand(args.command));
+      if (args.timeout) text += theme.fg("dim", ` (timeout: ${args.timeout}s)`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      const c = result.content?.[0];
+      const msg = c?.type === "text" ? c.text : "";
+      if (isPartial) return new Text(theme.fg("warning", msg || "Waiting…"), 0, 0);
+      const d = result.details as WaitDetails | undefined;
+      const color = d?.met ? "success" : d?.cancelled ? "muted" : "warning";
+      return new Text(theme.fg(color, msg), 0, 0);
+    },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const capMs = Math.min(Math.max(1, params.timeout ?? MAX_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000;
       const intervalMs = Math.max(1, params.interval ?? 2) * 1000;
@@ -702,6 +730,13 @@ export default function (pi: ExtensionAPI) {
       note: Type.Optional(Type.String({ description: "Message to include when the alarm wakes you." })),
       cancel: Type.Optional(Type.String({ description: "Cancel the pending alarm with this id instead of scheduling a new one." })),
     }),
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("alarm "));
+      if (args.cancel) text += theme.fg("dim", `cancel ${args.cancel}`);
+      else if (args.delay != null) text += theme.fg("accent", `in ${args.delay}s`);
+      else if (args.command) text += theme.fg("accent", clipCommand(args.command));
+      return new Text(text, 0, 0);
+    },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.cancel) {
         if (!cancelAlarm(params.cancel)) {
