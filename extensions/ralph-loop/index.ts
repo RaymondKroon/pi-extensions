@@ -53,6 +53,16 @@ const COMPLETION_SUMMARY_TYPE = 'ralph-loop-completion-summary';
 /** Marker in a ralph-provided compaction entry's details (distinguishes it from pi's LLM compactions). */
 const COMPACTION_SOURCE = 'ralph-loop';
 /**
+ * pi-loop-police detection events that indicate a reasoning loop (repeated
+ * thinking, within one stream or across turns). Only these trigger the
+ * cycle instruction (active loop) or the auto-loop arming (auto mode, no
+ * active loop). Tool-call detections (tool_loop, file_scan_loop,
+ * redundant_reread, search_spiral) and output-stream loops are ignored on
+ * purpose: cycling on repeated tool calls is too restrictive for legitimate
+ * re-runs (build/test/lint).
+ */
+const LOOP_POLICE_REASONING_EVENTS = new Set(['stagnation', 'rederived_reasoning', 'thinking_loop', 'semantic_loop']);
+/**
  * The ralph backlog directory: every loop (tasks/goal/auto) and every idle
  * ralph_todo/ralph_goal read runs on the per-session ralph file here. Stored
  * in the ralph subdirectory of pi's global agent directory (like sessions in
@@ -107,7 +117,7 @@ const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, CYCLE_TOOL_NAME];
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
-type CycleReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested' | 'iteration-ended';
+type CycleReason = 'completed-task' | 'plan-updated' | 'phase-changed' | 'context-limit' | 'model-requested' | 'iteration-ended' | 'loop-escape';
 
 interface RalphConfig {
 	/**
@@ -248,7 +258,8 @@ function isRalphState(value: unknown): value is RalphState {
 			cycleReason === 'phase-changed' ||
 			cycleReason === 'context-limit' ||
 			cycleReason === 'model-requested' ||
-			cycleReason === 'iteration-ended') &&
+			cycleReason === 'iteration-ended' ||
+			cycleReason === 'loop-escape') &&
 		(cycleNote === undefined || typeof cycleNote === 'string') &&
 		(state.reloadRequested === undefined || typeof state.reloadRequested === 'boolean') &&
 		(cycleCheckpointing === undefined || typeof cycleCheckpointing === 'boolean') &&
@@ -810,6 +821,8 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		const contextNote =
 			reason === 'context-limit'
 				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. The backlog also carries "Findings: " entries with what the previous iteration learned, and DEBUG.md at the project root may carry durable debug findings — read them before starting work instead of rediscovering what they already establish.'
+				: reason === 'loop-escape'
+				? 'A reasoning loop was detected, so the previous iteration was cut and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat the reasoning that led to the loop.'
 				: reason === 'model-requested'
 				? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat what the recorded checkpoint lists as already tried.`
 			: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
@@ -845,6 +858,8 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 					? 'The goal phase changed. Start the next independent iteration with a clean review of the repository and the backlog.'
 					: reason === 'iteration-ended'
 						? 'The previous iteration ended. Start the next independent iteration with a clean review of the repository and the backlog.'
+						: reason === 'loop-escape'
+						? 'A reasoning loop was detected, so the previous iteration was cut. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat the reasoning that led to the loop.'
 						: reason === 'model-requested'
 							? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat what the recorded checkpoint lists as already tried.`
 						: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
@@ -1000,6 +1015,8 @@ function recordingPromptFor(state: RalphState): string {
 			? finishUpPrompt(state, 'model-requested')
 		: state.cycleReason === 'phase-changed'
 			? finishUpPrompt(state, 'phase-changed')
+		: state.cycleReason === 'loop-escape'
+			? finishUpPrompt(state, 'loop-escape')
 		: state.cycleReason === 'iteration-ended'
 			? state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
 				? contextCheckpointPrompt(state)
@@ -1040,7 +1057,7 @@ function contextCheckpointPromptBody(state: RalphState): string {
  */
 function finishUpPrompt(
 	state: RalphState,
-	reason: 'context-limit' | 'phase-changed' | 'model-requested' | 'iteration-ended'
+	reason: 'context-limit' | 'phase-changed' | 'model-requested' | 'iteration-ended' | 'loop-escape'
 ): string {
 	const isAuto = state.mode === 'auto';
 	// The auto loop records its todos in the session category; the other loops
@@ -1057,6 +1074,8 @@ function finishUpPrompt(
 			? `You requested a fresh Ralph iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
 		: reason === 'iteration-ended'
 			? 'The current Ralph iteration has ended. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
+		: reason === 'loop-escape'
+			? 'A reasoning loop was detected. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog with a clean context.'
 		: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
 	return `${automatedPrefix()}${renderPrompt('finish-up', {
 		opening,
@@ -1513,6 +1532,10 @@ export default function (pi: ExtensionAPI) {
 	// In-flight auto-arm setup; the promise cache keeps a burst of streaming
 	// updates from arming two loops (two session categories).
 	let autoArmInFlight: Promise<RalphState | undefined> | undefined;
+	// The most recent extension context (captured at agent_start): the
+	// loop-police detection event carries no ctx, but arming the auto loop on
+	// a loop-escape detection needs one (session manager, UI, cwd).
+	let lastCtx: ExtensionContext | undefined;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -2928,6 +2951,7 @@ export default function (pi: ExtensionAPI) {
 		goalState = undefined;
 		freshIterationPending = false;
 		turnStartedOverBudget = false;
+		lastCtx = undefined;
 		lastAssistantStopReason = undefined;
 		runSawAssistantMessage = true;
 		runAbortedByUser = false;
@@ -3165,6 +3189,7 @@ export default function (pi: ExtensionAPI) {
 	// cannot re-trigger immediately after a cycle whose reported usage has
 	// not caught up with the fresh (filtered) context yet.
 	pi.on('agent_start', (_event, ctx) => {
+		lastCtx = ctx;
 		lastAssistantStopReason = undefined;
 		runSawAssistantMessage = false;
 		runAbortedByUser = false;
@@ -3182,6 +3207,34 @@ export default function (pi: ExtensionAPI) {
 		if ((ctx as { signal?: AbortSignal }).signal?.aborted) {
 			runAbortedByUser = true;
 		}
+	});
+
+	// Loop escape hatch for the optional pi-loop-police extension: when it
+	// detects a reasoning loop, instruct the model to request a fresh Ralph
+	// iteration — the context cut is the strongest reset for a stuck model.
+	// loop-police already sends its own recovery message (triggerTurn) on the
+	// same detection, so this instruction joins that turn; no ctx is needed.
+	// Only reasoning-loop events act here (see LOOP_POLICE_REASONING_EVENTS),
+	// and never while a cycle is already pending or the loop is stopping.
+	// With no loop active yet, a reasoning loop in auto mode arms the auto
+	// loop instead: the fresh iteration's context cut is the escape, and the
+	// steered recording prompt joins loop-police's recovery turn the same way
+	// (the steer survives the aborted run and is delivered at the next LLM
+	// call). An explicit /ralph stop of the auto loop still wins
+	// (autoInterceptSuspended), like the context-budget intercept.
+	pi.events.on('loop-police:detection', (data) => {
+		const event = (data as { event?: string } | null | undefined)?.event;
+		if (!event || !LOOP_POLICE_REASONING_EVENTS.has(event)) return;
+		if (state?.enabled) {
+			if (state.cycleQueued || state.stopRequested) return;
+			pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('cycle-on-loop', { event })}`, { deliverAs: 'steer' });
+			return;
+		}
+		const ctx = lastCtx;
+		if (config.autoMode !== 'on' || autoInterceptSuspended || !ctx) return;
+		void armAutoLoop(ctx).then((armed) => {
+			if (armed) queueCycle(ctx, 'loop-escape', { midTurn: true });
+		});
 	});
 
 	pi.on('context', (event) => {

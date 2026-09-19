@@ -1,0 +1,1 @@
+A reasoning loop was detected ({{event}}): you are repeating the same reasoning without making progress. Break the loop by requesting a fresh iteration: call ralph_cycle with a note describing the stuck pattern (what you are repeating and what a fresh iteration should try differently), then stop working. The fresh iteration continues from the backlog with a clean context.

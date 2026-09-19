@@ -50,6 +50,7 @@ interface FakeCustomMessage {
 
 function createFakePi() {
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+	const eventHandlers = new Map<string, Array<(data: unknown) => unknown>>();
 	const tools = new Map<string, unknown>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => unknown }>();
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
@@ -80,6 +81,17 @@ function createFakePi() {
 		sendMessage: (message: { customType?: string; content?: string }, options?: unknown) => {
 			customMessages.push({ message, options });
 		},
+		events: {
+			on: (name: string, handler: (data: unknown) => unknown) => {
+				const list = eventHandlers.get(name) ?? [];
+				list.push(handler);
+				eventHandlers.set(name, list);
+				return () => {};
+			},
+			emit: (name: string, data: unknown) => {
+				for (const handler of eventHandlers.get(name) ?? []) handler(data);
+			}
+		},
 		getActiveTools: () => [...activeTools],
 		setActiveTools: (names: string[]) => {
 			activeTools.length = 0;
@@ -102,6 +114,10 @@ function createFakePi() {
 				if (result !== undefined) last = result;
 			}
 			return last;
+		},
+		/** Emit on the shared extension event bus (pi.events). */
+		fireEvent: (name: string, data: unknown) => {
+			for (const handler of eventHandlers.get(name) ?? []) handler(data);
 		}
 	};
 }
@@ -441,6 +457,101 @@ describe('ralph-loop extension', () => {
 		expect(result!.systemPrompt.startsWith('BASE\n\n')).toBe(true);
 		expect(result!.systemPrompt).toContain('no periodic re-trigger');
 		expect(result!.systemPrompt).toContain('misperception');
+	});
+
+	test('loop-police reasoning-loop detection instructs the model to cycle; other detections are ignored', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		// No active loop and auto mode off (default): ralph_cycle would fail and
+		// there is no auto loop to arm, so the detection is ignored.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(0);
+
+		await startLoop(fake, fakeCtx);
+		expect(fake.userMessages.length).toBe(1);
+
+		// A reasoning-loop detection instructs a cycle, naming the event.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation', consecutiveLoops: 1 });
+		expect(fake.userMessages.length).toBe(2);
+		const instruction = fake.userMessages[1].text;
+		expect(instruction).toContain('Automated Ralph loop instruction');
+		expect(instruction).toContain('ralph_cycle');
+		expect(instruction).toContain('stagnation');
+
+		// Tool-call and output-stream detections are ignored.
+		for (const event of ['tool_loop', 'file_scan_loop', 'redundant_reread', 'search_spiral', 'output_loop', 'output_semantic_loop']) {
+			fake.fireEvent('loop-police:detection', { event });
+		}
+		expect(fake.userMessages.length).toBe(2);
+
+		// A pending cycle suppresses further instructions (the recording prompt
+		// from ralph_cycle is the only new message).
+		const cycle = fake.tools.get('ralph_cycle') as {
+			execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
+		};
+		await cycle.execute('t', { note: 'stuck' }, undefined, undefined, fakeCtx.ctx);
+		expect(fake.userMessages.length).toBe(3);
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(3);
+	});
+
+	test('loop-police reasoning-loop detection arms the auto loop and queues the escape cycle when no loop is active', async () => {
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		// The detection event carries no ctx: the handler arms with the last
+		// agent_start's context.
+		await fake.fire('agent_start', fakeCtx.ctx);
+
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		await flush();
+
+		// The auto loop is armed (iteration 1) and the escape cycle is queued:
+		// the recording prompt is steered into loop-police's recovery turn.
+		const status = statusLine(fakeCtx.widgets);
+		expect(status).toContain('Ralph (auto)');
+		expect(status).toContain('finishing');
+		expect(status).toContain('iteration 1/10');
+		expect(fake.userMessages.length).toBe(1);
+		expect(fake.userMessages[0].text).toContain('A reasoning loop was detected');
+		expect(fake.userMessages[0].text).toContain('Finish up now');
+		expect(fake.userMessages[0].options).toEqual({ deliverAs: 'steer' });
+		// The persisted state carries the loop-escape cycle reason.
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
+	});
+
+	test('loop-police detection does not re-arm the auto loop after an explicit stop', async () => {
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+		);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto)');
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).not.toContain('Ralph (auto)');
+
+		await fake.fire('agent_start', fakeCtx.ctx);
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		await flush();
+
+		// The explicit stop wins over the loop-escape arming: no re-arm, no
+		// new message (only the start's iteration prompt was sent).
+		expect(statusLine(fakeCtx.widgets)).not.toContain('Ralph (auto)');
+		expect(fake.userMessages.length).toBe(1);
 	});
 
 	test('context-limit cycle finishes up, then starts a fresh iteration with incremented counters', async () => {
