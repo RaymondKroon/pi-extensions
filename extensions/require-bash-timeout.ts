@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 /**
  * Fails any bash (or powershell) tool call that does not specify a timeout,
@@ -14,6 +15,14 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
  * command position in the command string (respecting quotes, comments,
  * operators, subshells, command substitution, wrappers and here-docs) and
  * blocks the call if any of them is in DISALLOWED_COMMANDS.
+ *
+ * Because a single call is capped at MAX_TIMEOUT_SECONDS, long work must run
+ * in the background. To wait for it without busy-waiting (sleep is disallowed),
+ * this extension also provides two tools:
+ *
+ *   - wait_for: block (up to the cap) until a shell condition exits 0.
+ *   - alarm:    schedule a later wake-up (timed or condition-based) so the
+ *               agent can do other work now and be interrupted when it fires.
  */
 const MAX_TIMEOUT_SECONDS = 300;
 
@@ -25,7 +34,8 @@ const MAX_TIMEOUT_SECONDS = 300;
 const DISALLOWED_COMMANDS: Record<string, string> = {
   sleep:
     "sleep is disallowed — do not use it to wait or pace yourself; " +
-    "restructure the work or poll for completion instead",
+    "use wait_for to block until a condition is met, or alarm to be woken " +
+    "later while you continue other work",
 };
 
 /** Wrappers whose actual command is the following word. */
@@ -371,8 +381,399 @@ export function extractCommandNames(command: string): string[] {
   return names;
 }
 
+/**
+ * Detect busy-wait loops: `while`/`until`/`for` loops whose body has no
+ * `sleep` and does no real work (only no-ops like `:` / `true` / nothing).
+ * These spin the CPU while waiting and should use wait_for / alarm instead.
+ * Returns a short description for each detected loop.
+ *
+ * Conservative on purpose: a loop whose body contains a real command (or a
+ * `$(...)`/backtick/`(...)` group) is left alone, so legitimate processing
+ * loops are never flagged. Only command-position loop keywords are considered,
+ * so `while`/`for` used as plain arguments are ignored.
+ */
+export function findBusyWaitLoops(command: string): string[] {
+  const results: string[] = [];
+  const n = command.length;
+  const LOOP_KW = new Set(["while", "until", "for"]);
+  const NOOP = new Set([":", "true"]);
+
+  // Advance past a group starting at `start` ($( ... ), backticks, or ( ... ))
+  // and return the index just past its closing delimiter. Contents are opaque.
+  const skipGroup = (start: number): number => {
+    const c = command[start];
+    if (c === "$" && command[start + 1] === "(") {
+      let depth = 1;
+      let k = start + 2;
+      while (k < n && depth > 0) {
+        if (command[k] === "(") depth++;
+        else if (command[k] === ")") depth--;
+        k++;
+      }
+      return k;
+    }
+    if (c === "`") {
+      let k = start + 1;
+      while (k < n && command[k] !== "`") {
+        if (command[k] === "\\") k++;
+        k++;
+      }
+      return k + 1;
+    }
+    if (c === "(") {
+      let depth = 1;
+      let k = start + 1;
+      while (k < n && depth > 0) {
+        if (command[k] === "(") depth++;
+        else if (command[k] === ")") depth--;
+        k++;
+      }
+      return k;
+    }
+    return start + 1;
+  };
+
+  // Read one word starting at `start` (quote/comment aware), stopping at
+  // whitespace or a shell operator. Returns the word and the index past it.
+  const readWord = (start: number): { word: string; next: number } => {
+    let k = start;
+    while (k < n) {
+      const ch = command[k];
+      if (/\s/.test(ch) || ";|&()".includes(ch)) break;
+      if (ch === "\\") {
+        k += 2;
+        continue;
+      }
+      if (ch === "'") {
+        k++;
+        while (k < n && command[k] !== "'") k++;
+        k++;
+        continue;
+      }
+      if (ch === '"') {
+        k++;
+        while (k < n && command[k] !== '"') k++;
+        k++;
+        continue;
+      }
+      k++;
+    }
+    return { word: command.slice(start, k), next: k };
+  };
+
+  // A body is a busy-wait if it has no `sleep` and no real command — only
+  // no-ops (`:`, `true`) and separators, with no command/substitution groups.
+  const isTrivialBusyWaitBody = (body: string): boolean => {
+    if (/\bsleep\b/.test(body)) return false;
+    const noComments = body.replace(/#[^\n]*/g, " ");
+    const noQuotes = noComments.replace(/'[^']*'/g, " ").replace(/"[^"]*"/g, " ");
+    if (/\$\(|`|[()]/.test(noQuotes)) return false; // does real work
+    const tokens = noQuotes.split(/[\s;|&]+/).filter(Boolean);
+    return tokens.every((t) => NOOP.has(t));
+  };
+
+  let i = 0;
+  let atCmdPos = true;
+  while (i < n) {
+    const c = command[i];
+    if (/\s/.test(c)) {
+      if (c === "\n") atCmdPos = true;
+      i++;
+      continue;
+    }
+    if (c === "#") {
+      while (i < n && command[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      const q = c;
+      i++;
+      while (i < n && command[i] !== q) {
+        if (command[i] === "\\") i++;
+        i++;
+      }
+      i++;
+      continue;
+    }
+    if (c === "$" && command[i + 1] === "(") {
+      const end = skipGroup(i);
+      results.push(...findBusyWaitLoops(command.slice(i + 2, end - 1)));
+      i = end;
+      continue;
+    }
+    if (c === "`" || c === "(") {
+      const end = skipGroup(i);
+      results.push(...findBusyWaitLoops(command.slice(i + 1, end - 1)));
+      if (c === "(") atCmdPos = true;
+      i = end;
+      continue;
+    }
+    if (";|&".includes(c)) {
+      atCmdPos = true;
+      i++;
+      continue;
+    }
+
+    const { word, next } = readWord(i);
+    i = next;
+    if (!atCmdPos) continue;
+    atCmdPos = false;
+    if (!LOOP_KW.has(word)) continue;
+
+    // Scan forward for this loop's `do`, then its body up to the matching `done`.
+    let j = i; // just past the loop keyword
+    let doDoneDepth = 0;
+    let sawDo = false;
+    let bodyStart = -1;
+    let bodyEnd = -1;
+    while (j < n) {
+      const ch = command[j];
+      if (/\s/.test(ch)) {
+        j++;
+        continue;
+      }
+      if (ch === "#") {
+        while (j < n && command[j] !== "\n") j++;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        const q = ch;
+        j++;
+        while (j < n && command[j] !== q) {
+          if (command[j] === "\\") j++;
+          j++;
+        }
+        j++;
+        continue;
+      }
+      if (ch === "$" && command[j + 1] === "(") {
+        j = skipGroup(j);
+        continue;
+      }
+      if (ch === "`" || ch === "(") {
+        j = skipGroup(j);
+        continue;
+      }
+      if (";|&".includes(ch)) {
+        j++;
+        continue;
+      }
+      const wStart = j;
+      const w = readWord(j);
+      j = w.next;
+      if (w.word === "do") {
+        if (!sawDo) {
+          sawDo = true;
+          bodyStart = j;
+        }
+        doDoneDepth++;
+        continue;
+      }
+      if (w.word === "done") {
+        doDoneDepth--;
+        if (sawDo && doDoneDepth === 0) {
+          bodyEnd = wStart;
+          break;
+        }
+        continue;
+      }
+    }
+
+    if (sawDo && bodyEnd !== -1 && isTrivialBusyWaitBody(command.slice(bodyStart, bodyEnd))) {
+      results.push(`${word} loop with no sleep and an empty/no-op body`);
+    }
+    // Continue the outer scan from just past the keyword (i already == next),
+    // so nested loops in the body are also inspected.
+  }
+
+  return results;
+}
+
+/** Per-check cap so a hanging condition command can't block a wait forever. */
+const CHECK_TIMEOUT_MS = 30_000;
+
+/** Abortable sleep: resolves after `ms`, or immediately once `signal` aborts. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+interface AlarmEntry {
+  cancelled: boolean;
+  controller: AbortController;
+  timer?: NodeJS.Timeout;
+}
+
 export default function (pi: ExtensionAPI) {
   const GUARDED_TOOLS = ["bash", "powershell"] as const;
+
+  const ops = createLocalBashOperations();
+  const alarms = new Map<string, AlarmEntry>();
+  let alarmSeq = 0;
+
+  const cancelAlarm = (id: string): boolean => {
+    const entry = alarms.get(id);
+    if (!entry) return false;
+    entry.cancelled = true;
+    entry.controller.abort();
+    if (entry.timer) clearTimeout(entry.timer);
+    alarms.delete(id);
+    return true;
+  };
+
+  // Run a shell condition once and return its exit code (null on error/timeout).
+  const runCheck = async (command: string, cwd: string, signal?: AbortSignal): Promise<number | null> => {
+    try {
+      const r = await ops.exec(command, cwd, { onData: () => {}, signal, timeout: CHECK_TIMEOUT_MS });
+      return r.exitCode;
+    } catch {
+      return null;
+    }
+  };
+
+  // ---- wait_for: block until a shell condition exits 0 (or a timeout) ----
+  pi.registerTool({
+    name: "wait_for",
+    label: "Wait For",
+    description:
+      "Block until a shell command exits 0 (condition met) or a timeout elapses — use to wait for a background job instead of busy-waiting.",
+    parameters: Type.Object({
+      command: Type.String({ description: "Shell command to run as the check; exit code 0 means the condition is met." }),
+      timeout: Type.Optional(Type.Number({ description: `Max seconds to wait (default and max ${MAX_TIMEOUT_SECONDS}).` })),
+      interval: Type.Optional(Type.Number({ description: "Seconds between checks (default 2, min 1)." })),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const capMs = Math.min(Math.max(1, params.timeout ?? MAX_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000;
+      const intervalMs = Math.max(1, params.interval ?? 2) * 1000;
+      const start = Date.now();
+      let checks = 0;
+      for (;;) {
+        if (signal?.aborted) {
+          return {
+            content: [{ type: "text", text: `Cancelled after ${((Date.now() - start) / 1000).toFixed(1)}s.` }],
+            details: { met: false, cancelled: true },
+          };
+        }
+        checks++;
+        const exitCode = await runCheck(params.command, ctx.cwd, signal);
+        if (exitCode === 0) {
+          const s = (Date.now() - start) / 1000;
+          return {
+            content: [{ type: "text", text: `Condition met after ${s.toFixed(1)}s (${checks} check${checks === 1 ? "" : "s"}).` }],
+            details: { met: true, elapsedSec: Number(s.toFixed(1)) },
+          };
+        }
+        if (Date.now() - start >= capMs) {
+          return {
+            content: [{ type: "text", text: `Timed out after ${capMs / 1000}s waiting for: \`${params.command}\`` }],
+            details: { met: false, timedOut: true },
+          };
+        }
+        onUpdate?.({
+          content: [{ type: "text", text: `Waiting… ${((Date.now() - start) / 1000).toFixed(0)}s / ${capMs / 1000}s` }],
+          details: { met: false },
+        });
+        await sleep(intervalMs, signal);
+      }
+    },
+  });
+
+  // ---- alarm: schedule a later wake-up (timed or condition-based) ----
+  pi.registerTool({
+    name: "alarm",
+    label: "Alarm",
+    description:
+      "Schedule a later wake-up — timed (delay seconds) or condition (command that exits 0) — so you can do other work and be interrupted when it fires; pass cancel to remove a pending alarm by id.",
+    parameters: Type.Object({
+      delay: Type.Optional(Type.Number({ description: `Seconds until a timed alarm fires (max ${MAX_TIMEOUT_SECONDS}).` })),
+      command: Type.Optional(Type.String({ description: "Shell condition to poll; exit code 0 fires the alarm." })),
+      interval: Type.Optional(Type.Number({ description: "Seconds between condition checks (default 2, min 1)." })),
+      timeout: Type.Optional(Type.Number({ description: `For condition alarms: give up after this many seconds (default and max ${MAX_TIMEOUT_SECONDS}).` })),
+      note: Type.Optional(Type.String({ description: "Message to include when the alarm wakes you." })),
+      cancel: Type.Optional(Type.String({ description: "Cancel the pending alarm with this id instead of scheduling a new one." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.cancel) {
+        if (!cancelAlarm(params.cancel)) {
+          return { content: [{ type: "text", text: `No pending alarm with id "${params.cancel}".` }], isError: true };
+        }
+        return { content: [{ type: "text", text: `Cancelled alarm ${params.cancel}.` }], details: { cancelled: true, id: params.cancel } };
+      }
+
+      if (params.delay == null && !params.command) {
+        return {
+          content: [{ type: "text", text: "Provide `delay` (timed) or `command` (condition), or `cancel` (id) to remove an alarm." }],
+          isError: true,
+        };
+      }
+
+      const id = `a${++alarmSeq}`;
+      const note = params.note?.trim();
+      const entry: AlarmEntry = { cancelled: false, controller: new AbortController() };
+      alarms.set(id, entry);
+
+      const fire = (reason: string) => {
+        if (entry.cancelled || !alarms.has(id)) return;
+        alarms.delete(id);
+        pi.sendMessage(
+          {
+            customType: "bash-wait-alarm",
+            content: `⏰ Alarm ${id}: ${reason}${note ? ` — ${note}` : ""}`,
+            display: true,
+            details: { id, reason },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      };
+
+      if (params.delay != null) {
+        const sec = Math.min(Math.max(1, params.delay), MAX_TIMEOUT_SECONDS);
+        entry.timer = setTimeout(() => fire(`fired after ${sec}s`), sec * 1000);
+        return {
+          content: [{ type: "text", text: `Scheduled timed alarm ${id} in ${sec}s. You will be woken when it fires.` }],
+          details: { scheduled: true, id, delaySec: sec },
+        };
+      }
+
+      const command = params.command!;
+      const intervalMs = Math.max(1, params.interval ?? 2) * 1000;
+      const capMs = Math.min(Math.max(1, params.timeout ?? MAX_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000;
+      void (async () => {
+        const start = Date.now();
+        while (!entry.cancelled) {
+          const exitCode = await runCheck(command, ctx.cwd, entry.controller.signal);
+          if (entry.cancelled) return;
+          if (exitCode === 0) {
+            fire(`condition met: \`${command}\``);
+            return;
+          }
+          if (Date.now() - start >= capMs) {
+            fire(`timed out after ${capMs / 1000}s waiting for: \`${command}\``);
+            return;
+          }
+          await sleep(intervalMs, entry.controller.signal);
+        }
+      })();
+      return {
+        content: [{ type: "text", text: `Scheduled condition alarm ${id} (checking every ${intervalMs / 1000}s, up to ${capMs / 1000}s). You will be woken when it fires or times out.` }],
+        details: { scheduled: true, id },
+      };
+    },
+  });
+
+  pi.on("session_shutdown", () => {
+    for (const id of [...alarms.keys()]) cancelAlarm(id);
+  });
 
   for (const toolName of GUARDED_TOOLS) {
     pi.on("tool_call", (event) => {
@@ -395,7 +796,8 @@ export default function (pi: ExtensionAPI) {
           reason:
             `Blocked: ${toolName} timeout ${timeout}s exceeds the hard cap of ${MAX_TIMEOUT_SECONDS}s. ` +
             `Re-run with timeout <= ${MAX_TIMEOUT_SECONDS}, or split the work into smaller steps, ` +
-            `or run it in the background (e.g. nohup ... &) and poll for completion.`,
+            `or run it in the background (e.g. nohup ... &) and use wait_for to block until it finishes, ` +
+            `or alarm to be woken later while you do other work.`,
         };
       }
 
@@ -407,6 +809,16 @@ export default function (pi: ExtensionAPI) {
           return {
             block: true,
             reason: `Blocked: disallowed command(s) in bash call: ${details}. Re-run without them.`,
+          };
+        }
+
+        const busyWaits = findBusyWaitLoops(event.input.command);
+        if (busyWaits.length > 0) {
+          return {
+            block: true,
+            reason:
+              `Blocked: busy-wait loop detected (${busyWaits[0]}) — it spins the CPU while waiting. ` +
+              `Use wait_for to block until the condition is met, or alarm to be woken later while you do other work.`,
           };
         }
       }
