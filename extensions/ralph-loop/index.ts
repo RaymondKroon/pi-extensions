@@ -185,10 +185,11 @@ interface RalphState {
 	/** The cycle policy resolved at loop start (the loop mode's configured value); a mid-loop config edit does not change a running loop. */
 	cycleOn: 'task' | 'budget';
 	todoPath: string;
-	/** Backlog snapshot at the start of the current loop (never cycled). */
-	loopStartTodo: string;
-	baselineTodo: string;
-	/** Epoch ms when baselineTodo was taken; attributes completions to the current iteration. */
+	/** Compact backlog diff inputs at the start of the current loop (never cycled). */
+	loopStart: LoopStartSnapshot;
+	/** Compact backlog diff inputs at the start of the current iteration. */
+	baseline: BaselineSnapshot;
+	/** Epoch ms when the baseline was taken; attributes completions to the current iteration. */
 	baselineTime: number;
 	/** 1-based count of Ralph iterations started in this session. */
 	iteration: number;
@@ -220,13 +221,73 @@ interface RalphState {
 	reloadRequested?: boolean;
 }
 
-/** State fields persisted under the old rotation names (pre cycle rename). */
+/**
+ * Compact diff inputs captured from a backlog at the start of an iteration.
+ * The full rendered backlog can run to hundreds of KB and grows over the
+ * loop's lifetime, and the session file is append-only and re-read on every
+ * resume — so the state persists only what the diff checks need (task-id
+ * sets, a count, the goal phase), never the backlog text. The "after" side
+ * of every diff is always the backlog re-read from disk.
+ */
+interface BaselineSnapshot {
+	/** Whether the snapshot is a ralph-format backlog (vs Markdown). */
+	ralph: boolean;
+	/** Completed task count in scope at the snapshot (completed-task cycle trigger). */
+	completed: number;
+	/** Open task ids in scope at the snapshot (ralph format; plan-growth check). */
+	openIds?: number[];
+	/** Done task ids at the snapshot, all categories (ralph format; completion attribution). */
+	doneIds?: number[];
+	/** Goal phase in scope at the snapshot (goal mode). */
+	phase?: GoalPhase;
+}
+
+/** The loop-level snapshot: the baseline plus what the per-loop completion summary diffs against. */
+interface LoopStartSnapshot extends BaselineSnapshot {
+	/** Highest completion-log entry id at loop start; entries above it are new (ids are never reused). */
+	maxLogEntryId?: number;
+	/** Non-null task checkpoints in scope at loop start, by task id. */
+	taskCheckpoints?: Record<number, string>;
+	/** Goal checkpoint text at loop start. */
+	goalCheckpoint?: string | null;
+}
+
+function isBaselineSnapshot(value: unknown): value is BaselineSnapshot {
+	if (!value || typeof value !== 'object') return false;
+	const s = value as Partial<BaselineSnapshot>;
+	return (
+		typeof s.ralph === 'boolean' &&
+		typeof s.completed === 'number' &&
+		(s.openIds === undefined || (Array.isArray(s.openIds) && s.openIds.every((v) => typeof v === 'number'))) &&
+		(s.doneIds === undefined || (Array.isArray(s.doneIds) && s.doneIds.every((v) => typeof v === 'number'))) &&
+		(s.phase === undefined || s.phase === 'planning' || s.phase === 'execution' || s.phase === 're-evaluation')
+	);
+}
+
+function isLoopStartSnapshot(value: unknown): value is LoopStartSnapshot {
+	if (!isBaselineSnapshot(value)) return false;
+	const s = value as Partial<LoopStartSnapshot>;
+	return (
+		(s.maxLogEntryId === undefined || typeof s.maxLogEntryId === 'number') &&
+		(s.taskCheckpoints === undefined ||
+			(typeof s.taskCheckpoints === 'object' &&
+				s.taskCheckpoints !== null &&
+				!Array.isArray(s.taskCheckpoints) &&
+				Object.values(s.taskCheckpoints).every((v) => typeof v === 'string'))) &&
+		(s.goalCheckpoint === undefined || s.goalCheckpoint === null || typeof s.goalCheckpoint === 'string')
+	);
+}
+
+/** State fields persisted under older names (pre cycle rename, pre compact snapshots). */
 type LegacyRalphStateFields = {
 	rotateOn?: 'task' | 'budget';
 	rotationQueued?: boolean;
 	rotationReason?: CycleReason;
 	rotationCheckpointing?: boolean;
 	rotationNote?: string;
+	/** Full rendered backlog text (pre compact snapshots). */
+	loopStartTodo?: string;
+	baselineTodo?: string;
 };
 
 function isRalphState(value: unknown): value is RalphState {
@@ -242,8 +303,10 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.mode === undefined || state.mode === 'tasks' || state.mode === 'goal' || state.mode === 'auto') &&
 		(cycleOn === undefined || cycleOn === 'task' || cycleOn === 'budget') &&
 		typeof state.todoPath === 'string' &&
-		(state.loopStartTodo === undefined || typeof state.loopStartTodo === 'string') &&
-		typeof state.baselineTodo === 'string' &&
+		(isBaselineSnapshot(state.baseline) || typeof state.baselineTodo === 'string') &&
+		(state.loopStart === undefined ||
+			isLoopStartSnapshot(state.loopStart) ||
+			typeof state.loopStartTodo === 'string') &&
 		(state.baselineTime === undefined || typeof state.baselineTime === 'number') &&
 		(state.iteration === undefined || (typeof state.iteration === 'number' && state.iteration >= 1)) &&
 		(state.taskIteration === undefined || (typeof state.taskIteration === 'number' && state.taskIteration >= 1)) &&
@@ -273,18 +336,34 @@ function isRalphState(value: unknown): value is RalphState {
 	);
 }
 
-/** Keep sessions created before graceful stopping/blocking/configuration was added compatible. */
+/** Keep sessions created before graceful stopping/blocking/configuration/compact snapshots was added compatible. */
 function normalizeState(state: RalphState): RalphState {
 	const mode = state.mode ?? 'tasks';
-	// Strip the old rotation field names so they are not re-persisted.
+	// Strip the old rotation field names and the legacy full-text backlog
+	// snapshots so they are not re-persisted.
 	const {
 		rotateOn: legacyCycleOn,
 		rotationQueued: legacyCycleQueued,
 		rotationReason: legacyCycleReason,
 		rotationCheckpointing: legacyCycleCheckpointing,
 		rotationNote: legacyCycleNote,
+		loopStartTodo: legacyLoopStartTodo,
+		baselineTodo: legacyBaselineTodo,
 		...rest
 	} = state as RalphState & LegacyRalphStateFields;
+	// Legacy entries carry the full rendered backlog text; rebuild the compact
+	// snapshots from it. The diff scope is the state's (the auto loop works
+	// through every list). Restore normalizes only the last entry, so this
+	// runs once per session start.
+	const scope = mode === 'auto' ? undefined : state.category;
+	const baseline = isBaselineSnapshot(state.baseline)
+		? state.baseline
+		: snapshotBaseline(legacyBaselineTodo ?? '', scope);
+	const loopStart = isLoopStartSnapshot(state.loopStart)
+		? state.loopStart
+		: typeof legacyLoopStartTodo === 'string'
+			? snapshotLoopStart(legacyLoopStartTodo, scope)
+			: baseline;
 	return {
 		...rest,
 		mode,
@@ -293,7 +372,8 @@ function normalizeState(state: RalphState): RalphState {
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
-		loopStartTodo: state.loopStartTodo ?? state.baselineTodo,
+		baseline,
+		loopStart,
 		baselineTime: state.baselineTime ?? Date.now(),
 		cycleQueued: state.cycleQueued ?? legacyCycleQueued ?? false,
 		cycleReason: state.cycleReason ?? legacyCycleReason,
@@ -561,8 +641,8 @@ function currentTaskNumber(current: number): number | undefined {
 	return current > 0 ? current : undefined;
 }
 
-function hasCompletedTodoItem(previousTodo: string, currentTodo: string, category?: string): boolean {
-	return todoCounts(currentTodo, category).completed > todoCounts(previousTodo, category).completed;
+function hasCompletedTodoItem(baseline: BaselineSnapshot, currentTodo: string, category?: string): boolean {
+	return todoCounts(currentTodo, category).completed > baseline.completed;
 }
 
 /**
@@ -577,7 +657,7 @@ function hasCompletedTodoItem(previousTodo: string, currentTodo: string, categor
  * cannot be parsed, or names no task.
  */
 function completedTaskNumbers(
-	previousTodo: string,
+	baseline: BaselineSnapshot,
 	currentTodo: string,
 	category: string | undefined,
 	baselineTime: number | undefined
@@ -585,20 +665,14 @@ function completedTaskNumbers(
 	if (!isRalphBacklog(currentTodo)) return undefined;
 	try {
 		const current = Backlog.parse(currentTodo);
-		let previousDone: Map<number, boolean> | undefined;
-		if (isRalphBacklog(previousTodo)) {
-			try {
-				previousDone = new Map(Backlog.parse(previousTodo).listTasks().map((task) => [task.id, task.done]));
-			} catch {
-				previousDone = undefined;
-			}
-		}
+		const previousDone =
+			baseline.ralph && baseline.doneIds !== undefined ? new Set(baseline.doneIds) : undefined;
 		const numbers = current.taskNumbers(category);
 		const completed = current
 			.listTasks(category)
 			.filter((task) => {
 				if (!task.done) return false;
-				const wasOpenAtBaseline = previousDone !== undefined && previousDone.get(task.id) !== true;
+				const wasOpenAtBaseline = previousDone !== undefined && !previousDone.has(task.id);
 				if (task.completedAt !== null && baselineTime !== undefined) {
 					const completedAt = Date.parse(task.completedAt);
 					// Completion timestamps are second-granular: only a strictly
@@ -678,28 +752,33 @@ function goalPhaseOf(todo: string, category?: string): GoalPhase | undefined {
  * start, so without the cycle a finished plan with context headroom would
  * never reach the re-evaluation prompt and the loop would stall.
  */
-function goalPhaseChanged(previousTodo: string, currentTodo: string, category?: string): boolean {
-	const previous = goalPhaseOf(previousTodo, category);
+function goalPhaseChanged(baseline: BaselineSnapshot, currentTodo: string, category?: string): boolean {
 	const current = goalPhaseOf(currentTodo, category);
-	return previous !== undefined && current !== undefined && previous !== current;
+	return baseline.phase !== undefined && current !== undefined && baseline.phase !== current;
 }
 
 /**
- * The goal-loop phase for the state's baseline backlog: planning (goal open,
- * zero tasks), execution (open tasks), or re-evaluation (goal open, tasks
- * exist, none open). Undefined outside a goal loop on a ralph backlog with a
- * goal, so callers fall back to the task-loop prompts.
+ * The goal phase at the iteration baseline, from the compact snapshot (no
+ * file access — safe on hot paths like the status line). Undefined outside a
+ * goal loop on a ralph backlog with a goal, so callers fall back to the
+ * task-loop prompts.
+ */
+function baselineGoalPhase(state: RalphState): GoalPhase | undefined {
+	return state.mode === 'goal' && state.baseline.ralph ? state.baseline.phase : undefined;
+}
+
+/**
+ * The goal loop's phase and goal: the phase from the iteration baseline, the
+ * goal from the current backlog. At cycle time — the only caller that needs
+ * the goal object — the baseline IS the current backlog, so the two agree.
  */
 function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefined {
-	if (state.mode !== 'goal' || !isRalphBacklog(state.baselineTodo)) return undefined;
+	const phase = baselineGoalPhase(state);
+	if (phase === undefined) return undefined;
 	try {
-		const backlog = Backlog.parse(state.baselineTodo);
-		const goal = backlog.goal();
+		const goal = Backlog.open(state.todoPath).goal();
 		if (!goal) return undefined;
-		const counts = backlog.counts(state.category);
-		if (counts.total === 0) return { phase: 'planning', goal };
-		if (counts.open === 0) return { phase: 're-evaluation', goal };
-		return { phase: 'execution', goal };
+		return { phase, goal };
 	} catch {
 		return undefined;
 	}
@@ -735,15 +814,10 @@ function goalStatus(todo: string): GoalStatus | undefined {
  * completed task re-opened). The goal loop uses this to tell a progress turn
  * (the plan grew) from a stalled one, and to trigger a plan-updated cycle.
  */
-function planGrew(previousTodo: string, currentTodo: string, category?: string): boolean {
-	if (!isRalphBacklog(previousTodo) || !isRalphBacklog(currentTodo)) return false;
+function planGrew(baseline: BaselineSnapshot, currentTodo: string, category?: string): boolean {
+	if (!baseline.ralph || baseline.openIds === undefined || !isRalphBacklog(currentTodo)) return false;
 	try {
-		const previousOpen = new Set(
-			Backlog.parse(previousTodo)
-				.listTasks(category)
-				.filter((task) => !task.done)
-				.map((task) => task.id)
-		);
+		const previousOpen = new Set(baseline.openIds);
 		return Backlog.parse(currentTodo)
 			.listTasks(category)
 			.some((task) => !task.done && !previousOpen.has(task.id));
@@ -763,6 +837,56 @@ function todoCounts(todo: string, category?: string): { open: number; total: num
 	const open = (todo.match(/^\s*- \[ \]\s+/gm) ?? []).length;
 	const total = (todo.match(/^\s*- \[[ xX]\]\s+/gm) ?? []).length;
 	return { open, total, completed: total - open };
+}
+
+/**
+ * Capture the compact baseline snapshot from a rendered backlog: everything
+ * the iteration diff checks need (see BaselineSnapshot) without the text.
+ */
+function snapshotBaseline(todo: string, category?: string): BaselineSnapshot {
+	if (!isRalphBacklog(todo)) {
+		return { ralph: false, completed: todoCounts(todo, category).completed };
+	}
+	try {
+		const backlog = Backlog.parse(todo);
+		const counts = backlog.counts(category);
+		const snapshot: BaselineSnapshot = {
+			ralph: true,
+			completed: counts.completed,
+			openIds: backlog.listTasks(category).filter((task) => !task.done).map((task) => task.id),
+			doneIds: backlog.listTasks().filter((task) => task.done).map((task) => task.id)
+		};
+		const goal = backlog.goal();
+		if (goal)
+			snapshot.phase =
+				counts.total === 0 ? 'planning' : counts.open === 0 ? 're-evaluation' : 'execution';
+		return snapshot;
+	} catch {
+		// Unparseable ralph backlog: keep the count so the completion trigger
+		// still works; the id sets stay unknown and their checks stay conservative.
+		return { ralph: true, completed: todoCounts(todo, category).completed };
+	}
+}
+
+/** Capture the loop-start snapshot: the baseline plus the loop-level diff inputs. */
+function snapshotLoopStart(todo: string, category?: string): LoopStartSnapshot {
+	const snapshot: LoopStartSnapshot = { ...snapshotBaseline(todo, category) };
+	if (!snapshot.ralph) return snapshot;
+	try {
+		const backlog = Backlog.parse(todo);
+		snapshot.maxLogEntryId = backlog
+			.listLogEntries()
+			.reduce((max, entry) => Math.max(max, entry.id), 0);
+		const checkpoints: Record<number, string> = {};
+		for (const task of backlog.listTasks(category)) {
+			if (task.checkpoint !== null) checkpoints[task.id] = task.checkpoint;
+		}
+		snapshot.taskCheckpoints = checkpoints;
+		snapshot.goalCheckpoint = backlog.goal()?.checkpoint ?? null;
+		return snapshot;
+	} catch {
+		return snapshot;
+	}
 }
 
 /**
@@ -814,7 +938,7 @@ function iterationPrompt(state: RalphState, reason?: CycleReason): string {
 }
 
 function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
-	if (!isRalphBacklog(state.baselineTodo)) {
+	if (!state.baseline.ralph) {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
 	if (state.mode === 'auto') {
@@ -932,24 +1056,16 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
  * context — the model checks its own progress with the ralph_todo/ralph_goal
  * tools.
  */
-function completionSummary(todo: string, loopStartTodo: string, category?: string): string | undefined {
+function completionSummary(todo: string, loopStart: LoopStartSnapshot, category?: string): string | undefined {
 	if (!isRalphBacklog(todo)) return undefined;
 	const backlog = Backlog.parse(todo);
-	const baseline = isRalphBacklog(loopStartTodo) ? Backlog.parse(loopStartTodo) : undefined;
-	const baselineDone = new Map<number, boolean>();
-	const baselineCheckpoints = new Map<number, string | null>();
-	const baselineEntryIds = new Set<number>();
-	const baselineGoalCheckpoint = baseline?.goal()?.checkpoint ?? null;
-	if (baseline) {
-		for (const task of baseline.listTasks(category)) {
-			baselineDone.set(task.id, task.done);
-			baselineCheckpoints.set(task.id, task.checkpoint);
-		}
-		for (const entry of baseline.listLogEntries()) baselineEntryIds.add(entry.id);
-	}
+	const hasBaseline = loopStart.ralph;
+	const baselineDone = hasBaseline ? new Set(loopStart.doneIds ?? []) : undefined;
+	const baselineCheckpoints = hasBaseline ? (loopStart.taskCheckpoints ?? {}) : undefined;
+	const baselineGoalCheckpoint = hasBaseline ? (loopStart.goalCheckpoint ?? null) : null;
 	const newEntriesByTask = new Map<number, CompletionEntry[]>();
 	for (const entry of backlog.listLogEntries()) {
-		if (baselineEntryIds.has(entry.id)) continue;
+		if (hasBaseline && loopStart.maxLogEntryId !== undefined && entry.id <= loopStart.maxLogEntryId) continue;
 		const list = newEntriesByTask.get(entry.taskId) ?? [];
 		list.push(entry);
 		newEntriesByTask.set(entry.taskId, list);
@@ -960,14 +1076,14 @@ function completionSummary(todo: string, loopStartTodo: string, category?: strin
 	backlog.listTasks(category).forEach((task, index) => {
 		const number = numbers.get(task.id) ?? String(index + 1);
 		const newEntries = newEntriesByTask.get(task.id) ?? [];
-		const wasDone = baseline ? (baselineDone.get(task.id) ?? false) : false;
+		const wasDone = baselineDone !== undefined && baselineDone.has(task.id);
 		if (task.done && (!wasDone || newEntries.some((entry) => entry.kind === 'done'))) {
 			// Title only: the completion log entries (outcome, evidence,
 			// verification) stay durable in the backlog's completion log; the
 			// summary is a compact progress list for the TUI/audit trail.
 			completionLines.push(`${number}. ${task.title}`);
 		}
-		const previousCheckpoint = baseline ? (baselineCheckpoints.get(task.id) ?? null) : null;
+		const previousCheckpoint = baselineCheckpoints !== undefined ? (baselineCheckpoints[task.id] ?? null) : null;
 		if (task.checkpoint !== null && task.checkpoint !== previousCheckpoint) {
 			checkpointLines.push(
 				`${number}. ${task.title}: checkpoint${task.checkpointIteration ? ` (iteration ${task.checkpointIteration})` : ''}: ${task.checkpoint}`
@@ -1018,12 +1134,12 @@ function recordingPromptFor(state: RalphState): string {
 		: state.cycleReason === 'loop-escape'
 			? finishUpPrompt(state, 'loop-escape')
 		: state.cycleReason === 'iteration-ended'
-			? state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
+			? state.mode === 'goal' && baselineGoalPhase(state) !== 'execution'
 				? contextCheckpointPrompt(state)
 				: finishUpPrompt(state, 'iteration-ended')
-		: state.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
-				? contextCheckpointPrompt(state)
-			: isRalphBacklog(state.baselineTodo)
+		: state.mode === 'goal' && baselineGoalPhase(state) !== 'execution'
+			? contextCheckpointPrompt(state)
+			: state.baseline.ralph
 				? finishUpPrompt(state, 'context-limit')
 				: contextCheckpointPrompt(state);
 }
@@ -1033,13 +1149,13 @@ function contextCheckpointPrompt(state: RalphState): string {
 }
 
 function contextCheckpointPromptBody(state: RalphState): string {
-	if (!isRalphBacklog(state.baselineTodo)) {
+	if (!state.baseline.ralph) {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
 	// Task-less goal iterations (planning/re-evaluation) have no task to
 	// checkpoint: the goal carries the durable state instead.
-	const goalInfo = goalPhase(state);
-	if (goalInfo && goalInfo.phase !== 'execution') {
+	const phase = baselineGoalPhase(state);
+	if (phase !== undefined && phase !== 'execution') {
 		return renderPrompt('context-checkpoint-goal', {});
 	}
 	return renderPrompt('context-checkpoint-ralph', {});
@@ -1673,7 +1789,7 @@ export default function (pi: ExtensionAPI) {
 			: state?.cycleCheckpointing
 				? state?.cycleReason === 'completed-task' || state?.cycleReason === 'plan-updated'
 					? 'recording'
-					: state?.mode === 'goal' && goalPhase(state)?.phase !== 'execution'
+					: state?.mode === 'goal' && baselineGoalPhase(state) !== 'execution'
 						? 'checkpointing'
 						: 'finishing'
 					: state?.stopRequested
@@ -2565,7 +2681,7 @@ export default function (pi: ExtensionAPI) {
 				const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
 				const next: RalphState = {
 					...state,
-					baselineTodo: currentTodo,
+					baseline: snapshotBaseline(currentTodo, countCategory(state)),
 					baselineTime: Date.now(),
 					iteration: state.iteration + 1,
 					taskIteration: taskChanged ? 1 : state.taskIteration + 1,
@@ -2602,7 +2718,7 @@ export default function (pi: ExtensionAPI) {
 				// progress with the ralph_todo/ralph_goal tools.
 				freshIterationPending = true;
 				updateStatus(ctx);
-				const completion = completionSummary(currentTodo, state.loopStartTodo, next.category);
+				const completion = completionSummary(currentTodo, state.loopStart, next.category);
 				const finishCycle = () => {
 					// A pause/stop/blocked decision that landed while the compaction
 					// ran must not start a new turn; the resume/stop flow continues.
@@ -2720,8 +2836,9 @@ export default function (pi: ExtensionAPI) {
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
-				loopStartTodo: rendered,
-				baselineTodo: rendered,
+				// The auto loop's diff scope is every list (countCategory).
+				loopStart: snapshotLoopStart(rendered),
+				baseline: snapshotBaseline(rendered),
 				baselineTime: Date.now(),
 				iteration: 1,
 				taskIteration: 1,
@@ -2865,8 +2982,8 @@ export default function (pi: ExtensionAPI) {
 			const next: RalphState = {
 				enabled: true,
 				todoPath,
-				loopStartTodo: baselineTodo,
-				baselineTodo,
+				loopStart: snapshotLoopStart(baselineTodo, category),
+				baseline: snapshotBaseline(baselineTodo, category),
 				baselineTime: Date.now(),
 				iteration: 1,
 				taskIteration: 1,
@@ -2928,7 +3045,7 @@ export default function (pi: ExtensionAPI) {
 		// without one) already identify them.
 		const completedTasks =
 			reason === 'completed-task' && options?.currentTodo
-				? completedTaskNumbers(state.baselineTodo, options.currentTodo, countCategory(state), state.baselineTime)
+				? completedTaskNumbers(state.baseline, options.currentTodo, countCategory(state), state.baselineTime)
 				: undefined;
 
 		persistState({
@@ -2978,6 +3095,11 @@ export default function (pi: ExtensionAPI) {
 		config = defaultConfig();
 		configFromDefaults = false;
 		let hasSessionConfig = false;
+		// Only the last state entry matters: remember it and normalize once
+		// after the walk. Legacy entries carry full-text backlog snapshots that
+		// normalization rebuilds into the compact form — normalizing every entry
+		// would re-parse the whole backlog history for nothing.
+		let lastStateData: unknown;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== 'custom') continue;
 			if (entry.customType === CONFIG_TYPE) {
@@ -2988,8 +3110,11 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			if (entry.customType === STATE_TYPE && isRalphState(entry.data)) {
-				state = normalizeState(entry.data);
+				lastStateData = entry.data;
 			}
+		}
+		if (lastStateData !== undefined) {
+			state = normalizeState(lastStateData as RalphState);
 		}
 		// The persisted state may predate the SQLite migration: when the
 		// recorded backlog path no longer exists but its format sibling does
@@ -3447,18 +3572,18 @@ export default function (pi: ExtensionAPI) {
 					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
 					return;
 				}
-				if (state.cycleOn === 'task' && hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state))) {
+				if (state.cycleOn === 'task' && hasCompletedTodoItem(state.baseline, currentTodo, countCategory(state))) {
 					queueCycle(ctx, 'completed-task', { currentTodo });
 					return;
 				}
 				// Goal mode: a grown plan (task policy) or a phase change (budget
 				// policy) is a progress boundary too — the plan update gets its
 				// commit before the loop ends.
-				if (state.mode === 'goal' && state.cycleOn === 'task' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+				if (state.mode === 'goal' && state.cycleOn === 'task' && planGrew(state.baseline, currentTodo, state.category)) {
 					queueCycle(ctx, 'plan-updated');
 					return;
 				}
-				if (state.mode === 'goal' && state.cycleOn === 'budget' && goalPhaseChanged(state.baselineTodo, currentTodo, state.category)) {
+				if (state.mode === 'goal' && state.cycleOn === 'budget' && goalPhaseChanged(state.baseline, currentTodo, state.category)) {
 					queueCycle(ctx, 'phase-changed');
 					return;
 				}
@@ -3502,7 +3627,7 @@ export default function (pi: ExtensionAPI) {
 		// while context-limit first records the finish-up. Under "budget",
 		// completions are progress, not a boundary (the nudge below keeps the
 		// loop moving).
-			if (state.cycleOn === 'task' && hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state))) {
+			if (state.cycleOn === 'task' && hasCompletedTodoItem(state.baseline, currentTodo, countCategory(state))) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
@@ -3518,7 +3643,7 @@ export default function (pi: ExtensionAPI) {
 			// execution → re-evaluation) cycles — without it a finished plan with
 			// context headroom would never reach the re-evaluation prompt and the
 			// loop would stall.
-			if (state.mode === 'goal' && state.cycleOn === 'task' && planGrew(state.baselineTodo, currentTodo, state.category)) {
+			if (state.mode === 'goal' && state.cycleOn === 'task' && planGrew(state.baseline, currentTodo, state.category)) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
@@ -3526,7 +3651,7 @@ export default function (pi: ExtensionAPI) {
 				queueCycle(ctx, 'plan-updated');
 				return;
 			}
-			if (state.mode === 'goal' && state.cycleOn === 'budget' && goalPhaseChanged(state.baselineTodo, currentTodo, state.category)) {
+			if (state.mode === 'goal' && state.cycleOn === 'budget' && goalPhaseChanged(state.baseline, currentTodo, state.category)) {
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;
@@ -3572,7 +3697,7 @@ export default function (pi: ExtensionAPI) {
 			// "continue".
 			if (
 				state.cycleOn === 'budget' &&
-				hasCompletedTodoItem(state.baselineTodo, currentTodo, countCategory(state)) &&
+				hasCompletedTodoItem(state.baseline, currentTodo, countCategory(state)) &&
 				openWorkTaskCount(currentTodo, countCategory(state)) > 0
 			) {
 					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('continue-loop', {})}`, { deliverAs: 'followUp' });
@@ -3587,7 +3712,7 @@ export default function (pi: ExtensionAPI) {
 				state.mode === 'goal' &&
 				goalStatus(currentTodo) === 'open' &&
 				isBacklogFinished(currentTodo, state.category) &&
-				!planGrew(state.baselineTodo, currentTodo, state.category)
+				!planGrew(state.baseline, currentTodo, state.category)
 			) {
 				stopLoop(
 					ctx,

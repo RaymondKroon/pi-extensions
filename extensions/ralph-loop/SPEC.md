@@ -218,7 +218,8 @@ in one deterministic step — when **compaction mode** is enabled (config
   context clean.
 - **Completion summary.** Scoped to the current loop: re-derived by diffing
   the backlog against the snapshot taken when the loop started (retained in
-  the loop state as `loopStartTodo`, never cycled like `baselineTodo`). It
+  the loop state as the `loopStart` compact snapshot, never cycled like the
+  per-iteration `baseline`). It
   lists the tasks completed in this loop (task number, title, and the
   completion log entries added in this loop; completions without a new log
   entry are listed as such) and the task and goal checkpoints made or changed
@@ -227,6 +228,19 @@ in one deterministic step — when **compaction mode** is enabled (config
   fresh iteration (before the boundary marker); the first iteration sends no
   summary. No summary is sent when the loop has no completions or checkpoints
   yet.
+- **Compact state snapshots.** The loop state never persists the rendered
+  backlog text. The full render can run to hundreds of KB and grows over the
+  loop's lifetime, and the session file is append-only and re-read on every
+  resume — a long loop used to accumulate tens of MB of near-duplicate
+  snapshots. Instead, `RalphState` carries `baseline: BaselineSnapshot`
+  (re-captured every cycle) and `loopStart: LoopStartSnapshot` (captured once
+  at loop start): task-id sets (open in scope, done overall), the in-scope
+  completed count, the goal phase, and — for `loopStart` — the highest
+  completion-log entry id, the non-null task checkpoints, and the goal
+  checkpoint. Every diff check re-reads the "after" side from disk. Legacy
+  state entries that still carry the full-text `loopStartTodo`/`baselineTodo`
+  fields are migrated to the compact form at restore (only the last state
+  entry is normalized, so the history is never re-parsed).
 - **Model context.** After the cycle the model context is
   `[compactionSummary, retained tail, summary, boundary, prompt, …]`; the
   existing context-boundary slice drops everything before the boundary —
