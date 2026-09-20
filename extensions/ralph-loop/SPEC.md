@@ -383,3 +383,44 @@ with `reload: true` — reload the pi extensions at that boundary.
   `model-requested` cycle reuses the finish-up recording prompt (new
   opening carrying the note) and the existing settle → `startFreshIteration`
   path; the fresh iteration prompt gets a `model-requested` context note.
+
+## 14. Cross-session handoff: `/ralph import` (ralph sources) and `/ralph new`
+
+A session's ralph backlog is per-session (`<session-id>.db` in the global
+agent directory), so an open task cannot be picked up by a plain new session.
+Two commands move backlog data across sessions without changing the session
+model (no shared/project backlog, no loop-state cloning):
+
+- **`/ralph import <session-id | ralph-file>`** extends the existing
+  Markdown import with ralph-format sources. The argument is a session id
+  (full, or a unique prefix of an existing `<agent dir>/ralph/<id>.db`) or a
+  ralph-format file path (`.db`, or legacy `.ralph`, auto-migrated by
+  `Backlog.open`). It merges the selected subset into the **current**
+  session's ralph file and does nothing else (no loop state, no auto-start).
+  Selection: open tasks by default; `--all` for every task (open and
+  completed, with their completion log entries); `--goal` for the goal only.
+  `--all`/`--goal` are mutually exclusive and only apply to ralph sources
+  (a `.md` input with either is a usage error). Categories are preserved
+  from the source unless `--category` stamps one. The resolved source path is
+  recorded as an import source, so the same source is not imported twice
+  (`--force` re-imports it and, for `--goal`, overwrites an existing goal);
+  `import --goal` into a backlog that already has a goal is refused without
+  `--force`.
+- **`/ralph new [--all]`** starts a fresh pi session whose ralph backlog is a
+  scoped copy of the current session's: goal + open tasks by default, goal +
+  all tasks with `--all`. It always works (no active loop required; a missing
+  or empty backlog yields a clean session with no file). It moves backlog data
+  only — never `RalphState` — so the new session simply has its `<session-id>.db`
+  ready and the user runs `/ralph start` there. The original session's backlog
+  is left untouched.
+- **Mechanism.** `Backlog.mergeFrom(other, { category?, tasks?, goal? })`
+  drives the selection: `tasks` is `'all'` (default) | `'open'` | `'none'`,
+  `goal` copies the source goal verbatim via a raw `setGoalRecord` (bypassing
+  the goal state machine, so any status is copied), and an omitted `category`
+  preserves each task's own category (a given one stamps all). Completion log
+  entries are copied only for the tasks that were copied. `/ralph new` builds
+  the clone in-memory (plain data, safe across the session replacement) and
+  writes it in `ctx.newSession({ parentSession, setup, withSession })`'s
+  `setup(sm)`, which runs before the new instance's `session_start`, so the
+  new session's file exists before it starts; `withSession` only notifies.
+  No new dependencies; `bun test` in full is the quality gate.

@@ -137,6 +137,11 @@ interface FakeCtx {
 			getSessionId: () => string;
 			getSessionName: () => string | undefined;
 		};
+		newSession: (options?: {
+			parentSession?: string;
+			setup?: (sessionManager: { getSessionId: () => string; getSessionFile: () => string }) => Promise<void>;
+			withSession?: (ctx: { ui: { notify: (message: string, type?: string) => void } }) => Promise<void>;
+		}) => Promise<{ cancelled: boolean }>;
 		ui: {
 			setWidget: (id: string, widget: unknown) => void;
 			setStatus: (id: string, value: unknown) => void;
@@ -180,6 +185,8 @@ interface FakeCtx {
 	compactCalls: FakeCompactCall[];
 	/** When true (default) each ctx.compact() settles itself asynchronously, like pi. */
 	compactAutoSettle: { value: boolean };
+	/** ctx.newSession() calls, in order (with the simulated new session id). */
+	newSessionCalls: Array<{ parentSession?: string; newId: string }>;
 }
 
 interface FakeCompactCall {
@@ -206,6 +213,7 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const branchEntries: unknown[] = [];
 	const compactCalls: FakeCompactCall[] = [];
 	const compactAutoSettle = { value: true };
+	const newSessionCalls: FakeCtx['newSessionCalls'] = [];
 
 	const ctx = {
 		cwd,
@@ -240,6 +248,32 @@ function createFakeCtx(cwd: string): FakeCtx {
 			getSessionFile: () => join(cwd, 'session.jsonl'),
 			getSessionId: () => 'test-session',
 			getSessionName: () => undefined
+		},
+		// Simulates pi's session replacement: run setup() against a fresh
+		// session id, then withSession() against a replacement context. The
+		// new session's ralph file is <agentDir>/ralph/<newId>.db.
+		newSession: (options?: {
+		parentSession?: string;
+		setup?: (sm: { getSessionId: () => string; getSessionFile: () => string }) => Promise<void>;
+		withSession?: (ctx: { ui: { notify: (message: string, type?: string) => void } }) => Promise<void>;
+		}) => {
+		const newId = `new-session-${newSessionCalls.length + 1}`;
+		newSessionCalls.push({ parentSession: options?.parentSession, newId });
+		const fakeSm = { getSessionId: () => newId, getSessionFile: () => join(cwd, `${newId}.jsonl`) };
+		const replacementCtx = {
+		ui: {
+		notify: (message: string, type?: string) => {
+		notifications.push({ message, type });
+		}
+		}
+		};
+		return Promise.resolve(
+		(async () => {
+		await options?.setup?.(fakeSm);
+		await options?.withSession?.(replacementCtx);
+		return { cancelled: false };
+		})()
+		);
 		},
 		ui: {
 			setWidget: (id: string, widget: unknown) => {
@@ -297,7 +331,8 @@ function createFakeCtx(cwd: string): FakeCtx {
 		customControl,
 		branchEntries,
 		compactCalls,
-		compactAutoSettle
+		compactAutoSettle,
+		newSessionCalls
 	};
 }
 
@@ -1374,6 +1409,22 @@ async function importTodo(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCt
 	await ralph.handler(args, fakeCtx.ctx);
 }
 
+/** Run the /ralph new subcommand. */
+async function runNew(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx, args = '') {
+	const ralph = fake.commands.get('ralph')!;
+	await ralph.handler(args ? `new ${args}` : 'new', fakeCtx.ctx);
+}
+
+/** The ralph file of another (source) session in the fake agent directory. */
+const srcSessionFile = (id: string) => join(agentDir, 'ralph', `${id}.db`);
+/** Create a source session's ralph file with the given tasks/goal. */
+function seedSourceSession(id: string, build: (b: Backlog) => void) {
+	const b = Backlog.empty();
+	build(b);
+	b.save(srcSessionFile(id));
+	return b;
+}
+
 describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 	beforeEach(async () => {
 		await writeFile(join(dir, 'TODO.md'), RALPH_MD);
@@ -1405,26 +1456,32 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('already imported into');
 	});
 
-	test('/ralph import rejects ralph-format input', async () => {
+	test('/ralph import treats ralph-format files as sources and rejects ralph content in .md', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		await importTodo(fake, fakeCtx, 'import TODO.md');
-		expect(readBacklog().listTasks()).toHaveLength(3);
-
+		// A missing ralph source is an error (not a Markdown rejection).
 		fakeCtx.notifications.length = 0;
 		await importTodo(fake, fakeCtx, 'import TODO.ralph');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('only accepts Markdown TODO files');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('No ralph backlog at');
 
-		// Non-Markdown input is rejected outright; ralph-format content in a
-		// .md file is rejected as input.
-		await writeFile(join(dir, 'OTHER.ralph'), renderFile());
+		// A real ralph-format .ralph file is imported (open tasks by default),
+		// preserving each task's own category.
+		const source = Backlog.empty();
+		source.addTask({ title: 'Carried task', category: 'work' });
+		source.addTask({ title: 'Carried done', category: 'work' });
+		source.complete('2');
+		source.save(join(dir, 'OTHER.ralph'));
 		fakeCtx.notifications.length = 0;
 		await importTodo(fake, fakeCtx, 'import OTHER.ralph');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('only accepts Markdown TODO files');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 1 task');
+		const imported = readBacklog();
+		expect(imported.listTasks().find((t) => t.title === 'Carried task')?.category).toBe('work');
+		expect(imported.counts()).toEqual({ open: 1, total: 1, completed: 0 });
 
+		// ralph-format content in a .md file is still rejected as input.
 		await writeFile(join(dir, 'OTHER.md'), renderFile());
 		fakeCtx.notifications.length = 0;
 		await importTodo(fake, fakeCtx, 'import OTHER.md');
@@ -1499,6 +1556,226 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		expect(fakeCtx.notifications.at(-1)?.message).toBe('Import cancelled');
 		const ralph = await readFile(autoFile(), 'utf8').catch(() => undefined);
 		expect(ralph).toBeUndefined();
+	});
+
+	test('/ralph import <session-id> imports open tasks, preserving categories', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		seedSourceSession('src-session', (b) => {
+			b.addTask({ title: 'Open one', category: 'alpha' });
+			b.addTask({ title: 'Open two', category: 'beta' });
+			b.addTask({ title: 'Done one', category: 'alpha' });
+			b.complete('3');
+		});
+
+		await importTodo(fake, fakeCtx, 'import src-session');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 2 tasks');
+		const imported = readBacklog();
+		expect(imported.listTasks().find((t) => t.title === 'Open one')?.category).toBe('alpha');
+		expect(imported.listTasks().find((t) => t.title === 'Open two')?.category).toBe('beta');
+		expect(imported.listTasks().find((t) => t.title === 'Done one')).toBeUndefined();
+		expect(imported.counts()).toEqual({ open: 2, total: 2, completed: 0 });
+	});
+
+	test('/ralph import <session-id> --all imports every task and its log entries', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		seedSourceSession('src-session', (b) => {
+			b.addTask({ title: 'Open one', category: 'alpha' });
+			b.addTask({ title: 'Done one', category: 'alpha' });
+			b.complete('2');
+			b.addLogEntry({ task: '2', note: 'Shipped it.' });
+		});
+
+		await importTodo(fake, fakeCtx, 'import src-session --all');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 2 tasks');
+		const imported = readBacklog();
+		expect(imported.counts()).toEqual({ open: 1, total: 2, completed: 1 });
+		const done = imported.listTasks().find((t) => t.title === 'Done one')!;
+		expect(imported.listLogEntriesForTask(done.id)).toHaveLength(1);
+	});
+
+	test('/ralph import <session-id> --goal imports the goal only', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		seedSourceSession('src-session', (b) => {
+			b.setGoal('Ship the rewrite');
+			b.addTask({ title: 'A task', category: 'work' });
+		});
+
+		await importTodo(fake, fakeCtx, 'import src-session --goal');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported the goal');
+		const imported = readBacklog();
+		expect(imported.goal()?.body).toBe('Ship the rewrite');
+		expect(imported.listTasks()).toHaveLength(0);
+	});
+
+	test('/ralph import <session-id> blocks duplicate sources and --force re-imports', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		seedSourceSession('src-session', (b) => {
+			b.addTask({ title: 'Open one', category: 'work' });
+		});
+
+		await importTodo(fake, fakeCtx, 'import src-session');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 1 task');
+
+		fakeCtx.notifications.length = 0;
+		await importTodo(fake, fakeCtx, 'import src-session');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('already imported into');
+
+		fakeCtx.notifications.length = 0;
+		await importTodo(fake, fakeCtx, 'import src-session --force');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 1 task');
+		expect(readBacklog().counts().total).toBe(2);
+	});
+
+	test('/ralph import --goal refuses to replace an existing goal without --force', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		const current = Backlog.empty();
+		current.setGoal('Existing goal');
+		current.save(autoFile());
+		seedSourceSession('src-session', (b) => b.setGoal('New goal'));
+
+		fakeCtx.notifications.length = 0;
+		await importTodo(fake, fakeCtx, 'import src-session --goal');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('already has a goal');
+		expect(readBacklog().goal()?.body).toBe('Existing goal');
+
+		fakeCtx.notifications.length = 0;
+		await importTodo(fake, fakeCtx, 'import src-session --goal --force');
+		expect(readBacklog().goal()?.body).toBe('New goal');
+	});
+
+	test('/ralph import resolves a unique partial session id', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		seedSourceSession('abcdef12-unique', (b) => b.addTask({ title: 'From partial', category: 'work' }));
+
+		await importTodo(fake, fakeCtx, 'import abcdef12');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Imported 1 task');
+		expect(readBacklog().listTasks().find((t) => t.title === 'From partial')).toBeDefined();
+	});
+
+	test('/ralph import errors on an ambiguous or unknown session id', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+		seedSourceSession('dup-one', (b) => b.addTask({ title: 'A', category: 'w' }));
+		seedSourceSession('dup-two', (b) => b.addTask({ title: 'B', category: 'w' }));
+
+		fakeCtx.notifications.length = 0;
+		await importTodo(fake, fakeCtx, 'import dup-');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('ambiguous session id');
+
+		fakeCtx.notifications.length = 0;
+		await importTodo(fake, fakeCtx, 'import no-such-session');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('no session backlog found');
+	});
+
+	describe('/ralph new', () => {
+		test('clones the goal and open tasks into a fresh session', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			const current = Backlog.empty();
+			current.setGoal('Ship the rewrite');
+			current.addTask({ title: 'Open one', category: 'work' });
+			current.addTask({ title: 'Done one', category: 'work' });
+			current.complete('2');
+			current.save(autoFile());
+
+			await runNew(fake, fakeCtx);
+			expect(fakeCtx.newSessionCalls).toHaveLength(1);
+			expect(fakeCtx.newSessionCalls[0]!.parentSession).toBe(join(dir, 'session.jsonl'));
+
+			const cloned = Backlog.open(join(agentDir, 'ralph', 'new-session-1.db'));
+			expect(cloned.goal()?.body).toBe('Ship the rewrite');
+			expect(cloned.listTasks()).toHaveLength(1);
+			expect(cloned.listTasks()[0]!.title).toBe('Open one');
+			expect(cloned.counts()).toEqual({ open: 1, total: 1, completed: 0 });
+
+			// The original session's backlog is untouched.
+			expect(readBacklog().counts()).toEqual({ open: 1, total: 2, completed: 1 });
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('New session: 1 open / 1 tasks');
+		});
+
+		test('--all clones every task and the goal', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			const current = Backlog.empty();
+			current.setGoal('Ship the rewrite');
+			current.addTask({ title: 'Open one', category: 'work' });
+			current.addTask({ title: 'Done one', category: 'work' });
+			current.complete('2');
+			current.save(autoFile());
+
+			await runNew(fake, fakeCtx, '--all');
+			const cloned = Backlog.open(join(agentDir, 'ralph', 'new-session-1.db'));
+			expect(cloned.goal()?.body).toBe('Ship the rewrite');
+			expect(cloned.counts()).toEqual({ open: 1, total: 2, completed: 1 });
+		});
+
+		test('with no backlog starts a clean session (no file created)', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			await runNew(fake, fakeCtx);
+			expect(fakeCtx.newSessionCalls).toHaveLength(1);
+			expect(await readFile(join(agentDir, 'ralph', 'new-session-1.db'), 'utf8').catch(() => undefined)).toBeUndefined();
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('no open tasks or goal to clone');
+		});
+
+		test('waits for the run to finish', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+			fakeCtx.idle.value = false;
+
+			await runNew(fake, fakeCtx);
+			expect(fakeCtx.newSessionCalls).toHaveLength(0);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Wait for the current agent run to finish');
+		});
+
+		test('rejects unknown arguments', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			await runNew(fake, fakeCtx, '--bogus');
+			expect(fakeCtx.newSessionCalls).toHaveLength(0);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph new [--all]');
+		});
 	});
 
 	test('start with a ralph-format backlog uses the ralph_todo prompt and tool', async () => {
@@ -3411,6 +3688,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		}
 		expect((command.getArgumentCompletions('') ?? []).map((o) => o.value)).toEqual([
 			'start',
+			'new',
 			'import',
 			'set-goal',
 			'stop',

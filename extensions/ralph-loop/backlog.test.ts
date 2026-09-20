@@ -886,7 +886,7 @@ describe('mergeFrom (multi-file import)', () => {
 		const target = Backlog.parse(SAMPLE);
 		const other = Backlog.fromMarkdown(OTHER_MD);
 		const result = target.mergeFrom(other, { category: 'beta' });
-		expect(result).toEqual({ tasks: 3, logEntries: 1 });
+		expect(result).toEqual({ tasks: 3, logEntries: 1, goal: false });
 		const q11 = target.listTasks().find((t) => t.title === 'Ship export.')!;
 		expect(q11.category).toBe('beta');
 		expect(q11.id).toBeGreaterThan(5);
@@ -906,6 +906,68 @@ describe('mergeFrom (multi-file import)', () => {
 		target.mergeFrom(other);
 		const sub = target.listTasks().find((task) => task.title === 'Prepare the importer.')!;
 		expect(sub.category).toBeNull();
+	});
+
+	test('preserves each task\'s own category when no stamp is given', () => {
+		const source = Backlog.empty();
+		source.addTask({ title: 'Alpha task', category: 'alpha' });
+		source.addTask({ title: 'Beta task', category: 'beta' });
+		const target = Backlog.empty();
+		const result = target.mergeFrom(source);
+		expect(result.tasks).toBe(2);
+		expect(target.listTasks().find((t) => t.title === 'Alpha task')?.category).toBe('alpha');
+		expect(target.listTasks().find((t) => t.title === 'Beta task')?.category).toBe('beta');
+	});
+
+	test('tasks: "open" copies only open tasks and their log entries', () => {
+		const source = Backlog.empty();
+		source.addTask({ title: 'Still open', category: 'work' });
+		source.addTask({ title: 'Already done', category: 'work' });
+		source.complete('2');
+		source.addLogEntry({ task: '2', note: 'Did the thing.' });
+		const target = Backlog.empty();
+		const result = target.mergeFrom(source, { tasks: 'open' });
+		expect(result.tasks).toBe(1);
+		expect(result.logEntries).toBe(0);
+		const tasks = target.listTasks();
+		expect(tasks).toHaveLength(1);
+		expect(tasks[0]!.title).toBe('Still open');
+		expect(tasks[0]!.category).toBe('work');
+	});
+
+	test('tasks: "none" copies no tasks or log entries', () => {
+		const source = Backlog.empty();
+		source.addTask({ title: 'A task', category: 'work' });
+		const target = Backlog.empty();
+		const result = target.mergeFrom(source, { tasks: 'none' });
+		expect(result).toEqual({ tasks: 0, logEntries: 0, goal: false });
+		expect(target.listTasks()).toHaveLength(0);
+	});
+
+	test('goal: true copies the source goal verbatim (any status)', () => {
+		const source = Backlog.empty();
+		source.setGoal('Ship the rewrite');
+		source.claimGoal('all criteria pass');
+		source.setGoalCheckpoint('halfway there', 3);
+		const target = Backlog.empty();
+		const result = target.mergeFrom(source, { tasks: 'none', goal: true });
+		expect(result.goal).toBe(true);
+		expect(target.goal()).toEqual({
+			status: 'claimed',
+			body: 'Ship the rewrite',
+			evidence: 'all criteria pass',
+			checkpoint: 'halfway there',
+			checkpointIteration: 3
+		});
+	});
+
+	test('goal: true is a no-op when the source has no goal', () => {
+		const source = Backlog.empty();
+		source.addTask({ title: 'A task', category: 'work' });
+		const target = Backlog.empty();
+		const result = target.mergeFrom(source, { tasks: 'none', goal: true });
+		expect(result.goal).toBe(false);
+		expect(target.goal()).toBeUndefined();
 	});
 
 	test('fromMarkdown stamps a category on every imported task', () => {

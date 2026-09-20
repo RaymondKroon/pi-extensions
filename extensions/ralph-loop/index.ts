@@ -19,6 +19,7 @@ import {
 	visibleWidth
 } from '@earendil-works/pi-tui';
 import { execFileSync } from 'node:child_process';
+import { existsSync, readdirSync } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
@@ -1465,19 +1466,31 @@ interface RalphImportArgs {
 	input: string;
 	force: boolean;
 	category?: string;
+	/** Import every task (open and completed) instead of open tasks only. Ralph-format sources only. */
+	all?: boolean;
+	/** Import the goal only (no tasks). Ralph-format sources only. */
+	goal?: boolean;
 }
 
-/** Parse `/ralph import <file.md> [--category name] [--force]`. */
+/** Parse `/ralph import <file.md|session-id|ralph-file> [--category name] [--all | --goal] [--force]`. */
 function parseImportArgs(args: string[]): RalphImportArgs | undefined {
 	let input: string | undefined;
 	let category: string | undefined;
 	let force = false;
+	let all = false;
+	let goal = false;
 	let index = 0;
 	for (; index < args.length; index += 1) {
 		const arg = args[index];
 		if (arg === '--force') {
 			if (force) return undefined;
 			force = true;
+		} else if (arg === '--all') {
+			if (all || goal) return undefined;
+			all = true;
+		} else if (arg === '--goal') {
+			if (goal || all) return undefined;
+			goal = true;
 		} else if (arg === '--category') {
 			const value = args[index + 1];
 			if (!value || value.startsWith('--') || category !== undefined) return undefined;
@@ -1492,7 +1505,7 @@ function parseImportArgs(args: string[]): RalphImportArgs | undefined {
 		}
 	}
 	if (!input) return undefined;
-	return { input, force, category };
+	return { input, force, category, all: all || undefined, goal: goal || undefined };
 }
 
 /** Suggest a category name from a todo filename: TODO.md → General, TODO_EMAIL.md → Email. */
@@ -1520,8 +1533,9 @@ type RalphImportOutcome =
 	| {
 			ok: true;
 			outName: string;
-			category: string;
-			merged?: { tasks: number; logEntries: number };
+			/** The stamped category; undefined when the source tasks' own categories are preserved. */
+			category?: string;
+			merged?: { tasks: number; logEntries: number; goal: boolean };
 			counts: { open: number; total: number };
 	  }
 	| { ok: false; level: 'warning' | 'error'; message: string };
@@ -1567,7 +1581,7 @@ async function importMarkdownBacklog(
 	}
 	const sourceId = relative(cwd, inputPath) || inputPath;
 	let target: Backlog | undefined;
-	let merged: { tasks: number; logEntries: number } | undefined;
+	let merged: { tasks: number; logEntries: number; goal: boolean } | undefined;
 	if (await pathExists(outPath)) {
 		let existing: Backlog | undefined;
 		try {
@@ -1604,6 +1618,128 @@ async function importMarkdownBacklog(
 		return { ok: false, level: 'error', message: `Could not write ${outPath}: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	return { ok: true, outName, category, merged, counts: target.counts() };
+}
+
+/**
+ * Resolve a ralph import source (a session id or a ralph-format file path) to
+ * a file on disk. A bare token (no path separator, no .db/.ralph extension) is
+ * treated as a session id: it matches <agent dir>/ralph/<id>.db exactly, or a
+ * unique prefix of an existing session file. Anything else is a file path
+ * (absolute, or relative to the project).
+ */
+function resolveRalphSourcePath(cwd: string, input: string): { path?: string; error?: string } {
+	const ralphDir = join(getAgentDir(), AUTO_TODO_DIR);
+	const looksLikePath =
+		isAbsolute(input) || input.includes('/') || input.includes('\\') || /\.db$/i.test(input) || /\.ralph$/i.test(input);
+	if (looksLikePath) {
+		return { path: isAbsolute(input) ? input : resolve(cwd, input) };
+	}
+	// Session id: exact match first, then a unique prefix.
+	const exact = join(ralphDir, `${input}.db`);
+	if (existsSync(exact)) return { path: exact };
+	let names: string[] = [];
+	try {
+		names = readdirSync(ralphDir);
+	} catch {
+		names = [];
+	}
+	const matches = names.filter((name) => name.endsWith('.db') && name.slice(0, -3).startsWith(input));
+	if (matches.length === 1) return { path: join(ralphDir, matches[0]!) };
+	if (matches.length > 1) {
+		return { error: `ambiguous session id "${input}" (matches: ${matches.sort().join(', ')})` };
+	}
+	return { error: `no session backlog found for "${input}"` };
+}
+
+/**
+ * Import a ralph-format backlog (a session's ralph file or a ralph-format file)
+ * into the session's ralph backlog. `tasks` selects which tasks are copied
+ * ('open' by default, 'all' for open and completed, 'none' for none); `goal`
+ * copies the source's goal. Categories are preserved unless a category is
+ * given (which stamps every copied task). The resolved source is recorded so
+ * the same source is not imported twice (bypassed by force).
+ */
+async function importRalphBacklog(
+	cwd: string,
+	input: string,
+	outPath: string,
+	options: { category?: string; force?: boolean; tasks?: 'none' | 'open' | 'all'; goal?: boolean }
+): Promise<RalphImportOutcome> {
+	const outName = outPath;
+	const resolved = resolveRalphSourcePath(cwd, input);
+	if (resolved.error || !resolved.path) {
+		return { ok: false, level: 'warning', message: resolved.error ?? `Could not resolve ralph source ${input}` };
+	}
+	const srcPath = resolved.path;
+	let source: Backlog;
+	try {
+		source = Backlog.open(srcPath);
+	} catch (error) {
+		if (isMissingFileError(error)) {
+			return { ok: false, level: 'error', message: `No ralph backlog at ${srcPath}` };
+		}
+		return {
+			ok: false,
+			level: 'warning',
+			message: `${srcPath} is not a ralph-format backlog: ${error instanceof Error ? error.message : String(error)}`
+		};
+	}
+	const sourceId = srcPath;
+	const selection = { category: options.category, tasks: options.tasks ?? 'open', goal: options.goal ?? false };
+	let target: Backlog | undefined;
+	let merged: { tasks: number; logEntries: number; goal: boolean } | undefined;
+	if (await pathExists(outPath)) {
+		let existing: Backlog | undefined;
+		try {
+			existing = Backlog.open(outPath);
+		} catch {
+			existing = undefined;
+		}
+		if (existing) {
+			if (existing.sources().includes(sourceId) && !options.force) {
+				return {
+					ok: false,
+					level: 'warning',
+					message: `${input} was already imported into ${outName} (its source is recorded in the backlog). Use --force to import it again.`
+				};
+			}
+			if (options.goal && existing.goal() && !options.force) {
+				return { ok: false, level: 'warning', message: `${outName} already has a goal. Use --force to replace it.` };
+			}
+			try {
+				merged = existing.mergeFrom(source, selection);
+			} catch (error) {
+				return {
+					ok: false,
+					level: 'error',
+					message: `Could not merge ${input} into ${outName}: ${error instanceof Error ? error.message : String(error)}`
+				};
+			}
+			existing.addSource(sourceId);
+			target = existing;
+		} else if (!options.force) {
+			return {
+				ok: false,
+				level: 'warning',
+				message: `Refusing to replace existing ${outName} (it is not a ralph-format backlog). Use --force to overwrite.`
+			};
+		}
+	}
+	if (!target) {
+		target = Backlog.empty();
+		merged = target.mergeFrom(source, selection);
+		target.addSource(sourceId);
+	}
+	try {
+		target.save(outPath);
+	} catch (error) {
+		return {
+			ok: false,
+			level: 'error',
+			message: `Could not write ${outPath}: ${error instanceof Error ? error.message : String(error)}`
+		};
+	}
+	return { ok: true, outName, category: options.category, merged, counts: target.counts() };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -4140,7 +4276,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand('ralph', {
-		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|import|set-goal|stop|reload|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|new|import|set-goal|stop|reload|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
@@ -4148,7 +4284,8 @@ export default function (pi: ExtensionAPI) {
 					label: 'start',
 					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
-				{ value: 'import', label: 'import', description: 'Import a Markdown TODO backlog into the ralph format: /ralph import <file.md> [--category name] [--force]. Always imports into the session\'s ralph file, merging into an existing backlog. Each source file is only imported once.' },
+				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start.' },
+				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
 			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
 			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested cycle continues on the reloaded code.' },
@@ -4238,12 +4375,12 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const knownCommands = ['start', 'import', 'set-goal', 'stop', 'status', 'config', 'reload'];
+			const knownCommands = ['start', 'new', 'import', 'set-goal', 'stop', 'status', 'config', 'reload'];
 			if (command !== '' && !knownCommands.includes(command)) {
 				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
 					ctx.ui.notify(
-						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|import|set-goal|stop|status|config|reload]`,
+						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|new|import|set-goal|stop|status|config|reload]`,
 						'error'
 					);
 					return;
@@ -4253,7 +4390,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === '') {
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('Usage: /ralph [start|import|set-goal|stop|status|config|reload] (in TUI: bare /ralph opens the home view)', 'warning');
+					ctx.ui.notify('Usage: /ralph [start|new|import|set-goal|stop|status|config|reload] (in TUI: bare /ralph opens the home view)', 'warning');
 					return;
 				}
 				await openHome(ctx);
@@ -4291,40 +4428,138 @@ export default function (pi: ExtensionAPI) {
 			if (command === 'import') {
 				const importArgs = parseImportArgs(commandArgs.slice(1));
 				if (!importArgs) {
-					ctx.ui.notify('Usage: /ralph import <file.md> [--category name] [--force] (quote paths containing spaces)', 'warning');
+					ctx.ui.notify('Usage: /ralph import <file.md | session-id | ralph-file> [--category name] [--all | --goal] [--force] (quote paths containing spaces)', 'warning');
 					return;
 				}
 				if (!ctx.isIdle()) {
 					ctx.ui.notify('Wait for the current agent run to finish before importing a backlog', 'warning');
 					return;
 				}
-				// Category: explicit --category wins; in TUI mode ask (suggested
-				// from the file name; empty accepts the suggestion).
-				let category = importArgs.category;
-				if (category === undefined && ctx.mode === 'tui') {
-					const answer = await ctx.ui.input('Category', suggestCategory(importArgs.input));
-					if (answer === undefined) {
-						ctx.ui.notify('Import cancelled', 'info');
+				const isMarkdown = /\.md$/i.test(importArgs.input);
+				if (isMarkdown && (importArgs.all || importArgs.goal)) {
+					ctx.ui.notify('--all and --goal only apply to ralph-format sources (a session id or a .db/.ralph file), not Markdown', 'warning');
+					return;
+				}
+				if (isMarkdown) {
+					// Category: explicit --category wins; in TUI mode ask (suggested
+					// from the file name; empty accepts the suggestion).
+					let category = importArgs.category;
+					if (category === undefined && ctx.mode === 'tui') {
+						const answer = await ctx.ui.input('Category', suggestCategory(importArgs.input));
+						if (answer === undefined) {
+							ctx.ui.notify('Import cancelled', 'info');
+							return;
+						}
+						category = answer.trim() === '' ? undefined : answer.trim();
+					}
+					const outcome = await importMarkdownBacklog(ctx.cwd, importArgs.input, autoTodoPath(ctx), {
+						category,
+						force: importArgs.force
+					});
+					if (!outcome.ok) {
+						ctx.ui.notify(outcome.message, outcome.level);
 						return;
 					}
-					category = answer.trim() === '' ? undefined : answer.trim();
+					const counts = outcome.counts;
+					const categoryNote = outcome.category ? ` in category "${outcome.category}"` : '';
+					ctx.ui.notify(
+						outcome.merged
+							? `Merged ${outcome.merged.tasks} tasks${outcome.merged.logEntries ? ` and ${outcome.merged.logEntries} log entries` : ''} from ${importArgs.input} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total). Start with: /ralph start`
+							: `Imported ${counts.total} tasks (${counts.open} open) from ${importArgs.input} to ${outcome.outName}${categoryNote}. Start with: /ralph start`,
+						'info'
+					);
+					return;
 				}
-				const outcome = await importMarkdownBacklog(ctx.cwd, importArgs.input, autoTodoPath(ctx), {
-					category,
-					force: importArgs.force
+				// Ralph-format source (session id or .db/.ralph file): preserve the
+				// source tasks' categories unless --category stamps one.
+				const tasks: 'none' | 'open' | 'all' = importArgs.goal ? 'none' : importArgs.all ? 'all' : 'open';
+				const outcome = await importRalphBacklog(ctx.cwd, importArgs.input, autoTodoPath(ctx), {
+					category: importArgs.category,
+					force: importArgs.force,
+					tasks,
+					goal: !!importArgs.goal
 				});
 				if (!outcome.ok) {
 					ctx.ui.notify(outcome.message, outcome.level);
 					return;
 				}
 				const counts = outcome.counts;
-				const categoryNote = ` in category "${outcome.category}"`;
-				ctx.ui.notify(
-					outcome.merged
-						? `Merged ${outcome.merged.tasks} tasks${outcome.merged.logEntries ? ` and ${outcome.merged.logEntries} log entries` : ''} from ${importArgs.input} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total). Start with: /ralph start`
-						: `Imported ${counts.total} tasks (${counts.open} open) from ${importArgs.input} to ${outcome.outName}${categoryNote}. Start with: /ralph start`,
-					'info'
-				);
+				const categoryNote = outcome.category ? ` in category "${outcome.category}"` : '';
+				let what: string;
+				if (outcome.merged) {
+					const parts: string[] = [];
+					if (outcome.merged.tasks > 0) parts.push(`${outcome.merged.tasks} task${outcome.merged.tasks === 1 ? '' : 's'}`);
+					if (outcome.merged.logEntries > 0) parts.push(`${outcome.merged.logEntries} log entr${outcome.merged.logEntries === 1 ? 'y' : 'ies'}`);
+					if (outcome.merged.goal) parts.push('the goal');
+					what = parts.join(' and ');
+				} else {
+					what = `${counts.total} tasks (${counts.open} open)`;
+				}
+				ctx.ui.notify(`Imported ${what} from ${importArgs.input} into ${outcome.outName}${categoryNote} (backlog now ${counts.open} open / ${counts.total} total). Start with: /ralph start`, 'info');
+				return;
+			}
+			if (command === 'new') {
+				// /ralph new [--all]: start a fresh pi session whose ralph backlog is
+				// a scoped copy of the current session's (goal + open tasks by
+				// default, goal + all tasks with --all). Always works; it only moves
+				// backlog data, never the loop state.
+				let all = false;
+				for (const arg of commandArgs.slice(1)) {
+					if (arg === '--all') {
+						if (all) {
+							ctx.ui.notify('Usage: /ralph new [--all]', 'warning');
+							return;
+						}
+						all = true;
+					} else {
+						ctx.ui.notify('Usage: /ralph new [--all]', 'warning');
+						return;
+					}
+				}
+				if (!ctx.isIdle()) {
+					ctx.ui.notify('Wait for the current agent run to finish before starting a new session', 'warning');
+					return;
+				}
+				// Build the cloned backlog in-memory here (plain data, safe across the
+				// session replacement); it is written in setup(), which runs before the
+				// new instance's session_start, so the new session simply has its file.
+				const srcPath = autoTodoPath(ctx);
+				let srcBacklog: Backlog | undefined;
+				try {
+					srcBacklog = Backlog.open(srcPath);
+				} catch {
+					srcBacklog = undefined; // no backlog yet: the new session starts clean
+				}
+				const fresh = Backlog.empty();
+				if (srcBacklog) {
+					fresh.mergeFrom(srcBacklog, { tasks: all ? 'all' : 'open', goal: true });
+				}
+				const counts = fresh.counts();
+				const clonedGoal = fresh.goal();
+				const parentSession = ctx.sessionManager.getSessionFile();
+				const result = await ctx.newSession({
+					parentSession,
+					setup: async (sm) => {
+						if (counts.total > 0 || clonedGoal) {
+							fresh.save(join(getAgentDir(), AUTO_TODO_DIR, `${sm.getSessionId()}.db`));
+						}
+					},
+					withSession: async (replacementCtx) => {
+						const parts: string[] = [];
+						if (counts.total > 0) parts.push(`${counts.open} open / ${counts.total} tasks`);
+						if (clonedGoal) parts.push(`goal ${clonedGoal.status}`);
+						replacementCtx.ui.notify(
+							parts.length > 0
+								? `New session: ${parts.join(', ')}. /ralph start to run it.`
+								: 'New session started (no open tasks or goal to clone).',
+							'info'
+						);
+					}
+				});
+				if (result.cancelled) {
+					ctx.ui.notify('New session cancelled', 'info');
+					return;
+				}
 				return;
 			}
 			const startFiles = parseStartFiles(commandArgs.slice(1));

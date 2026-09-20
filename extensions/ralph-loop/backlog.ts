@@ -931,6 +931,18 @@ export class Backlog {
 		return this.goal()!;
 	}
 
+	/**
+	 * Overwrite the single goal with a verbatim record (a data copy). Unlike the
+	 * state-machine methods this bypasses the status transitions, so an
+	 * arbitrary status (open/claimed/done) is copied as-is. Used by mergeFrom
+	 * when importing a goal.
+	 */
+	setGoalRecord(goal: Goal): void {
+		this.db
+			.prepare('INSERT OR REPLACE INTO goal (id, status, body, evidence, checkpoint, checkpoint_iteration) VALUES (1, ?, ?, ?, ?, ?)')
+			.run(goal.status, goal.body, goal.evidence, goal.checkpoint, goal.checkpointIteration);
+	}
+
 	/** Mark the task with the given position number done. Records the completion timestamp and clears the context checkpoint (it described in-progress work). Throws when unknown. */
 	complete(number: string, category?: string): Task {
 		const task = this.requireTask(number, category);
@@ -1129,9 +1141,23 @@ export class Backlog {
 	 * log entries get new ids (task links are remapped). When a category is
 	 * given it is stamped on every merged task.
 	 */
-	mergeFrom(other: Backlog, options: { category?: string } = {}): { tasks: number; logEntries: number } {
-		const category = options.category ?? null;
-		const otherTasks = other.listTasks();
+	/**
+	 * Merge another backlog's tasks and log entries into this one. Tasks and
+	 * log entries get new ids (task links are remapped). When a category is
+	 * given it is stamped on every merged task; otherwise each task keeps its
+	 * own category. `tasks` selects which tasks are copied ('all' by default,
+	 * 'open' for open tasks only, 'none' for no tasks); completion log entries
+	 * are copied only for the tasks that were copied. `goal` copies the
+	 * source's goal verbatim (status, body, evidence, checkpoint), replacing
+	 * any existing goal.
+	 */
+	mergeFrom(
+		other: Backlog,
+		options: { category?: string; tasks?: 'none' | 'open' | 'all'; goal?: boolean } = {}
+	): { tasks: number; logEntries: number; goal: boolean } {
+		const taskFilter = options.tasks ?? 'all';
+		const otherTasks =
+			taskFilter === 'none' ? [] : other.listTasks().filter((task) => taskFilter === 'all' || !task.done);
 		let nextTaskId = ((this.db.prepare('SELECT COALESCE(MAX(id), 0) AS next FROM tasks').get() as { next: number }).next) + 1;
 		let nextTaskPosition = ((this.db.prepare('SELECT COALESCE(MAX(position), 0) AS next FROM tasks').get() as { next: number }).next) + 1;
 		const idBySource = new Map<number, number>();
@@ -1143,7 +1169,7 @@ export class Backlog {
 				)
 				.run(
 					nextTaskId,
-					category,
+					options.category ?? task.category,
 					task.title,
 					task.body,
 					task.done ? 1 : 0,
@@ -1160,9 +1186,10 @@ export class Backlog {
 		let nextLogPosition = ((this.db.prepare('SELECT COALESCE(MAX(position), 0) AS next FROM completion_entries').get() as { next: number }).next) + 1;
 		let mergedLogEntries = 0;
 		for (const entry of other.listLogEntries()) {
-			// Every entry belongs to a task, and every source task was merged
-			// above, so the mapping is guaranteed.
-			const taskId = idBySource.get(entry.taskId)!;
+			// Entries for tasks that were not copied (e.g. done tasks under the
+			// 'open' filter) are skipped; every copied task's entries are kept.
+			const taskId = idBySource.get(entry.taskId);
+			if (taskId === undefined) continue;
 			this.db
 				.prepare('INSERT INTO completion_entries (id, task_id, date, note, kind, position) VALUES (?, ?, ?, ?, ?, ?)')
 				.run(nextLogId, taskId, entry.date, entry.note, entry.kind, nextLogPosition);
@@ -1170,7 +1197,15 @@ export class Backlog {
 			nextLogPosition += 1;
 			mergedLogEntries += 1;
 		}
-		return { tasks: mergedTasks, logEntries: mergedLogEntries };
+		let mergedGoal = false;
+		if (options.goal) {
+			const goal = other.goal();
+			if (goal) {
+				this.setGoalRecord(goal);
+				mergedGoal = true;
+			}
+		}
+		return { tasks: mergedTasks, logEntries: mergedLogEntries, goal: mergedGoal };
 	}
 
 	// --- serialization -----------------------------------------------------------
