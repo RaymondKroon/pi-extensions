@@ -613,6 +613,13 @@ interface AlarmEntry {
   cancelled: boolean;
   controller: AbortController;
   timer?: NodeJS.Timeout;
+  kind: "timed" | "condition";
+  command?: string;
+  delaySec?: number;
+  intervalSec?: number;
+  repeat?: boolean;
+  note?: string;
+  scheduledAt: number;
 }
 
 /** Details the wait_for tool attaches to its result, for rendering. */
@@ -643,6 +650,15 @@ export default function (pi: ExtensionAPI) {
     if (entry.timer) clearTimeout(entry.timer);
     alarms.delete(id);
     return true;
+  };
+
+  const describeAlarm = (id: string, e: AlarmEntry): string => {
+    const age = Math.round((Date.now() - e.scheduledAt) / 1000);
+    if (e.kind === "timed") {
+      const remaining = Math.max(0, Math.round((e.scheduledAt + (e.delaySec ?? 0) * 1000 - Date.now()) / 1000));
+      return `alarm ${id}: timed, fires in ~${remaining}s (set ${age}s ago)${e.note ? ` — ${e.note}` : ""}`;
+    }
+    return `alarm ${id}: polling \`${clipCommand(e.command ?? "", 60)}\` every ${e.intervalSec}s${e.repeat ? ", repeats until met" : ""} (set ${age}s ago)${e.note ? ` — ${e.note}` : ""}`;
   };
 
   // Run a shell condition once and return its exit code (null on error/timeout).
@@ -721,23 +737,34 @@ export default function (pi: ExtensionAPI) {
     name: "alarm",
     label: "Alarm",
     description:
-      "Schedule a later wake-up — timed (delay seconds) or condition (command that exits 0) — so you can do other work and be interrupted when it fires; pass cancel to remove a pending alarm by id.",
+      "Schedule a later wake-up — timed (delay) or condition (command that exits 0) — so you can do other work and be interrupted when it fires. Pass cancel to remove one, list to see pending alarms, or repeat to keep a condition alarm polling until it is met.",
     parameters: Type.Object({
       delay: Type.Optional(Type.Number({ description: `Seconds until a timed alarm fires (max ${MAX_TIMEOUT_SECONDS}).` })),
       command: Type.Optional(Type.String({ description: "Shell condition to poll; exit code 0 fires the alarm." })),
       interval: Type.Optional(Type.Number({ description: "Seconds between condition checks (default 2, min 1)." })),
-      timeout: Type.Optional(Type.Number({ description: `For condition alarms: give up after this many seconds (default and max ${MAX_TIMEOUT_SECONDS}).` })),
+      timeout: Type.Optional(Type.Number({ description: `For condition alarms: give up after this many seconds (default and max ${MAX_TIMEOUT_SECONDS}). Ignored with repeat.` })),
+      repeat: Type.Optional(Type.Boolean({ description: "Condition alarms only: on timeout, silently keep polling (re-arm) instead of waking you — you are woken only when the condition is met or you cancel. Use to wait for something that may take a long time (e.g. a human returning to the console)." })),
       note: Type.Optional(Type.String({ description: "Message to include when the alarm wakes you." })),
       cancel: Type.Optional(Type.String({ description: "Cancel the pending alarm with this id instead of scheduling a new one." })),
+      list: Type.Optional(Type.Boolean({ description: "List pending alarms instead of scheduling a new one." })),
     }),
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("alarm "));
-      if (args.cancel) text += theme.fg("dim", `cancel ${args.cancel}`);
+      if (args.list) text += theme.fg("dim", "list");
+      else if (args.cancel) text += theme.fg("dim", `cancel ${args.cancel}`);
       else if (args.delay != null) text += theme.fg("accent", `in ${args.delay}s`);
-      else if (args.command) text += theme.fg("accent", clipCommand(args.command));
+      else if (args.command) text += theme.fg("accent", clipCommand(args.command)) + (args.repeat ? theme.fg("dim", " (repeat)") : "");
       return new Text(text, 0, 0);
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.list) {
+        const items = [...alarms.entries()].map(([id, e]) => describeAlarm(id, e));
+        return {
+          content: [{ type: "text", text: items.length ? items.join("\n") : "No pending alarms." }],
+          details: { alarms: items },
+        };
+      }
+
       if (params.cancel) {
         if (!cancelAlarm(params.cancel)) {
           return { content: [{ type: "text", text: `No pending alarm with id "${params.cancel}".` }], isError: true };
@@ -747,14 +774,25 @@ export default function (pi: ExtensionAPI) {
 
       if (params.delay == null && !params.command) {
         return {
-          content: [{ type: "text", text: "Provide `delay` (timed) or `command` (condition), or `cancel` (id) to remove an alarm." }],
+          content: [{ type: "text", text: "Provide `delay` (timed) or `command` (condition), or `cancel` (id) / `list`." }],
           isError: true,
         };
       }
 
       const id = `a${++alarmSeq}`;
       const note = params.note?.trim();
-      const entry: AlarmEntry = { cancelled: false, controller: new AbortController() };
+      const timed = params.delay != null;
+      const entry: AlarmEntry = {
+        cancelled: false,
+        controller: new AbortController(),
+        kind: timed ? "timed" : "condition",
+        command: params.command,
+        delaySec: timed ? Math.min(Math.max(1, params.delay!), MAX_TIMEOUT_SECONDS) : undefined,
+        intervalSec: timed ? undefined : Math.max(1, params.interval ?? 2),
+        repeat: timed ? undefined : !!params.repeat,
+        note,
+        scheduledAt: Date.now(),
+      };
       alarms.set(id, entry);
 
       const fire = (reason: string) => {
@@ -771,8 +809,8 @@ export default function (pi: ExtensionAPI) {
         );
       };
 
-      if (params.delay != null) {
-        const sec = Math.min(Math.max(1, params.delay), MAX_TIMEOUT_SECONDS);
+      if (timed) {
+        const sec = entry.delaySec!;
         entry.timer = setTimeout(() => fire(`fired after ${sec}s`), sec * 1000);
         return {
           content: [{ type: "text", text: `Scheduled timed alarm ${id} in ${sec}s. You will be woken when it fires.` }],
@@ -780,9 +818,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const command = params.command!;
-      const intervalMs = Math.max(1, params.interval ?? 2) * 1000;
+      const command = entry.command!;
+      const intervalMs = entry.intervalSec! * 1000;
       const capMs = Math.min(Math.max(1, params.timeout ?? MAX_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000;
+      const repeat = entry.repeat!;
       void (async () => {
         const start = Date.now();
         while (!entry.cancelled) {
@@ -792,16 +831,23 @@ export default function (pi: ExtensionAPI) {
             fire(`condition met: \`${command}\``);
             return;
           }
-          if (Date.now() - start >= capMs) {
-            fire(`timed out after ${capMs / 1000}s waiting for: \`${command}\``);
+          if (!repeat && Date.now() - start >= capMs) {
+            fire(`timed out after ${capMs / 1000}s; condition was still false at the last check — re-arm (or use repeat) if you expect it to resolve`);
             return;
           }
           await sleep(intervalMs, entry.controller.signal);
         }
       })();
       return {
-        content: [{ type: "text", text: `Scheduled condition alarm ${id} (checking every ${intervalMs / 1000}s, up to ${capMs / 1000}s). You will be woken when it fires or times out.` }],
-        details: { scheduled: true, id },
+        content: [
+          {
+            type: "text",
+            text: repeat
+              ? `Scheduled condition alarm ${id} (checking every ${intervalMs / 1000}s; repeats until the condition is met). You will be woken only when it is met — cancel ${id} to stop.`
+              : `Scheduled condition alarm ${id} (checking every ${intervalMs / 1000}s, up to ${capMs / 1000}s). You will be woken when it is met or times out.`,
+          },
+        ],
+        details: { scheduled: true, id, repeat },
       };
     },
   });
