@@ -260,7 +260,12 @@ afterEach(async () => {
 	await rm(agentDir, { recursive: true, force: true });
 });
 
-async function createRalphSession(port: number, config: Record<string, unknown>, bindings?: Record<string, unknown>) {
+async function createRalphSession(
+	port: number,
+	config: Record<string, unknown>,
+	bindings?: Record<string, unknown>,
+	onPi?: (pi: { events: { emit: (channel: string, data: unknown) => void } }) => void
+) {
 	await writeFile(join(projectDir, '.pi', 'ralph-loop.json'), `${JSON.stringify(config, null, '\t')}\n`);
 
 	const loader = new DefaultResourceLoader({
@@ -269,6 +274,7 @@ async function createRalphSession(port: number, config: Record<string, unknown>,
 		additionalExtensionPaths: [RALPH_EXTENSION],
 		extensionFactories: [
 			(pi) => {
+			onPi?.(pi as { events: { emit: (channel: string, data: unknown) => void } });
 				pi.registerProvider('ralph-mock', {
 					name: 'Ralph Mock',
 					baseUrl: `http://127.0.0.1:${port}/v1`,
@@ -978,6 +984,69 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 					),
 				'context boundary message'
 			);
+		}
+	);
+
+	test(
+		'loop-escape enforcement: a renewed detection aborts the stuck run and the recording turn still runs',
+		{ timeout: 60000 },
+		async () => {
+			// Regression (session 01a0c400): the enforcement path aborted the
+			// stuck run and queued the cycle's recording prompt as a followUp —
+			// but an abort marks the run abort-requested (user-Escape semantics)
+			// and pi never delivers queued continuations after such a run
+			// settles, so the recording turn never started and the loop sat
+			// dead with a queued cycle. The recording prompt must be delivered
+			// at the aborted run's settle instead.
+			endpoint = startMockEndpoint([
+				// Iteration 1: the mock model calls bash sleep, keeping the run
+				// active while the test emits two loop-police detections.
+				toolCallResponder('bash', { command: 'sleep 1.5', timeout: 10 }),
+				// The recording turn — starts only if the deferred recording
+				// prompt is delivered at the aborted run's settle.
+				textResponder('Finished up; todos recorded.'),
+				// The fresh iteration after the recording turn settles.
+				textResponder('Continuing from the recorded todos.')
+			]);
+			let ralphPi: { events: { emit: (channel: string, data: unknown) => void } } | undefined;
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				(pi) => {
+					ralphPi = pi;
+				}
+			);
+
+			await sess.prompt('/ralph start');
+
+			// Iteration 1: the run is active (streaming the tool call / running
+			// the sleep). First detection: the model is nudged to call
+			// ralph_cycle. The model ignores it and loops on: the renewed
+			// detection enforces — the stuck run is aborted and the cycle queued.
+			await waitFor(() => (endpoint!.requests.length >= 1), 'iteration 1 request');
+			ralphPi!.events.emit('loop-police:detection', { event: 'stagnation' });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			ralphPi!.events.emit('loop-police:detection', { event: 'stagnation' });
+
+			// The enforcement aborts the sleep mid-flight; the aborted run
+			// settles, and the settle delivers the deferred recording prompt:
+			// the recording turn is the next model request. Without the fix
+			// this request never arrives and the wait times out.
+			await waitFor(() => endpoint!.requests.length >= 2, 'recording turn request');
+			const recordingRequest = endpoint!.requests[1]!;
+			expect(requestText(recordingRequest)).toContain('Finish up now');
+			expect(requestText(recordingRequest)).toContain('continue from the backlog with a clean context');
+
+			// The recording turn settles: the fresh iteration starts from the
+			// cut, named for the loop-escape reason.
+			await waitFor(() => endpoint!.requests.length >= 3, 'fresh iteration request');
+			const freshRequest = endpoint!.requests[2]!;
+			expect(requestText(freshRequest)).toContain('A reasoning loop was detected, so the previous iteration was cut');
 		}
 	);
 });

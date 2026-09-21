@@ -3188,7 +3188,7 @@ export default function (pi: ExtensionAPI) {
 	const queueCycle = (
 		ctx: ExtensionContext,
 		reason: CycleReason,
-		options?: { midTurn?: boolean; currentTodo?: string }
+		options?: { midTurn?: boolean; currentTodo?: string; record?: boolean }
 	) => {
 		// Any queued cycle resolves a pending loop escape: the model complied
 		// (or a cycle ran for another reason), so neither the enforcement nor
@@ -3220,8 +3220,12 @@ export default function (pi: ExtensionAPI) {
 		// that continues from the recorded state instead of the old conversation.
 		// When the budget is crossed mid-turn, steer the instruction into the
 		// running turn so the model stops at the next tool boundary instead of the
-		// turn running on until it settles on its own.
-		sendRecordingPrompt(ctx, options);
+		// turn running on until it settles on its own. record: false defers
+		// the prompt to the caller: the loop-escape enforcement aborts the run
+		// first, and an abort suppresses pi's queued continuations (user-Escape
+		// semantics), so a followUp queued here would never be delivered
+		// (session 01a0c400) — the settle handler delivers it instead.
+		if (options?.record !== false) sendRecordingPrompt(ctx, options);
 	};
 
 	// Dynamic tool loading (pi "defer_loading"): the four ralph tools stay
@@ -3403,6 +3407,13 @@ export default function (pi: ExtensionAPI) {
 		if (state?.enabled && state.cycleQueued && !state.cycleCheckpointing) {
 			startFreshIteration(ctx);
 		}
+		// The progress-recording turn was interrupted before it ran (the
+		// session quit or crashed mid-cycle — e.g. right after a loop-escape
+		// enforcement abort): re-run it so the queued cycle completes instead
+		// of sitting dead with a checkpoint pending.
+		if (state?.enabled && state.cycleQueued && state.cycleCheckpointing) {
+			sendRecordingPrompt(ctx);
+		}
 		updateStatus(ctx);
 		syncToolActivation();
 	});
@@ -3544,13 +3555,24 @@ export default function (pi: ExtensionAPI) {
 				// The previous intercept was ignored and the model is looping
 				// again: enforce the escape — abort the stuck run and queue the
 				// cycle ourselves, so the context cut no longer depends on the
-				// stuck model's cooperation. The recording prompt (followUp)
-				// starts the recording turn as soon as the abort lands.
+				// stuck model's cooperation. The recording prompt is NOT queued
+				// with the cycle: ctx.abort() marks the run abort-requested
+				// (user-Escape semantics) and pi drops queued continuations after
+				// such a run settles, so the settle handler delivers the prompt
+				// instead (session 01a0c400: the followUp was queued here, never
+				// delivered, and the loop sat dead with a queued cycle).
 				loopEscapePending = false;
 				selfEscapeAbort = true;
 				ctx.abort();
 				ctx.ui.notify('Ralph: the model ignored the loop-escape instruction — aborting the stuck turn and cutting to a fresh iteration', 'warning');
-				queueCycle(ctx, 'loop-escape');
+				queueCycle(ctx, 'loop-escape', { record: false });
+				if (ctx.isIdle()) {
+					// No run was active to abort, so no settle will come to
+					// deliver the recording prompt — start the recording turn
+					// now.
+					selfEscapeAbort = false;
+					sendRecordingPrompt(ctx);
+				}
 				return;
 			}
 			loopEscapePending = true;
@@ -3685,9 +3707,12 @@ export default function (pi: ExtensionAPI) {
 			loopEscapePending = false;
 			if (selfEscapeAbort) {
 				// Our own enforcement abort, not a user Escape: the escape cycle
-				// is already queued and its recording prompt pending — continue
-				// the cycle instead of pausing.
+				// is already queued. The abort suppresses pi's queued
+				// continuations, so the recording prompt (deliberately not queued
+				// with the abort) is delivered here — the session is idle at
+				// settle, so it starts the recording turn.
 				selfEscapeAbort = false;
+				sendRecordingPrompt(ctx);
 				return;
 			}
 			if (state.stopRequested) {

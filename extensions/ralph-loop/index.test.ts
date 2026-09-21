@@ -630,6 +630,8 @@ describe('ralph-loop extension', () => {
 
 		await startLoop(fake, fakeCtx);
 		await fake.fire('agent_start', fakeCtx.ctx);
+		// A run is active (the model is looping).
+		fakeCtx.idle.value = false;
 
 		// First detection: the model is asked to call ralph_cycle.
 		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
@@ -637,23 +639,28 @@ describe('ralph-loop extension', () => {
 		expect(fakeCtx.abortCalls.value).toBe(0);
 
 		// The model ignores it and loops on: the renewed detection enforces —
-		// the stuck run is aborted and the escape cycle is queued, so the
-		// recording prompt starts as soon as the abort lands.
+		// the stuck run is aborted and the escape cycle is queued. The
+		// recording prompt is NOT sent yet: the abort suppresses pi's queued
+		// continuations, so a followUp sent now would never be delivered
+		// (session 01a0c400) — the settle delivers it instead.
 		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
 		expect(fakeCtx.abortCalls.value).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.length).toBe(2);
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
+
+		// The aborted run settles: the self-abort must not pause the loop, and
+		// the settle delivers the deferred recording prompt (the session is
+		// idle, so it starts the recording turn).
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
 		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 		expect(fake.userMessages.length).toBe(3);
 		expect(fake.userMessages[2].text).toContain('A reasoning loop was detected');
 		expect(fake.userMessages[2].text).toContain('Finish up now');
 		expect(fake.userMessages[2].options).toEqual({ deliverAs: 'followUp' });
-		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
-		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
-
-		// The aborted run settles: the self-abort must not pause the loop.
-		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
-		await fake.fire('agent_settled', fakeCtx.ctx);
-		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
-		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
 
 		// The recording turn runs with a fresh run signal (like pi: each run
 		// has its own abort signal) and settles: the fresh iteration starts
@@ -665,6 +672,69 @@ describe('ralph-loop extension', () => {
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
+	});
+
+	test('enforcement with no active run delivers the recording prompt immediately (no settle to wait for)', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+		// The session is idle: the detection lands in a gap where no run is
+		// active, so no settle will come to deliver the deferred prompt.
+		fakeCtx.idle.value = true;
+
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(2); // iteration prompt + nudge
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fakeCtx.abortCalls.value).toBe(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		// No settle will fire, so the recording prompt is sent right away.
+		expect(fake.userMessages.length).toBe(3);
+		expect(fake.userMessages[2].text).toContain('Finish up now');
+		expect(fake.userMessages[2].options).toEqual({ deliverAs: 'followUp' });
+
+		// The recording turn runs with a fresh run signal (like pi: each run
+		// has its own abort signal) and settles: the fresh iteration starts.
+		fakeCtx.newRun();
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+	});
+
+	test('a session resumed mid-cycle (recording turn pending) re-runs the recording turn', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+		fakeCtx.idle.value = false;
+
+		// Enforcement queues the cycle and defers the recording prompt to the
+		// settle — but the session quits before the aborted run settles.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.length).toBe(2);
+		const entry = [...fake.entries].reverse().find((e) => e.customType === 'ralph-loop-state')!;
+		expect(entry.data.cycleQueued).toBe(true);
+		expect(entry.data.cycleCheckpointing).toBe(true);
+
+		// A fresh instance starts on the same session: the persisted state
+		// carries the queued cycle with a pending checkpoint, so the recording
+		// turn re-runs instead of the loop sitting dead.
+		const reloaded = createFakePi();
+		extension(reloaded.pi as never);
+		const reloadedCtx = createFakeCtx(dir);
+		reloadedCtx.ctx.sessionManager.getBranch = () => [entry];
+		await reloaded.fire('session_start', reloadedCtx.ctx, { reason: 'startup' });
+		expect(reloaded.userMessages.length).toBe(1);
+		expect(reloaded.userMessages[0].text).toContain('Finish up now');
+		expect(reloaded.userMessages[0].options).toEqual({ deliverAs: 'followUp' });
 	});
 
 	test('loop-police stream abort nudges instead of pausing: the recovery turn runs, and the fallback queues the cycle if the model does not comply', async () => {
