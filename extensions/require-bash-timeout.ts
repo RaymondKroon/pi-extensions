@@ -459,7 +459,9 @@ export function findBusyWaitLoops(command: string): string[] {
       }
       k++;
     }
-    return { word: command.slice(start, k), next: k };
+    // Never report zero progress: if the word is empty (e.g. the scanner
+    // landed on a bare `)`), advance by one so callers can't spin.
+    return { word: command.slice(start, k), next: k === start ? start + 1 : k };
   };
 
   // A body is a busy-wait if it has no `sleep` and no real command — only
@@ -509,7 +511,10 @@ export function findBusyWaitLoops(command: string): string[] {
       i = end;
       continue;
     }
-    if (";|&".includes(c)) {
+    if (";|&)".includes(c)) {
+      // A bare `)` (unbalanced from the scanner's point of view) is just a
+      // separator — it must be consumed here, otherwise readWord() returns
+      // an empty word and the loop never advances.
       atCmdPos = true;
       i++;
       continue;
@@ -555,7 +560,7 @@ export function findBusyWaitLoops(command: string): string[] {
         j = skipGroup(j);
         continue;
       }
-      if (";|&".includes(ch)) {
+      if (";|&)".includes(ch)) {
         j++;
         continue;
       }
