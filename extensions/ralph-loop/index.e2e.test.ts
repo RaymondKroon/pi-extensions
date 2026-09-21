@@ -1049,4 +1049,142 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			expect(requestText(freshRequest)).toContain('A reasoning loop was detected, so the previous iteration was cut');
 		}
 	);
+
+	/** Last persisted ralph-loop-state entry (the loop's durable state). */
+	function lastStateEntry(sess: AgentSession): { paused?: boolean; cycleReason?: string } | undefined {
+		const entry = [...sess.sessionManager.getEntries()].reverse().find((e) => e.type === 'custom' && e.customType === 'ralph-loop-state');
+		return (entry as { data?: { paused?: boolean; cycleReason?: string } } | undefined)?.data;
+	}
+
+	test(
+		'loop-police stream abort (reasoning event): the cut run settles without pausing and the recovery turn carries the cycle nudge',
+		{ timeout: 60000 },
+		async () => {
+			// Regression (session 01a0c400): loop-police's semantic_loop detector
+			// truncated the stream and aborted the run itself. The settle then
+			// expected loop-police's triggerTurn recovery message to start the
+			// recovery turn — but at message_end the run is still streaming, so
+			// pi routed it through agent.steer() into the DYING run, where pi's
+			// aborted stop drops it: the session sat frozen with no pause, no
+			// cycle, nothing pending. The settle must start the recovery turn
+			// itself, delivering the cycle-on-loop nudge with it.
+			endpoint = startMockEndpoint([
+				// Iteration 1: the mock model calls bash sleep, keeping the run
+				// active while the test emits the detection and aborts the run
+				// (the abort is loop-police's in production; the test simulates
+				// it, as loop-police is not loaded here).
+				toolCallResponder('bash', { command: 'sleep 1.5', timeout: 10 }),
+				// The recovery turn — starts only if the settle delivers the
+				// nudge itself. Without the fix this request never arrives and
+				// the wait below times out.
+				textResponder('Ignoring the nudge; the loop continues.'),
+				// The model ignored the nudge: the settle fallback queues the
+				// loop-escape cycle — its recording turn.
+				textResponder('Finished up; todos recorded.'),
+				// The fresh iteration after the recording turn settles.
+				textResponder('Continuing from the recorded todos.')
+			]);
+			let ralphPi: { events: { emit: (channel: string, data: unknown) => void } } | undefined;
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				(pi) => {
+					ralphPi = pi;
+				}
+			);
+
+			await sess.prompt('/ralph start');
+
+			// The stream-loop detection: ralph marks the abort and remembers the
+			// event, but sends NO nudge steer — a steer now would join the dying
+			// run and be dropped. loop-police's own abort follows.
+			await waitFor(() => (endpoint!.requests.length >= 1), 'iteration 1 request');
+			ralphPi!.events.emit('loop-police:detection', { event: 'semantic_loop' });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			void sess.abort();
+
+			// The aborted run settles WITHOUT pausing the loop (a user Escape
+			// would have paused it and no further request would ever arrive).
+			await waitFor(() => endpoint!.requests.length >= 2, 'recovery turn request');
+			expect(lastStateEntry(sess)?.paused).toBe(false);
+
+			// The NEXT model request is the recovery turn, carrying the
+			// cycle-on-loop nudge.
+			const recoveryRequest = endpoint!.requests[1]!;
+			expect(requestText(recoveryRequest)).toContain('A reasoning loop was detected');
+			expect(requestText(recoveryRequest)).toContain('call ralph_cycle');
+
+			// The model ignored the nudge: the fallback queues the loop-escape
+			// cycle — the recording turn, then the fresh iteration named for it.
+			await waitFor(() => endpoint!.requests.length >= 3, 'recording turn request');
+			const recordingRequest = endpoint!.requests[2]!;
+			expect(requestText(recordingRequest)).toContain('Finish up now');
+			expect(requestText(recordingRequest)).toContain('continue from the backlog with a clean context');
+
+			await waitFor(() => endpoint!.requests.length >= 4, 'fresh iteration request');
+			const freshRequest = endpoint!.requests[3]!;
+			expect(requestText(freshRequest)).toContain('A reasoning loop was detected, so the previous iteration was cut');
+		}
+	);
+
+	test(
+		'loop-police stream abort (output event): the recovery turn gets the plain continue prompt and the loop keeps running',
+		{ timeout: 60000 },
+		async () => {
+			// Output loops are not reasoning events: no cycle nudge, but the
+			// abort still must not pause the loop, and the settle must start the
+			// recovery turn with the plain continue prompt (loop-police's own
+			// triggerTurn was lost with the abort, like in the reasoning case).
+			endpoint = startMockEndpoint([
+				// Iteration 1: bash sleep keeps the run active while the test
+				// emits the detection and aborts the run (loop-police's abort,
+				// simulated — loop-police is not loaded here).
+				toolCallResponder('bash', { command: 'sleep 1.5', timeout: 10 }),
+				// The recovery turn: a plain continue, no nudge.
+				textResponder('Continuing the task from the tool results.')
+			]);
+			let ralphPi: { events: { emit: (channel: string, data: unknown) => void } } | undefined;
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				(pi) => {
+					ralphPi = pi;
+				}
+			);
+
+			await sess.prompt('/ralph start');
+
+			await waitFor(() => (endpoint!.requests.length >= 1), 'iteration 1 request');
+			ralphPi!.events.emit('loop-police:detection', { event: 'output_semantic_loop' });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			void sess.abort();
+
+			// The aborted run settles without pausing, and the NEXT model
+			// request is the recovery turn with the plain continue prompt —
+			// no cycle nudge for a non-reasoning event.
+			await waitFor(() => endpoint!.requests.length >= 2, 'recovery turn request');
+			expect(lastStateEntry(sess)?.paused).toBe(false);
+			const recoveryRequest = endpoint!.requests[1]!;
+			expect(requestText(recoveryRequest)).toContain('cut by loop-police');
+			expect(requestText(recoveryRequest)).not.toContain('A reasoning loop was detected');
+
+			// The recovery turn settles cleanly: the loop just continues the
+			// current iteration — no escape cycle is queued, so no recording
+			// turn follows.
+			await waitFor(() => sess.isIdle, 'session idle after the recovery turn');
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			expect(endpoint!.requests.length).toBe(2);
+			expect(lastStateEntry(sess)?.paused).toBe(false);
+		}
+	);
 });
