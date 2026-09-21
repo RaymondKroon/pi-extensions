@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createLocalBashOperations, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { readdirSync, readFileSync } from "node:fs";
 
 /**
  * Fails any bash (or powershell) tool call that does not specify a timeout,
@@ -632,12 +633,101 @@ interface WaitDetails {
   met: boolean;
   timedOut?: boolean;
   cancelled?: boolean;
+  blocked?: boolean;
   elapsedSec?: number;
 }
 
 /** Truncate a command for a single-line tool-call display. */
 function clipCommand(cmd: string, max = 80): string {
   return cmd.length > max ? `${cmd.slice(0, max - 1)}…` : cmd;
+}
+
+/** Extract the patterns of `pgrep -f` / `pkill -f` invocations in a shell command. */
+function extractPgrepPatterns(command: string): string[] {
+  const out: string[] = [];
+  const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== "pgrep" && tokens[i] !== "pkill") continue;
+    let full = false;
+    i++;
+    while (i < tokens.length && tokens[i].startsWith("-")) {
+      if (tokens[i].slice(tokens[i].startsWith("--") ? 2 : 1).includes("f")) full = true;
+      i++;
+    }
+    if (!full || i >= tokens.length) continue;
+    let pat = tokens[i];
+    if ((pat.startsWith('"') && pat.endsWith('"')) || (pat.startsWith("'") && pat.endsWith("'"))) {
+      pat = pat.slice(1, -1);
+    }
+    if (pat) out.push(pat);
+  }
+  return out;
+}
+
+/**
+ * Audits a condition that uses `pgrep -f` / `pkill -f` for the two classic
+ * failure modes:
+ *   1. self-match — the polling shell runs as `sh -c <command>`, so its own
+ *      command line contains the pattern; the condition can never be true.
+ *   2. multi-match — the pattern matches several processes, so the boolean
+ *      result is ambiguous.
+ * Returns an explanation, or null if the condition looks sound.
+ */
+function auditPgrepCondition(command: string): string | null {
+  const patterns = extractPgrepPatterns(command);
+  if (patterns.length === 0) return null;
+  // 1) Static self-match: test each pattern against the polling shell's command line.
+  for (const p of patterns) {
+    let self: boolean;
+    try {
+      self = new RegExp(p).test(`sh -c ${command}`);
+    } catch {
+      self = true; // pattern not parseable as a regex — assume the worst
+    }
+    if (self) {
+      return (
+        `unreliable condition: the pattern of \`pgrep -f '${p}'\` self-matches the polling shell — ` +
+        `the shell's own command line contains the pattern, so the condition can never be true. ` +
+        `Use \`[ ! -d /proc/$PID ]\` or a marker file instead ` +
+        `(or a bracket pattern like \`pgrep -f 'cargo[ ]test'\` so the literal text does not match itself).`
+      );
+    }
+  }
+  // 2) Runtime multi-match: scan /proc for processes whose command line matches.
+  let dirs: string[];
+  try {
+    dirs = readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+  } catch {
+    return null; // not on Linux — skip the runtime check
+  }
+  const matchesPattern = (cmdline: string) =>
+    patterns.some((p) => {
+      try {
+        return new RegExp(p).test(cmdline);
+      } catch {
+        return cmdline.includes(p);
+      }
+    });
+  const hits: { pid: string; cmdline: string }[] = [];
+  for (const pid of dirs) {
+    let raw: Buffer;
+    try {
+      raw = readFileSync(`/proc/${pid}/cmdline`);
+    } catch {
+      continue;
+    }
+    const cmdline = raw.toString("utf8").split("\0").filter(Boolean).join(" ");
+    if (!cmdline || cmdline.includes(command)) continue; // skip the polling shell itself
+    if (matchesPattern(cmdline)) hits.push({ pid, cmdline });
+  }
+  if (hits.length > 1) {
+    const list = hits.map((h) => `pid ${h.pid} ${clipCommand(h.cmdline, 50)}`).join("; ");
+    return (
+      `unreliable condition: \`pgrep -f\` matched ${hits.length} processes (${list}) — ` +
+      `the boolean result is ambiguous; use a PID check or marker file instead.`
+    );
+  }
+  return null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -666,14 +756,21 @@ export default function (pi: ExtensionAPI) {
     return `alarm ${id}: polling \`${clipCommand(e.command ?? "", 60)}\` every ${e.intervalSec}s${e.repeat ? ", repeats until met" : ""} (set ${age}s ago)${e.note ? ` — ${e.note}` : ""}`;
   };
 
-  // Run a shell condition once and return its exit code (null on error/timeout).
-  const runCheck = async (command: string, cwd: string, signal?: AbortSignal): Promise<number | null> => {
+  // Run a shell condition once and return its exit code (null on error/timeout),
+  // plus an auditError if the condition uses an unreliable `pgrep -f` pattern.
+  const runCheck = async (
+    command: string,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<{ exitCode: number | null; auditError?: string }> => {
+    let exitCode: number | null;
     try {
       const r = await ops.exec(command, cwd, { onData: () => {}, signal, timeout: CHECK_TIMEOUT_MS });
-      return r.exitCode;
+      exitCode = r.exitCode;
     } catch {
-      return null;
+      exitCode = null;
     }
+    return { exitCode, auditError: auditPgrepCondition(command) ?? undefined };
   };
 
   // ---- wait_for: block until a shell condition exits 0 (or a timeout) ----
@@ -683,7 +780,13 @@ export default function (pi: ExtensionAPI) {
     description:
       "Block until a shell command exits 0 (condition met) or a timeout elapses — use to wait for a background job instead of busy-waiting.",
     parameters: Type.Object({
-      command: Type.String({ description: "Shell command to run as the check; exit code 0 means the condition is met." }),
+      command: Type.String({
+        description:
+          "Shell command to run as the check; exit code 0 means the condition is met. " +
+          "To wait for a background job, prefer a robust completion check (e.g. `[ ! -d /proc/$PID ]` " +
+          "or a marker file the job writes when done) over `pgrep -f` — the polling shell's own " +
+          "command line contains the pattern, so `pgrep -f` self-matches and the condition can never be true (use a bracket pattern like `pgrep -f 'cargo[ ]test'` if you must).",
+      }),
       timeout: Type.Optional(Type.Number({ description: `Max seconds to wait (default and max ${MAX_TIMEOUT_SECONDS}).` })),
       interval: Type.Optional(Type.Number({ description: "Seconds between checks (default 2, min 1)." })),
     }),
@@ -714,7 +817,14 @@ export default function (pi: ExtensionAPI) {
           };
         }
         checks++;
-        const exitCode = await runCheck(params.command, ctx.cwd, signal);
+        const { exitCode, auditError } = await runCheck(params.command, ctx.cwd, signal);
+        if (auditError) {
+          return {
+            content: [{ type: "text", text: `Blocked: ${auditError}` }],
+            isError: true,
+            details: { met: false, blocked: true },
+          };
+        }
         if (exitCode === 0) {
           const s = (Date.now() - start) / 1000;
           return {
@@ -745,7 +855,11 @@ export default function (pi: ExtensionAPI) {
       "Schedule a later wake-up — timed (delay) or condition (command that exits 0) — so you can do other work and be interrupted when it fires. Pass cancel to remove one, list to see pending alarms, or repeat to keep a condition alarm polling until it is met.",
     parameters: Type.Object({
       delay: Type.Optional(Type.Number({ description: `Seconds until a timed alarm fires (max ${MAX_TIMEOUT_SECONDS}).` })),
-      command: Type.Optional(Type.String({ description: "Shell condition to poll; exit code 0 fires the alarm." })),
+      command: Type.Optional(Type.String({
+        description:
+          "Shell condition to poll; exit code 0 fires the alarm. " +
+          "Prefer a robust check (e.g. `[ ! -d /proc/$PID ]` or a marker file) over `pgrep -f`, which can match unrelated processes.",
+      })),
       interval: Type.Optional(Type.Number({ description: "Seconds between condition checks (default 2, min 1)." })),
       timeout: Type.Optional(Type.Number({ description: `For condition alarms: give up after this many seconds (default and max ${MAX_TIMEOUT_SECONDS}). Ignored with repeat.` })),
       repeat: Type.Optional(Type.Boolean({ description: "Condition alarms only: on timeout, silently keep polling (re-arm) instead of waking you — you are woken only when the condition is met or you cancel. Use to wait for something that may take a long time (e.g. a human returning to the console)." })),
@@ -830,8 +944,12 @@ export default function (pi: ExtensionAPI) {
       void (async () => {
         const start = Date.now();
         while (!entry.cancelled) {
-          const exitCode = await runCheck(command, ctx.cwd, entry.controller.signal);
+          const { exitCode, auditError } = await runCheck(command, ctx.cwd, entry.controller.signal);
           if (entry.cancelled) return;
+          if (auditError) {
+            fire(`unreliable condition: ${auditError}`);
+            return;
+          }
           if (exitCode === 0) {
             fire(`condition met: \`${command}\``);
             return;
