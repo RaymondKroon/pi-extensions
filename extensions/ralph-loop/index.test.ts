@@ -667,6 +667,68 @@ describe('ralph-loop extension', () => {
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 	});
 
+	test('loop-police stream abort nudges instead of pausing: the recovery turn runs, and the fallback queues the cycle if the model does not comply', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+
+		// A thinking-loop detection truncates the stream: loop-police aborts
+		// the run itself and ralph steers the cycle instruction (the nudge).
+		fake.fireEvent('loop-police:detection', { event: 'thinking_loop' });
+		expect(fake.userMessages.length).toBe(2);
+		expect(fake.userMessages[1].options).toEqual({ deliverAs: 'steer' });
+		expect(fakeCtx.abortCalls.value).toBe(0);
+
+		// The aborted run settles: loop-police's own abort must not pause the
+		// loop as a user Escape, and the escape must not be queued yet — the
+		// recovery turn (carrying the nudge) still gets to run.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('finishing');
+
+		// The recovery turn runs with a fresh run signal and the model ignores
+		// the nudge: the settle fallback queues the escape cycle.
+		fakeCtx.newRun();
+		await fake.fire('agent_start', fakeCtx.ctx);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
+	});
+
+	test('loop-police output-loop abort does not pause the loop either (no ralph steer, loop-police recovery only)', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+
+		// Output loops are not reasoning events: ralph sends no steer, but the
+		// run abort still must not pause the loop.
+		fake.fireEvent('loop-police:detection', { event: 'output_loop' });
+		expect(fake.userMessages.length).toBe(1);
+
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+
+		// The recovery turn settles cleanly: the loop just continues.
+		fakeCtx.newRun();
+		await fake.fire('agent_start', fakeCtx.ctx);
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('finishing');
+	});
+
 	test('a complied ralph_cycle clears the pending escape: no enforcement, and a later detection asks again', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);

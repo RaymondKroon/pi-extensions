@@ -64,6 +64,14 @@ const COMPACTION_SOURCE = 'ralph-loop';
  */
 const LOOP_POLICE_REASONING_EVENTS = new Set(['stagnation', 'rederived_reasoning', 'thinking_loop', 'semantic_loop']);
 /**
+ * loop-police events that abort the run itself (stream truncation): the
+ * detection lands mid-stream, loop-police calls ctx.abort(), and the run
+ * settles as 'aborted' — indistinguishable from a user Escape unless ralph
+ * marks it. (stagnation / rederived_reasoning fire on clean turns and only
+ * trigger a recovery turn; tool detections block calls without aborting.)
+ */
+const LOOP_POLICE_STREAM_EVENTS = new Set(['thinking_loop', 'semantic_loop', 'output_loop', 'output_semantic_loop']);
+/**
  * The ralph backlog directory: every loop (tasks/goal/auto) and every idle
  * ralph_todo/ralph_goal read runs on the per-session ralph file here. Stored
  * in the ralph subdirectory of pi's global agent directory (like sessions in
@@ -1807,6 +1815,12 @@ export default function (pi: ExtensionAPI) {
 	// the loop) — the escape cycle is already queued and its recording turn
 	// follows. Cleared at the next agent_start (the recording turn).
 	let selfEscapeAbort = false;
+	// Set when loop-police aborts the run itself (stream-loop truncation):
+	// the settle must not treat that abort as a user Escape either —
+	// loop-police's recovery turn runs next with ralph's steer delivered, and
+	// the loopEscapePending fallback (or the model's own ralph_cycle) handles
+	// the escape from there. Consumed at the settle, cleared at agent_start.
+	let loopPoliceAbort = false;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -3231,6 +3245,7 @@ export default function (pi: ExtensionAPI) {
 		lastCtx = undefined;
 		loopEscapePending = false;
 		selfEscapeAbort = false;
+		loopPoliceAbort = false;
 		lastAssistantStopReason = undefined;
 		runSawWorkToolCall = false;
 		runSawAssistantMessage = true;
@@ -3479,6 +3494,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on('agent_start', (_event, ctx) => {
 		lastCtx = ctx;
 		selfEscapeAbort = false;
+		loopPoliceAbort = false;
 		lastAssistantStopReason = undefined;
 		runSawWorkToolCall = false;
 		runSawAssistantMessage = false;
@@ -3516,6 +3532,10 @@ export default function (pi: ExtensionAPI) {
 	// (autoInterceptSuspended), like the context-budget intercept.
 	pi.events.on('loop-police:detection', (data) => {
 		const event = (data as { event?: string } | null | undefined)?.event;
+		// Stream-loop detections abort the run themselves: mark the abort so
+		// the settle nudges (via the recovery turn) instead of pausing the
+		// loop on what looks like a user Escape.
+		if (event && LOOP_POLICE_STREAM_EVENTS.has(event)) loopPoliceAbort = true;
 		if (!event || !LOOP_POLICE_REASONING_EVENTS.has(event)) return;
 		if (state?.enabled) {
 			if (state.cycleQueued || state.stopRequested) return;
@@ -3651,6 +3671,14 @@ export default function (pi: ExtensionAPI) {
 		// iterations (a typed message resumes the loop before its turn runs).
 		if (state.paused) return;
 		if (userAborted) {
+			if (loopPoliceAbort) {
+				// loop-police truncated a looping stream and aborted the run
+				// itself — not a user Escape. Its recovery turn runs next with
+				// ralph's steer delivered; keep the pending escape so the
+				// fallback queues the cycle if the model does not comply.
+				loopPoliceAbort = false;
+				return;
+			}
 			// The user took the wheel: the intercept's chance to self-correct is
 			// void, so the pending escape is dropped — a renewed detection re-arms
 			// it instead of firing a cut right after a manual resume.
