@@ -5703,8 +5703,11 @@ T 1 - "Continuous re-test loop (run until stopped)"
 		const iterationCount = fake.userMessages.length;
 		expect(iterationCount).toBe(1);
 
-		// The iteration runs: the model commits and stops without completing
-		// the permanent task (it never completes) and without growing the plan.
+		// The iteration runs: the model does work (a non-ralph tool call —
+		// ralph tools manage the loop, not the job), commits, and stops without
+		// completing the permanent task (it never completes) and without growing
+		// the plan.
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash', isError: false, result: { content: [{ type: 'text', text: 'ok' }] } });
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
@@ -5721,6 +5724,51 @@ T 1 - "Continuous re-test loop (run until stopped)"
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
 		expect(fake.userMessages.at(-1)!.text).toContain('The previous iteration ended');
+	});
+
+	test('goal loop under cycleOn "task": a cleanly ended iteration that did no work stops instead of cycling', async () => {
+		await writeConfig({ cycleOn: allCycle('task') });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), GOAL_PERMANENT_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+		const iterationCount = fake.userMessages.length;
+
+		// The model stops cleanly without a single tool call (session 01a0c340:
+		// a confused small model narrated intent for 20+ iterations without
+		// ever calling a tool). Cycling would only start another empty
+		// iteration, so the loop stops with a clear notice instead of spinning.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('off');
+		expect(fake.userMessages).toHaveLength(iterationCount);
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('without doing any work');
+	});
+
+	test('goal loop under cycleOn "task": an iteration that only touched ralph tools stops as a no-work stall', async () => {
+		await writeConfig({ cycleOn: allCycle('task') });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), GOAL_PERMANENT_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+
+		// A ralph tool call is loop management, not work on the goal: the
+		// iteration is a no-work stall and the loop stops.
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'ralph_todo', isError: false, result: { content: [{ type: 'text', text: 'Backlog: 1 open' }] } });
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('off');
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('without doing any work');
 	});
 
 	test('goal loop under cycleOn "task": an errored iteration does not cycle', async () => {

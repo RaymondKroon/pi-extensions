@@ -1770,6 +1770,13 @@ export default function (pi: ExtensionAPI) {
 	// a recording turn that finished from one the user aborted (Escape) — an
 	// aborted recording turn must not count as recorded progress.
 	let lastAssistantStopReason: string | undefined;
+	// Whether the current run made at least one non-ralph tool call — i.e. did
+	// actual work. The ralph tools manage the loop, not the job: a turn that
+	// only listed or checkpointed the backlog made no progress on the goal.
+	// A clean stop with open tasks but no work is a stall (stuck or confused
+	// model), not a never-completing task, so the iteration-ended cycle must
+	// not fire for it (session 01a0c340: 20+ empty iterations cycled forever).
+	let runSawWorkToolCall = false;
 	// The ralph-provided compaction pending for the in-flight cycle:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
@@ -3225,6 +3232,7 @@ export default function (pi: ExtensionAPI) {
 		loopEscapePending = false;
 		selfEscapeAbort = false;
 		lastAssistantStopReason = undefined;
+		runSawWorkToolCall = false;
 		runSawAssistantMessage = true;
 		runAbortedByUser = false;
 		runSignal = undefined;
@@ -3472,6 +3480,7 @@ export default function (pi: ExtensionAPI) {
 		lastCtx = ctx;
 		selfEscapeAbort = false;
 		lastAssistantStopReason = undefined;
+		runSawWorkToolCall = false;
 		runSawAssistantMessage = false;
 		runAbortedByUser = false;
 		runSignal = (ctx as { signal?: AbortSignal }).signal;
@@ -3484,7 +3493,9 @@ export default function (pi: ExtensionAPI) {
 	// abort signal is the only trustworthy indicator: a failing tool whose output
 	// merely *contains* "abort" (file names, test names, log lines) is not an
 	// Escape, so the result text is deliberately not inspected.
-	pi.on('tool_execution_end', (_event, ctx) => {
+	pi.on('tool_execution_end', (event, ctx) => {
+		const toolName = (event as { toolName?: string }).toolName;
+		if (toolName && !RALPH_TOOL_NAMES.includes(toolName)) runSawWorkToolCall = true;
 		if ((ctx as { signal?: AbortSignal }).signal?.aborted) {
 			runAbortedByUser = true;
 		}
@@ -3813,6 +3824,13 @@ export default function (pi: ExtensionAPI) {
 			// without this cycle the loop would idle forever. Queue a cycle
 			// so the goal keeps iterating. Only a clean 'stop' qualifies: an
 			// errored or truncated run is left for the user to inspect.
+			// A turn that made no work tool calls at all is a stall, not a
+			// permanent task: cycling it just starts another empty iteration
+			// (session 01a0c340: a confused model stopped after every iteration
+			// without calling a single tool, and the loop cycled 20+ times in
+			// four minutes), so stop with a clear notice instead of spinning.
+			// Verified acceptable by the user in session 01a0c35a (the loop
+			// stopped at the first empty execution iteration — no nudge wanted).
 			if (
 				state.mode === 'goal' &&
 				state.cycleOn === 'task' &&
@@ -3820,6 +3838,13 @@ export default function (pi: ExtensionAPI) {
 				goalStatus(currentTodo) === 'open' &&
 				openWorkTaskCount(currentTodo, countCategory(state)) > 0
 			) {
+				if (!runSawWorkToolCall) {
+					stopLoop(
+						ctx,
+						'Ralph goal loop stopped: the iteration ended without doing any work (no tool calls, no task completed, no new tasks added). The model may be stuck — inspect the last turn, then give it direction with a message and /ralph start, or start a fresh session.'
+					);
+					return;
+				}
 				if (state.iteration >= state.maxIterations) {
 					stopLoop(ctx, `Ralph loop stopped after completing iteration ${state.iteration}/${state.maxIterations}`);
 					return;

@@ -109,9 +109,18 @@ Ralph decision workflow.
   a finish-up recording turn. The last trigger covers deliberately
   never-completing tasks ("run until stopped"): without it the loop idles
   forever, because completion, plan growth, and the context budget never
-  fire for a permanent task. An errored or truncated run does not cycle.
+  fire for a permanent task. It requires the run to have made at least one
+  **non-ralph** tool call (actual work): ralph tools manage the loop, not
+  the job, and a turn that only listed or checkpointed the backlog — or
+  called no tool at all (a stuck or confused model) — made no progress on
+  the goal, so cycling it would only start another empty iteration (session
+  01a0c340: 20+ empty iterations cycled in four minutes). An errored or
+  truncated run does not cycle.
 - **Stall:** a goal-mode turn that ends with no plan growth, no completion,
-  and the goal still open stops the loop with a clear notification.
+  and the goal still open stops the loop with a clear notification. This
+  includes the no-work case: a cleanly ended turn with open work tasks but
+  no non-ralph tool call stops the loop instead of queueing an
+  `iteration-ended` cycle.
 - The loop stops when the goal is `done` in the file.
 - The model is read-only on the goal body; it may only change goal
   state through `ralph_goal` with its enforced preconditions.

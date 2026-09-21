@@ -456,6 +456,63 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
+		'goal loop: an execution iteration that does no work stops the loop instead of cycling forever',
+		{ timeout: 60000 },
+		async () => {
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.db');
+			await writeFile(todoPath, RALPH_GOAL_ONLY);
+			endpoint = startMockEndpoint([
+				// Iteration 1 (planning): create the plan's list and add the tasks.
+				toolCallResponder('ralph_todo', { action: 'new-list', name: 'Plan' }, 'call_list'),
+				toolCallResponder(
+					'ralph_todo',
+					{ action: 'add-many', category: 'Plan', tasks: [{ title: 'Task one.' }, { title: 'Task two.' }] },
+					'call_plan'
+				),
+				textResponder('Plan recorded: two tasks added.'),
+				// Plan-updated recording turn (checkpoint-only).
+				textResponder('Task checkpointed.'),
+				// Iteration 2 (execution): the model stops without doing any work —
+				// no tool calls at all (session 01a0c340: a confused small model
+				// narrated "let me check the repository" for 20 straight iterations
+				// without ever calling a tool).
+				textResponder('I will start with the first task.'),
+				// If the loop (incorrectly) cycled on iteration-ended, the spin
+				// consumes these; the fallback keeps the run deterministic either way.
+				textResponder('Another empty iteration.')
+			]);
+			const sess = await createRalphSession(endpoint.port, {
+				contextThresholds: { __default__: 0.9 },
+				autoApproveDecisions: false,
+				maxIterations: 10
+			});
+
+			const loopDisabled = () => {
+				const states = sess.sessionManager
+					.getBranch()
+					.filter((entry) => entry.type === 'custom' && entry.customType === 'ralph-loop-state');
+				const last = states[states.length - 1] as { data?: { enabled?: boolean } } | undefined;
+				return last?.data?.enabled === false;
+			};
+			const spinRequestSeen = () =>
+				endpoint!.requests.some((r) => requestText(r).includes('The previous iteration ended'));
+
+			await sess.prompt('/ralph start --goal');
+
+			// The planning iteration grows the plan: plan-updated cycle, recording
+			// turn, then the fresh execution iteration.
+			await waitFor(() => endpoint!.requests.length >= 5, 30000);
+			expect(requestText(endpoint!.requests[4]!)).toContain('You are executing the goal');
+
+			// The execution turn settles with a clean stop and zero work: either
+			// the loop stops (fixed) or an iteration-ended spin request appears (bug).
+			await waitFor(() => loopDisabled() || spinRequestSeen(), 'loop stopped or spin started', 30000);
+			expect(spinRequestSeen()).toBe(false);
+			expect(loopDisabled()).toBe(true);
+		}
+	);
+
+	test(
 		'cycle: the finished iteration is compacted out of the TUI context; the fresh iteration\'s model context drops the completion summary',
 		{ timeout: 60000 },
 		async () => {
