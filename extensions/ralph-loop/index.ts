@@ -1816,11 +1816,18 @@ export default function (pi: ExtensionAPI) {
 	// follows. Cleared at the next agent_start (the recording turn).
 	let selfEscapeAbort = false;
 	// Set when loop-police aborts the run itself (stream-loop truncation):
-	// the settle must not treat that abort as a user Escape either —
-	// loop-police's recovery turn runs next with ralph's steer delivered, and
-	// the loopEscapePending fallback (or the model's own ralph_cycle) handles
-	// the escape from there. Consumed at the settle, cleared at agent_start.
+	// the settle must not treat that abort as a user Escape either — instead
+	// it starts the recovery turn (loop-police's own triggerTurn message was
+	// steered into the dying run and never delivered: pi ends the run on an
+	// aborted stop without draining the steering queue, and the abort
+	// suppresses agent.continue()). The loopEscapePending fallback (or the
+	// model's own ralph_cycle) handles the escape from there. Consumed at the
+	// settle, cleared at agent_start.
 	let loopPoliceAbort = false;
+	// The loop-police stream event that aborted the current run (thinking_loop,
+	// semantic_loop, output_loop, output_semantic_loop): the settle's recovery
+	// turn renders the right prompt from it. Cleared with loopPoliceAbort.
+	let loopPoliceEvent: string | undefined;
 
 	/** Refresh the cached task counter and goal state from a backlog snapshot. */
 	const refreshCounts = (todo: string, category?: string) => {
@@ -3250,6 +3257,7 @@ export default function (pi: ExtensionAPI) {
 		loopEscapePending = false;
 		selfEscapeAbort = false;
 		loopPoliceAbort = false;
+		loopPoliceEvent = undefined;
 		lastAssistantStopReason = undefined;
 		runSawWorkToolCall = false;
 		runSawAssistantMessage = true;
@@ -3506,6 +3514,7 @@ export default function (pi: ExtensionAPI) {
 		lastCtx = ctx;
 		selfEscapeAbort = false;
 		loopPoliceAbort = false;
+		loopPoliceEvent = undefined;
 		lastAssistantStopReason = undefined;
 		runSawWorkToolCall = false;
 		runSawAssistantMessage = false;
@@ -3544,9 +3553,13 @@ export default function (pi: ExtensionAPI) {
 	pi.events.on('loop-police:detection', (data) => {
 		const event = (data as { event?: string } | null | undefined)?.event;
 		// Stream-loop detections abort the run themselves: mark the abort so
-		// the settle nudges (via the recovery turn) instead of pausing the
-		// loop on what looks like a user Escape.
-		if (event && LOOP_POLICE_STREAM_EVENTS.has(event)) loopPoliceAbort = true;
+		// the settle starts the recovery turn instead of pausing the loop on
+		// what looks like a user Escape. Remember the event: the settle renders
+		// the recovery prompt from it.
+		if (event && LOOP_POLICE_STREAM_EVENTS.has(event)) {
+			loopPoliceAbort = true;
+			loopPoliceEvent = event;
+		}
 		if (!event || !LOOP_POLICE_REASONING_EVENTS.has(event)) return;
 		if (state?.enabled) {
 			if (state.cycleQueued || state.stopRequested) return;
@@ -3576,6 +3589,13 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			loopEscapePending = true;
+			if (LOOP_POLICE_STREAM_EVENTS.has(event)) {
+				// The run is being aborted: a steer now would join the dying run
+				// and be dropped (pi ends the run on an aborted stop without
+				// draining the steering queue). The settle starts the recovery
+				// turn and delivers the nudge there.
+				return;
+			}
 			pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('cycle-on-loop', { event })}`, { deliverAs: 'steer' });
 			return;
 		}
@@ -3695,10 +3715,27 @@ export default function (pi: ExtensionAPI) {
 		if (userAborted) {
 			if (loopPoliceAbort) {
 				// loop-police truncated a looping stream and aborted the run
-				// itself — not a user Escape. Its recovery turn runs next with
-				// ralph's steer delivered; keep the pending escape so the
-				// fallback queues the cycle if the model does not comply.
+				// itself — not a user Escape. Its triggerTurn recovery message
+				// was steered into the dying run and never delivered (pi ends
+				// the run on an aborted stop without draining the steering
+				// queue, and the abort suppresses agent.continue()), so ralph
+				// starts the recovery turn itself — the session is idle at
+				// settle, so the prompt starts a fresh run; loop-police's
+				// leftover steer is drained into it, so the model still sees the
+				// advice. Keep the pending escape so the fallback queues the
+				// cycle if the model does not comply in the recovery turn.
 				loopPoliceAbort = false;
+				const event = loopPoliceEvent;
+				loopPoliceEvent = undefined;
+				if (state?.cycleQueued && state.cycleCheckpointing) {
+					// A cycle is already in flight (e.g. armed auto mode) and its
+					// recording prompt was lost with the abort: re-deliver it.
+					sendRecordingPrompt(ctx);
+				} else if (event && LOOP_POLICE_REASONING_EVENTS.has(event)) {
+					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('cycle-on-loop', { event })}`, { deliverAs: 'followUp' });
+				} else {
+					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('loop-police-recovery', {})}`, { deliverAs: 'followUp' });
+				}
 				return;
 			}
 			// The user took the wheel: the intercept's chance to self-correct is

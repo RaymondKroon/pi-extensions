@@ -1,0 +1,1 @@
+The previous turn was cut by loop-police: it detected a loop in your output and aborted the run. Its advice for the detected loop is included in this message. Continue the current task from the tool results — do not repeat the cut output, and if your approach caused the repetition, change it.
