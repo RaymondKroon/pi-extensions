@@ -254,7 +254,17 @@ in one deterministic step — when **compaction mode** is enabled (config
   `[compactionSummary, retained tail, summary, boundary, prompt, …]`; the
   existing context-boundary slice drops everything before the boundary —
   including the completion summary — so the model sees only the current
-  iteration.
+  iteration. System messages are the exception: the slice keeps them. Since
+  pi 0.86 the request's tool loadout is declared as transcript deltas on
+  system messages (`toolsAdded`/`toolsRemoved`), and the provider rebuilds
+  the request's `tools` by replaying them; the initial declaration sits at
+  the head of the transcript, before any boundary. Slicing it out left the
+  fresh iteration with no callable tools while `declareToolChanges` saw no
+  delta (it diffs against the full transcript) and never re-declared them
+  (session 01a0c39d: the model stopped every fresh iteration without a
+  single tool call). The kept system messages replay idempotently — prompt
+  section patches re-apply to the same values, and tool deltas replay in
+  order to the current loadout.
 - **The keepRecentTokens gate.** pi refuses to prepare a compaction when less
   than `compaction.keepRecentTokens` (settings.json, default 20000) of content
   would be discarded. A gated cycle degrades gracefully: the finished

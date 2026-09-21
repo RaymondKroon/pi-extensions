@@ -456,6 +456,45 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
+		'cycle: the fresh iteration keeps the system prompt and the full tool loadout (pi 0.86 transcript tooling)',
+		{ timeout: 60000 },
+		async () => {
+			const todoPath = join(agentDir, 'ralph', 'e2e-session.db');
+			endpoint = startMockEndpoint([
+				writeToolCallResponder(todoPath, RALPH_V2_TASK_ONE_DONE),
+				textResponder('Task one complete.'),
+				// The dedicated progress-recording turn.
+				textResponder('Progress recorded.'),
+				// The fresh iteration.
+				textResponder('Working on task two.')
+			]);
+			const sess = await createRalphSession(endpoint.port, {
+				contextThresholds: { __default__: 0.9 },
+				autoApproveDecisions: false,
+				maxIterations: 10
+			});
+
+			await sess.prompt('/ralph start');
+
+			// The context-boundary slice must cut the conversation history, not the
+			// system message: since pi 0.86 the request's system prompt and tool
+			// loadout are derived from the transcript's system messages, so slicing
+			// them out leaves the fresh iteration with no system prompt and no
+			// callable tools (session 01a0c340: the model could not call a single
+			// tool for 20 straight iterations and the loop cycled on 'iteration-ended').
+			await waitFor(() => endpoint!.requests.length >= 4, 30000);
+			const fresh = endpoint!.requests[3]!;
+			expect(requestText(fresh)).toContain('Start the next independent iteration');
+			const toolNames = (fresh.body.tools ?? []).map((tool) => (tool.function as { name?: string })?.name);
+			expect(toolNames).toContain('ralph_todo');
+			expect(toolNames).toContain('bash');
+			const system = (fresh.body.messages ?? []).find((m) => m.role === 'system');
+			expect(system).toBeDefined();
+			expect(JSON.stringify(system)).toContain('expert coding assistant');
+		}
+	);
+
+	test(
 		'goal loop: an execution iteration that does no work stops the loop instead of cycling forever',
 		{ timeout: 60000 },
 		async () => {

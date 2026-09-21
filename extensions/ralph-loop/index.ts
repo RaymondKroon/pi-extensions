@@ -3546,12 +3546,27 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on('context', (event) => {
 		// The marker remains in the session as an audit boundary. Filter it and all
-		// prior messages from every subsequent model request, so every fresh Ralph
-		// iteration has a genuinely clean model context without replacing sessions.
+		// prior NON-SYSTEM messages from every subsequent model request, so every
+		// fresh Ralph iteration has a genuinely clean model context without
+		// replacing sessions. System messages must survive the cut: since pi 0.86
+		// the request's tools are declared as transcript deltas on system messages
+		// (toolsAdded/toolsRemoved), and the provider replays them to rebuild the
+		// request's tool list. Dropping the pre-boundary declarations leaves the
+		// fresh iteration with no tools at all — declareToolChanges sees no delta
+		// (it diffs against the full transcript, which still declares them) and
+		// never re-declares (session 01a0c39d: the model stopped every fresh
+		// iteration without a single tool call). Prompt-section patches on system
+		// messages are harmless to keep: they replay idempotently.
 		const boundaryIndex = event.messages.findLastIndex(
 			(message) => message.role === 'custom' && message.customType === CONTEXT_BOUNDARY_TYPE
 		);
-		if (boundaryIndex >= 0) return { messages: event.messages.slice(boundaryIndex + 1) };
+		if (boundaryIndex >= 0)
+			return {
+				messages: [
+					...event.messages.slice(0, boundaryIndex + 1).filter((message) => message.role === 'system'),
+					...event.messages.slice(boundaryIndex + 1)
+				]
+			};
 	});
 
 	// Ralph-provided compaction: when a cycle is in flight, supply the

@@ -4192,15 +4192,24 @@ describe('ralph-loop extension (cycle compaction and completion summaries)', () 
 		const fakeCtx = createFakeCtx(dir);
 		await startLoop(fake, fakeCtx);
 
+		const toolDeclaration = { name: 'ralph_todo', description: 'test', parameters: {} };
 		const context = (await fake.fire('context', fakeCtx.ctx, {
 			messages: [
+				{ role: 'system', content: '', sections: { preamble: 'You are...' }, toolsAdded: [toolDeclaration] },
 				{ role: 'assistant', content: [{ type: 'text', text: 'old iteration work' }] },
 				{ role: 'custom', customType: 'ralph-loop-context-boundary', content: 'boundary', display: false },
 				{ role: 'toolResult', toolCallId: 'c1', content: [{ type: 'text', text: 'current iteration work' }] }
 			]
-		})) as { messages: Array<{ role: string }> };
-		expect(context.messages).toHaveLength(1);
-		expect(context.messages[0].role).toBe('toolResult');
+		})) as unknown as { messages: Array<{ role: string; toolsAdded?: unknown[] }> };
+		// The pre-boundary conversation is dropped…
+		expect(context.messages).toHaveLength(2);
+		expect(context.messages[1].role).toBe('toolResult');
+		// …but the system message carrying the transcript tool declaration
+		// survives the cut: since pi 0.86 the provider rebuilds the request's
+		// tool list by replaying toolsAdded/toolsRemoved on system messages, so
+		// dropping it leaves the fresh iteration with no tools at all.
+		expect(context.messages[0].role).toBe('system');
+		expect(context.messages[0].toolsAdded).toEqual([toolDeclaration]);
 	});
 
 	test('start: no keepRecentTokens warning at loop start', async () => {
