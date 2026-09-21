@@ -657,6 +657,96 @@ function validateEditInput(input: { path?: string; edits?: Edit[] }): { path: st
 	return { path: input.path as string, edits: input.edits };
 }
 
+// ---------------------------------------------------------------------------
+// Argument preparation (stringified `edits` repair)
+// ---------------------------------------------------------------------------
+
+function isEditObject(value: unknown): value is Edit {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as Edit).oldText === "string" &&
+		typeof (value as Edit).newText === "string"
+	);
+}
+
+/**
+ * Best-effort repair of JSON text with invalid backslash escapes.
+ *
+ * Small local models occasionally double-encode the `edits` array as a JSON
+ * *string*, and when the payload contains backslashes (e.g. a Rust `'\''`
+ * char literal) they under-escape them, producing invalid escapes like `\'`.
+ * Pi core's prepareArguments silently gives up on such input and schema
+ * validation then rejects the whole call — which sent the model in session
+ * 01a0c400 to a raw bash/Python fallback. A backslash before an invalid
+ * escape character is almost always an intended literal backslash, so the
+ * repair doubles it.
+ */
+export function repairInvalidJsonEscapes(text: string): string {
+	const VALID = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"]);
+	let out = "";
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (ch !== "\\") {
+			out += ch;
+			continue;
+		}
+		const next = text[i + 1];
+		if (next === undefined) {
+			out += "\\\\"; // trailing backslash: keep it as an escaped backslash
+			continue;
+		}
+		if (VALID.has(next)) {
+			out += ch + next;
+			i++;
+			if (next === "u") {
+				const hex = text.slice(i + 1, i + 5);
+				out += hex;
+				i += hex.length;
+			}
+			continue;
+		}
+		// Invalid escape (e.g. \' or \x): under-escaped literal backslash — double it.
+		out += "\\\\" + next;
+		i++;
+	}
+	return out;
+}
+
+/**
+ * Parse `edits` that a model double-encoded as a JSON string: first the raw
+ * string (pi core's built-in behavior), then the escape-repaired variant.
+ * Returns the parsed edits, or null if the string cannot be recovered.
+ */
+export function parseStringEdits(raw: string): Edit[] | null {
+	for (const candidate of [raw, repairInvalidJsonEscapes(raw)]) {
+		try {
+			const parsed: unknown = JSON.parse(candidate);
+			if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(isEditObject)) return parsed;
+			if (isEditObject(parsed)) return [parsed];
+		} catch {
+			// try the repaired variant
+		}
+	}
+	return null;
+}
+
+/**
+ * prepareArguments override. Pi core's built-in prepareArguments already
+ * parses a *valid* JSON-string `edits` (and handles single-object and legacy
+ * oldText/newText inputs); it only silently gives up when the string is
+ * malformed JSON. We delegate to it first, then retry with escape repair so
+ * the call passes schema validation instead of forcing the model onto a raw
+ * bash/Python fallback.
+ */
+export function prepareBetterEditArguments(input: unknown, basePrepare?: (args: unknown) => unknown): unknown {
+	const prepared = (basePrepare ? basePrepare(input) : input) as { edits?: unknown } | null;
+	if (!prepared || typeof prepared !== "object" || typeof prepared.edits !== "string") return prepared;
+	const parsed = parseStringEdits(prepared.edits);
+	if (parsed) prepared.edits = parsed;
+	return prepared;
+}
+
 export async function enhancedExecute(
 	_toolCallId: string,
 	input: { path?: string; edits?: Edit[] },
@@ -726,7 +816,7 @@ interface BetterEditRenderState {
 interface RenderableEditArgs {
 	path?: string;
 	file_path?: string;
-	edits?: Edit[];
+	edits?: Edit[] | string;
 	oldText?: string;
 	newText?: string;
 }
@@ -814,6 +904,12 @@ function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path
 	if (!args) return null;
 	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
 	if (!path) return null;
+	if (typeof args.edits === "string") {
+		// Model double-encoded the array; best-effort parse so the preview
+		// agrees with execution (prepareArguments applies the same logic).
+		const parsed = parseStringEdits(args.edits);
+		return parsed ? { path, edits: parsed } : null;
+	}
 	if (
 		Array.isArray(args.edits) &&
 		args.edits.length > 0 &&
@@ -975,6 +1071,9 @@ export default function betterEdit(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...base,
 		promptGuidelines: [...(base.promptGuidelines ?? []), ...EXTRA_PROMPT_GUIDELINES],
+		// The repair only ever replaces a string `edits` with the parsed array,
+		// so the result still conforms to the built-in schema.
+		prepareArguments: ((args: unknown) => prepareBetterEditArguments(args, base.prepareArguments)) as NonNullable<typeof base.prepareArguments>,
 		execute: enhancedExecute,
 		renderCall: betterEditRenderCall,
 		renderResult: betterEditRenderResult,

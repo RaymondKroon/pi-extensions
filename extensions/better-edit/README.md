@@ -38,6 +38,17 @@ arguments and hit the next drifted edit.
 3. **Recovery guidelines** in the system prompt: re-read the exact region
    before retrying; never reconstruct indentation from memory; resubmit only
    failed edits.
+4. **Stringified-`edits` repair.** Small local models sometimes
+   double-encode the `edits` array as a JSON *string* and under-escape
+   backslashes in the payload (e.g. a Rust `'\''` char literal becomes an
+   invalid `\'` escape). Pi core's built-in argument preparation silently
+   gives up on malformed JSON, so schema validation rejects the whole call
+   and the model typically falls back to a raw bash/Python script. This
+   extension overrides `prepareArguments`: after the built-in preparation it
+   retries the string with invalid backslash escapes doubled, so the call
+   passes validation and keeps the edit tool's atomicity, diff preview, and
+   file-mutation queue. Unrecoverable strings are left as-is and rejected by
+   schema validation as before.
 
 ## Known limitations
 

@@ -9,6 +9,9 @@ import betterEdit, {
 	betterEditRenderResult,
 	computeEditsPreview,
 	enhancedExecute,
+	parseStringEdits,
+	prepareBetterEditArguments,
+	repairInvalidJsonEscapes,
 } from './index.ts';
 import { Box, Container } from '@earendil-works/pi-tui';
 import { initTheme } from '@earendil-works/pi-coding-agent';
@@ -451,6 +454,89 @@ describe('renderer', () => {
 	});
 });
 
+describe('prepareBetterEditArguments — stringified edits repair', () => {
+	// Backslash/quote via char codes so this test's own source cannot be
+	// mangled by another escaping layer.
+	const BS = String.fromCharCode(92);
+	const Q = String.fromCharCode(39);
+	// Rust char literal line: `let q = ` + ' + \ + ' + ' + `;`
+	const RUST_LINE = `let q = ${Q}${BS}${Q}${Q};`;
+
+	function registeredTool(): Record<string, unknown> {
+		const registered: unknown[] = [];
+		betterEdit({ registerTool: (tool: unknown) => registered.push(tool) } as never);
+		return registered[0] as Record<string, unknown>;
+	}
+
+	// Session 01a0c400: the model double-encoded edits as a JSON string and
+	// under-escaped the backslash of a Rust char literal, so the JSON text
+	// contains an invalid backslash-quote escape.
+	function mangledEdits(): string {
+		const good = JSON.stringify([{ oldText: RUST_LINE, newText: 'let q = 42;' }]);
+		return good.replace(`${BS}${BS}${Q}`, `${BS}${Q}`);
+	}
+
+	test('valid JSON-string edits are parsed (built-in behavior preserved)', () => {
+		const prepare = registeredTool().prepareArguments as (args: unknown) => { edits?: unknown };
+		const out = prepare({ path: 'f.ts', edits: JSON.stringify([{ oldText: 'a', newText: 'b' }]) });
+		expect(out.edits).toEqual([{ oldText: 'a', newText: 'b' }]);
+	});
+
+	test('normal array input passes through untouched', () => {
+		const prepare = registeredTool().prepareArguments as (args: unknown) => { edits?: unknown };
+		const edits = [{ oldText: 'a', newText: 'b' }];
+		expect(prepare({ path: 'f.ts', edits }).edits).toBe(edits);
+	});
+
+	test('session regression 01a0c400: under-escaped backslash-quote escapes are repaired', () => {
+		const mangled = mangledEdits();
+		expect(() => JSON.parse(mangled)).toThrow();
+		const prepare = registeredTool().prepareArguments as (args: unknown) => { edits?: { oldText: string; newText: string }[] };
+		const out = prepare({ path: 'f.ts', edits: mangled });
+		expect(out.edits).toEqual([{ oldText: RUST_LINE, newText: 'let q = 42;' }]);
+	});
+
+	test('unrecoverable string is left as-is (schema validation rejects it)', () => {
+		expect(prepareBetterEditArguments({ path: 'f.ts', edits: 'not json at all' }, undefined)).toEqual({
+			path: 'f.ts',
+			edits: 'not json at all',
+		});
+	});
+
+	test('end to end: repaired stringified edits apply the edit', async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'better-edit-'));
+		const file = join(dir, 'f.rs');
+		await writeFile(file, RUST_LINE + '\n', 'utf-8');
+		const prepare = registeredTool().prepareArguments as (args: unknown) => {
+			path: string;
+			edits: { oldText: string; newText: string }[];
+		};
+		const args = prepare({ path: file, edits: mangledEdits() });
+		const result = await enhancedExecute('tc', args, undefined, undefined, { cwd: dir });
+		expect(await readFile(file, 'utf-8')).toBe('let q = 42;\n');
+		expect(result.content[0].text).toContain('Successfully replaced 1 block(s)');
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	test('repairInvalidJsonEscapes keeps valid escapes intact', () => {
+		const valid = `{"a": "${BS}n${BS}t${BS}"${BS}${BS}${BS}/${BS}u00e9"}`;
+		expect(repairInvalidJsonEscapes(valid)).toBe(valid);
+		expect(JSON.parse(valid)).toEqual({ a: `\n\t"${BS}/${'é'}` });
+	});
+
+	test('repairInvalidJsonEscapes doubles under-escaped backslashes', () => {
+		expect(repairInvalidJsonEscapes(`{"a": ${BS}${Q}x"}`)).toBe(`{"a": ${BS}${BS}${Q}x"}`);
+		expect(repairInvalidJsonEscapes(`abc${BS}`)).toBe(`abc${BS}${BS}`);
+	});
+
+	test('parseStringEdits: array, single object, and garbage', () => {
+		expect(parseStringEdits('[{"oldText":"a","newText":"b"}]')).toEqual([{ oldText: 'a', newText: 'b' }]);
+		expect(parseStringEdits('{"oldText":"a","newText":"b"}')).toEqual([{ oldText: 'a', newText: 'b' }]);
+		expect(parseStringEdits('["nope"]')).toBeNull();
+		expect(parseStringEdits('garbage')).toBeNull();
+	});
+});
+
 describe('extension entry', () => {
 	test('registers a tool named edit with the recovery guidelines', () => {
 		const registered: unknown[] = [];
@@ -460,6 +546,7 @@ describe('extension entry', () => {
 		const tool = registered[0] as Record<string, unknown>;
 		expect(tool.name).toBe('edit');
 		expect(typeof tool.execute).toBe('function');
+		expect(typeof tool.prepareArguments).toBe('function');
 		const guidelines = tool.promptGuidelines as string[];
 		expect(guidelines.some((g) => g.includes('resubmit only the failed edit(s)'))).toBe(true);
 		expect(guidelines.some((g) => g.includes('never reconstruct indentation from memory'))).toBe(true);
