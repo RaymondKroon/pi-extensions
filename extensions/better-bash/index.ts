@@ -5,26 +5,36 @@ import { Type } from "typebox";
 import { readdirSync, readFileSync } from "node:fs";
 
 /**
- * Fails any bash (or powershell) tool call that does not specify a timeout,
- * and hard-caps the timeout at MAX_TIMEOUT_SECONDS.
+ * better-bash — wait discipline for the bash tool.
  *
- * The bash tool has no configurable default timeout, so this extension
- * enforces one by blocking timeout-less calls and telling the model to
- * retry with an explicit `timeout` (seconds). Timeouts above the cap are
- * blocked with a reason so the model can lower the value or split the work.
+ *  1. Fails any bash (or powershell) tool call that does not specify a
+ *     timeout, and hard-caps the timeout at MAX_TIMEOUT_SECONDS. The bash
+ *     tool has no configurable default timeout, so this extension enforces
+ *     one by blocking timeout-less calls and telling the model to retry
+ *     with an explicit `timeout` (seconds). Timeouts above the cap are
+ *     blocked with a reason so the model can lower the value or split the
+ *     work.
  *
- * Additionally, a lightweight bash parser extracts the command name at every
- * command position in the command string (respecting quotes, comments,
- * operators, subshells, command substitution, wrappers and here-docs) and
- * blocks the call if any of them is in DISALLOWED_COMMANDS.
+ *  2. A lightweight bash parser extracts the command name at every command
+ *     position in the command string (respecting quotes, comments,
+ *     operators, subshells, command substitution, wrappers and here-docs)
+ *     and blocks the call if any of them is in DISALLOWED_COMMANDS (sleep)
+ *     or if the command contains a busy-wait loop.
  *
- * Because a single call is capped at MAX_TIMEOUT_SECONDS, long work must run
- * in the background. To wait for it without busy-waiting (sleep is disallowed),
- * this extension also provides two tools:
+ *  3. Because a single call is capped at MAX_TIMEOUT_SECONDS, long work must
+ *     run in the background. To wait for it without busy-waiting, this
+ *     extension provides two tools:
  *
- *   - wait_for: block (up to the cap) until a shell condition exits 0.
- *   - alarm:    schedule a later wake-up (timed or condition-based) so the
- *               agent can do other work now and be interrupted when it fires.
+ *     - wait_for: block (up to the cap) until a shell condition exits 0.
+ *     - alarm:    schedule a later wake-up (timed or condition-based) so
+ *                 the agent can do other work now and be interrupted when
+ *                 it fires.
+ *
+ *     Conditions must be one-shot tests (re-run every `interval` seconds):
+ *     disallowed commands and busy-wait loops are blocked at entry, and
+ *     `pgrep -f` / `pkill -f` patterns are audited for self-match (the
+ *     polling shell's own command line contains the pattern, so the
+ *     condition can never be true) and multi-match (ambiguous boolean).
  */
 const MAX_TIMEOUT_SECONDS = 300;
 
@@ -644,7 +654,7 @@ function clipCommand(cmd: string, max = 80): string {
 }
 
 /** Extract the patterns of `pgrep -f` / `pkill -f` invocations in a shell command. */
-function extractPgrepPatterns(command: string): string[] {
+export function extractPgrepPatterns(command: string): string[] {
   const out: string[] = [];
   const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
   for (let i = 0; i < tokens.length; i++) {
@@ -675,7 +685,7 @@ function extractPgrepPatterns(command: string): string[] {
  * Returns an explanation, or null if the condition looks sound.
  */
 /** Static part of the audit: does a `pgrep -f` pattern match the polling shell's own command line? */
-function auditPgrepSelfMatch(command: string): string | null {
+export function auditPgrepSelfMatch(command: string): string | null {
   for (const p of extractPgrepPatterns(command)) {
     let self: boolean;
     try {
@@ -695,7 +705,7 @@ function auditPgrepSelfMatch(command: string): string | null {
   return null;
 }
 
-function auditPgrepCondition(command: string): string | null {
+export function auditPgrepCondition(command: string): string | null {
   // 1) Static self-match: test each pattern against the polling shell's command line.
   const selfError = auditPgrepSelfMatch(command);
   if (selfError) return selfError;
@@ -738,6 +748,29 @@ function auditPgrepCondition(command: string): string | null {
   return null;
 }
 
+/**
+ * Guards wait_for/alarm conditions: no disallowed commands (sleep) and no
+ * busy-wait loops — the condition is already re-run every `interval` seconds,
+ * so it must be a one-shot test, not a loop that paces or spins itself.
+ */
+export function guardWaitCondition(command: string): string | null {
+  const hits = [...new Set(extractCommandNames(command).filter((name) => name in DISALLOWED_COMMANDS))];
+  if (hits.length > 0) {
+    return (
+      `"${hits.join('", "')}" in the wait condition — the condition is already re-checked every \`interval\` seconds, ` +
+      `so it must be a one-shot test (e.g. \`[ -f done ]\`, \`[ ! -d /proc/$PID ]\`), not a loop that sleeps or paces itself.`
+    );
+  }
+  const busyWaits = findBusyWaitLoops(command);
+  if (busyWaits.length > 0) {
+    return (
+      `busy-wait loop in the wait condition (${busyWaits[0]}) — it spins the CPU; ` +
+      `the condition is already re-checked every \`interval\` seconds, make it a one-shot test.`
+    );
+  }
+  return null;
+}
+
 export default function (pi: ExtensionAPI) {
   const GUARDED_TOOLS = ["bash", "powershell"] as const;
 
@@ -762,27 +795,6 @@ export default function (pi: ExtensionAPI) {
       return `alarm ${id}: timed, fires in ~${remaining}s (set ${age}s ago)${e.note ? ` — ${e.note}` : ""}`;
     }
     return `alarm ${id}: polling \`${clipCommand(e.command ?? "", 60)}\` every ${e.intervalSec}s${e.repeat ? ", repeats until met" : ""} (set ${age}s ago)${e.note ? ` — ${e.note}` : ""}`;
-  };
-
-  // Guards wait_for/alarm conditions: no disallowed commands (sleep) and no
-  // busy-wait loops — the condition is already re-run every `interval` seconds,
-  // so it must be a one-shot test, not a loop that paces or spins itself.
-  const guardWaitCondition = (command: string): string | null => {
-    const hits = [...new Set(extractCommandNames(command).filter((name) => name in DISALLOWED_COMMANDS))];
-    if (hits.length > 0) {
-      return (
-        `"${hits.join('", "')}" in the wait condition — the condition is already re-checked every \`interval\` seconds, ` +
-        `so it must be a one-shot test (e.g. \`[ -f done ]\`, \`[ ! -d /proc/$PID ]\`), not a loop that sleeps or paces itself.`
-      );
-    }
-    const busyWaits = findBusyWaitLoops(command);
-    if (busyWaits.length > 0) {
-      return (
-        `busy-wait loop in the wait condition (${busyWaits[0]}) — it spins the CPU; ` +
-        `the condition is already re-checked every \`interval\` seconds, make it a one-shot test.`
-      );
-    }
-    return null;
   };
 
   // Run a shell condition once and return its exit code (null on error/timeout),
