@@ -5,7 +5,7 @@
 // the on-disk format: legacy text files are .ralph, SQLite databases are
 // .db. The backlog is
 // held in an in-memory SQLite database (node:sqlite / bun:sqlite); queries
-// and mutations run as SQL; save() serializes the database to a temp file
+// and mutations run as SQL; save() copies the database to a temp file
 // and atomically renames it over the target. Ralph files are global (never
 // tracked in a repository), so the on-disk format is the binary SQLite
 // format, not the human-readable text format below.
@@ -55,7 +55,7 @@
 // v2 form. Once no v1 files remain, the v1 branch can be removed.
 
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 // The store runs on whichever runtime hosts the extension: Node (pi) exposes
@@ -69,8 +69,6 @@ type SqliteStatement = {
 type SqliteDb = {
 	exec: (sql: string) => void;
 	prepare: (sql: string) => SqliteStatement;
-	/** Serialize the whole database to a buffer (both runtimes). */
-	serialize: () => Uint8Array;
 	close: () => void;
 };
 
@@ -224,6 +222,32 @@ function newDatabase(): SqliteDb {
 	return db;
 }
 
+/** Write an in-memory store to a SQLite file without relying on runtime-specific
+ * database serialization APIs. node:sqlite's DatabaseSync (used by pi) does
+ * not provide bun:sqlite's serialize() method, so copy the small, known schema
+ * row-wise into a database opened at the destination. */
+function writeSqliteFile(source: SqliteDb, path: string): void {
+	const target = createSqlite(path);
+	try {
+		target.exec('PRAGMA foreign_keys = ON;');
+		target.exec(SCHEMA);
+		const copyTable = (table: string, columns: string[]) => {
+			const rows = source.prepare(`SELECT ${columns.join(', ')} FROM ${table}`).all() as Array<Record<string, unknown>>;
+			if (rows.length === 0) return;
+			const insert = target.prepare(
+				`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`
+			);
+			for (const row of rows) insert.run(...columns.map((column) => row[column] ?? null));
+		};
+		copyTable('tasks', ['id', 'category', 'title', 'body', 'done', 'completed_at', 'checkpoint', 'checkpoint_iteration', 'position']);
+		copyTable('completion_entries', ['id', 'task_id', 'date', 'note', 'kind', 'position']);
+		copyTable('meta', ['id', 'key', 'value', 'position']);
+		copyTable('goal', ['id', 'status', 'body', 'evidence', 'checkpoint', 'checkpoint_iteration']);
+	} finally {
+		target.close();
+	}
+}
+
 function quote(value: string): string {
 	return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
@@ -268,9 +292,8 @@ export class Backlog {
 
 	/**
 	 * Copy the data of an opened ralph SQLite file into a fresh in-memory
-	 * database (the marker table comes from the schema). Row-wise, so it
-	 * works on both runtimes (neither exposes backup/deserialize for
-	 * cross-db copies here).
+	 * database (the marker table comes from the schema), row-wise so it works
+	 * on both runtimes.
 	 */
 	private static copyIntoMemory(fileDb: SqliteDb): Backlog {
 		const db = newDatabase();
@@ -676,7 +699,7 @@ export class Backlog {
 	}
 
 	/**
-	 * Persist the in-memory store to path as a SQLite file: serialize to a
+	 * Persist the in-memory store to path as a SQLite file: copy it to a
 	 * temp file in the same directory, then atomically rename over the target
 	 * (a crash never leaves a truncated ralph file behind).
 	 */
@@ -684,13 +707,13 @@ export class Backlog {
 		mkdirSync(dirname(path), { recursive: true });
 		const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
 		try {
-			writeFileSync(temp, this.db.serialize());
+			writeSqliteFile(this.db, temp);
 			renameSync(temp, path);
 		} catch (error) {
 			try {
 				unlinkSync(temp);
 			} catch {
-				// the temp file may not exist (serialize failed)
+				// the temp file may not exist (write failed)
 			}
 			throw error;
 		}
