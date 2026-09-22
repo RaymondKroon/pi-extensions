@@ -7,6 +7,7 @@ import {
   extractCommandNames,
   extractPgrepPatterns,
   findBusyWaitLoops,
+  findRootSearch,
   guardWaitCondition,
 } from "./index.ts";
 
@@ -192,5 +193,25 @@ describe("guardWaitCondition", () => {
 
   test("quoted disallowed commands are not flagged", () => {
     expect(guardWaitCondition('grep -q "sleep" /var/log/x')).toBeNull();
+  });
+});
+
+describe("findRootSearch", () => {
+  test("blocks filesystem-root searches", () => {
+    expect(findRootSearch("find / -name effect_scattered.py")).toBe("/");
+    expect(findRootSearch("find / -name x -not -path '*/target/*' 2>/dev/null | head")).toBe("/");
+    expect(findRootSearch("find /* -name x")).toBe("/*");
+    expect(findRootSearch("ls /x || find / -name x")).toBe("/");
+  });
+
+  test("allows scoped searches and -maxdepth 1", () => {
+    expect(findRootSearch("find /home/raymond -name x")).toBeNull();
+    expect(findRootSearch("find / -maxdepth 1 -name x")).toBeNull();
+    expect(findRootSearch("find /etc /var -name x")).toBeNull();
+  });
+
+  test("ignores find as a plain argument", () => {
+    expect(findRootSearch("echo find /")).toBeNull();
+    expect(findRootSearch("grep find /var/log/x")).toBeNull();
   });
 });

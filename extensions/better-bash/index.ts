@@ -771,6 +771,55 @@ export function guardWaitCondition(command: string): string | null {
   return null;
 }
 
+/** find options that take a separate value argument. */
+const FIND_VALUE_OPTS = new Set([
+  "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename", "-iwholename",
+  "-perm", "-user", "-group", "-newer", "-anewer", "-cnewer", "-newerxt", "-newerac",
+  "-mmin", "-cmin", "-amin", "-maxdepth", "-mindepth", "-size", "-fstype", "-gid", "-uid",
+]);
+
+/**
+ * Detects filesystem-root searches: `find /` (or `find /*`) without
+ * `-maxdepth 1` scans the entire disk and will run into the bash timeout
+ * cap. Returns the offending path list, or null.
+ * Token-based like extractPgrepPatterns; `find` only counts at a command
+ * position (start of command or after a shell operator).
+ */
+export function findRootSearch(command: string): string | null {
+  const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== "find") continue;
+    const prev = i > 0 ? tokens[i - 1] : "";
+    const atCmdPos =
+      prev === "" || ["&&", "||", "|", ";", "&", "(", ")", "`"].includes(prev) || /[;|&)(`]$/.test(prev);
+    if (!atCmdPos) continue;
+    let j = i + 1;
+    let maxDepth1 = false;
+    const paths: string[] = [];
+    while (j < tokens.length) {
+      const a = tokens[j];
+      if (/[;|&]/.test(a)) break; // next pipeline element
+      if (/^\d*(>>?|<)/.test(a)) {
+        // Redirection: `2>/dev/null` (attached) or `> /dev/null` (separate target).
+        j++;
+        if (/^\d*(>>?|<)$/.test(a)) j++; // skip the separate target
+        continue;
+      }
+      if (a.startsWith("-")) {
+        if (a === "-maxdepth" && tokens[j + 1] === "1") maxDepth1 = true;
+        j++;
+        if (FIND_VALUE_OPTS.has(a)) j++; // skip the option's value
+        continue;
+      }
+      if (["!", "not", "and", "or", "(", ")"].includes(a)) break; // expression started
+      paths.push(a);
+      j++;
+    }
+    if (!maxDepth1 && paths.some((p) => p === "/" || p === "/*")) return paths.join(" ");
+  }
+  return null;
+}
+
 export default function (pi: ExtensionAPI) {
   const GUARDED_TOOLS = ["bash", "powershell"] as const;
 
@@ -1082,6 +1131,18 @@ export default function (pi: ExtensionAPI) {
             reason:
               `Blocked: busy-wait loop detected (${busyWaits[0]}) — it spins the CPU while waiting. ` +
               `Use wait_for to block until the condition is met, or alarm to be woken later while you do other work.`,
+          };
+        }
+
+        const rootFind = findRootSearch(event.input.command);
+        if (rootFind) {
+          return {
+            block: true,
+            reason:
+              `Blocked: filesystem-root search (find ${rootFind}) — scanning the entire disk takes minutes ` +
+              `and will hit the ${MAX_TIMEOUT_SECONDS}s timeout cap. Scope the search to the directories you ` +
+              `actually mean (a project dir, $HOME, /tmp, …), or use fd/locate if available. ` +
+              `\`find / -maxdepth 1\` is allowed.`,
           };
         }
       }
