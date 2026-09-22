@@ -887,7 +887,10 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("wait_for "));
       text += theme.fg("accent", clipCommand(args.command));
-      if (args.timeout) text += theme.fg("dim", ` (timeout: ${args.timeout}s)`);
+      const parts: string[] = [];
+      parts.push(`every ${args.interval ?? 2}s`);
+      if (args.timeout) parts.push(`timeout: ${args.timeout}s`);
+      text += theme.fg("dim", ` (${parts.join(", ")})`);
       return new Text(text, 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
@@ -974,7 +977,12 @@ export default function (pi: ExtensionAPI) {
       if (args.list) text += theme.fg("dim", "list");
       else if (args.cancel) text += theme.fg("dim", `cancel ${args.cancel}`);
       else if (args.delay != null) text += theme.fg("accent", `in ${args.delay}s`);
-      else if (args.command) text += theme.fg("accent", clipCommand(args.command)) + (args.repeat ? theme.fg("dim", " (repeat)") : "");
+      else if (args.command) {
+        const parts: string[] = [theme.fg("accent", clipCommand(args.command))];
+        parts.push(theme.fg("dim", `every ${args.interval ?? 2}s`));
+        if (args.repeat) parts.push(theme.fg("dim", "(repeat)"));
+        text += parts.join("");
+      }
       return new Text(text, 0, 0);
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
