@@ -597,7 +597,8 @@ export function findBusyWaitLoops(command: string): string[] {
 }
 
 /** Per-check cap so a hanging condition command can't block a wait forever. */
-const CHECK_TIMEOUT_MS = 30_000;
+/** Per-check timeout in SECONDS — ops.exec expects seconds, not milliseconds. */
+const CHECK_TIMEOUT_SEC = 30;
 
 /** Abortable sleep: resolves after `ms`, or immediately once `signal` aborts. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -673,11 +674,9 @@ function extractPgrepPatterns(command: string): string[] {
  *      result is ambiguous.
  * Returns an explanation, or null if the condition looks sound.
  */
-function auditPgrepCondition(command: string): string | null {
-  const patterns = extractPgrepPatterns(command);
-  if (patterns.length === 0) return null;
-  // 1) Static self-match: test each pattern against the polling shell's command line.
-  for (const p of patterns) {
+/** Static part of the audit: does a `pgrep -f` pattern match the polling shell's own command line? */
+function auditPgrepSelfMatch(command: string): string | null {
+  for (const p of extractPgrepPatterns(command)) {
     let self: boolean;
     try {
       self = new RegExp(p).test(`sh -c ${command}`);
@@ -693,6 +692,15 @@ function auditPgrepCondition(command: string): string | null {
       );
     }
   }
+  return null;
+}
+
+function auditPgrepCondition(command: string): string | null {
+  // 1) Static self-match: test each pattern against the polling shell's command line.
+  const selfError = auditPgrepSelfMatch(command);
+  if (selfError) return selfError;
+  const patterns = extractPgrepPatterns(command);
+  if (patterns.length === 0) return null;
   // 2) Runtime multi-match: scan /proc for processes whose command line matches.
   let dirs: string[];
   try {
@@ -756,6 +764,27 @@ export default function (pi: ExtensionAPI) {
     return `alarm ${id}: polling \`${clipCommand(e.command ?? "", 60)}\` every ${e.intervalSec}s${e.repeat ? ", repeats until met" : ""} (set ${age}s ago)${e.note ? ` — ${e.note}` : ""}`;
   };
 
+  // Guards wait_for/alarm conditions: no disallowed commands (sleep) and no
+  // busy-wait loops — the condition is already re-run every `interval` seconds,
+  // so it must be a one-shot test, not a loop that paces or spins itself.
+  const guardWaitCondition = (command: string): string | null => {
+    const hits = [...new Set(extractCommandNames(command).filter((name) => name in DISALLOWED_COMMANDS))];
+    if (hits.length > 0) {
+      return (
+        `"${hits.join('", "')}" in the wait condition — the condition is already re-checked every \`interval\` seconds, ` +
+        `so it must be a one-shot test (e.g. \`[ -f done ]\`, \`[ ! -d /proc/$PID ]\`), not a loop that sleeps or paces itself.`
+      );
+    }
+    const busyWaits = findBusyWaitLoops(command);
+    if (busyWaits.length > 0) {
+      return (
+        `busy-wait loop in the wait condition (${busyWaits[0]}) — it spins the CPU; ` +
+        `the condition is already re-checked every \`interval\` seconds, make it a one-shot test.`
+      );
+    }
+    return null;
+  };
+
   // Run a shell condition once and return its exit code (null on error/timeout),
   // plus an auditError if the condition uses an unreliable `pgrep -f` pattern.
   const runCheck = async (
@@ -763,9 +792,12 @@ export default function (pi: ExtensionAPI) {
     cwd: string,
     signal?: AbortSignal,
   ): Promise<{ exitCode: number | null; auditError?: string }> => {
+    // Fail fast on the deterministic self-match before spending the check timeout.
+    const selfError = auditPgrepSelfMatch(command);
+    if (selfError) return { exitCode: null, auditError: selfError };
     let exitCode: number | null;
     try {
-      const r = await ops.exec(command, cwd, { onData: () => {}, signal, timeout: CHECK_TIMEOUT_MS });
+      const r = await ops.exec(command, cwd, { onData: () => {}, signal, timeout: CHECK_TIMEOUT_SEC });
       exitCode = r.exitCode;
     } catch {
       exitCode = null;
@@ -778,7 +810,8 @@ export default function (pi: ExtensionAPI) {
     name: "wait_for",
     label: "Wait For",
     description:
-      "Block until a shell command exits 0 (condition met) or a timeout elapses — use to wait for a background job instead of busy-waiting.",
+      "Block until a shell command exits 0 (condition met) or a timeout elapses — use to wait for a background job instead of busy-waiting. " +
+      "The command is a one-shot test re-run every `interval` seconds — no loops or sleep inside it.",
     parameters: Type.Object({
       command: Type.String({
         description:
@@ -805,6 +838,14 @@ export default function (pi: ExtensionAPI) {
       return new Text(theme.fg(color, msg), 0, 0);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const guardError = guardWaitCondition(params.command);
+      if (guardError) {
+        return {
+          content: [{ type: "text", text: `Blocked: ${guardError}` }],
+          isError: true,
+          details: { met: false, blocked: true },
+        };
+      }
       const capMs = Math.min(Math.max(1, params.timeout ?? MAX_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000;
       const intervalMs = Math.max(1, params.interval ?? 2) * 1000;
       const start = Date.now();
@@ -857,7 +898,7 @@ export default function (pi: ExtensionAPI) {
       delay: Type.Optional(Type.Number({ description: `Seconds until a timed alarm fires (max ${MAX_TIMEOUT_SECONDS}).` })),
       command: Type.Optional(Type.String({
         description:
-          "Shell condition to poll; exit code 0 fires the alarm. " +
+          "Shell condition to poll; exit code 0 fires the alarm. One-shot test re-run every `interval` seconds — no loops or sleep inside. " +
           "Prefer a robust check (e.g. `[ ! -d /proc/$PID ]` or a marker file) over `pgrep -f`, which can match unrelated processes.",
       })),
       interval: Type.Optional(Type.Number({ description: "Seconds between condition checks (default 2, min 1)." })),
@@ -901,6 +942,12 @@ export default function (pi: ExtensionAPI) {
       const id = `a${++alarmSeq}`;
       const note = params.note?.trim();
       const timed = params.delay != null;
+      if (!timed) {
+        const guardError = guardWaitCondition(params.command!);
+        if (guardError) {
+          return { content: [{ type: "text", text: `Blocked: ${guardError}` }], isError: true };
+        }
+      }
       const entry: AlarmEntry = {
         cancelled: false,
         controller: new AbortController(),
