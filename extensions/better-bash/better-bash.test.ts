@@ -6,7 +6,9 @@ import {
   auditPgrepSelfMatch,
   extractCommandNames,
   extractPgrepPatterns,
+  findBackgrounding,
   findBusyWaitLoops,
+  findDaemonLaunchers,
   findRootSearch,
   guardWaitCondition,
 } from "./index.ts";
@@ -193,6 +195,78 @@ describe("guardWaitCondition", () => {
 
   test("quoted disallowed commands are not flagged", () => {
     expect(guardWaitCondition('grep -q "sleep" /var/log/x')).toBeNull();
+  });
+});
+
+describe("findBackgrounding", () => {
+  test("flags bare & operators", () => {
+    expect(findBackgrounding("nohup cargo test > /tmp/x.log 2>&1 & echo $!").ops.length).toBe(1);
+    expect(findBackgrounding("a & b & wait").ops.length).toBe(2);
+    expect(findBackgrounding("cmd &\nnext").ops.length).toBe(1);
+    expect(findBackgrounding("cmd&").ops.length).toBe(1);
+  });
+
+  test("allows && and redirections", () => {
+    expect(findBackgrounding("ls && grep x").ops).toEqual([]);
+    expect(findBackgrounding("cmd &> /tmp/all.log").ops).toEqual([]);
+    expect(findBackgrounding("cmd 2>&1 | tee x").ops).toEqual([]);
+    expect(findBackgrounding("cmd >&2").ops).toEqual([]);
+    expect(findBackgrounding("cmd 2>>&1").ops).toEqual([]);
+  });
+
+  test("ignores arithmetic &", () => {
+    expect(findBackgrounding("echo $((3 & 5))").ops).toEqual([]);
+    expect(findBackgrounding("if (( mask & 0x2 )); then echo y; fi").ops).toEqual([]);
+    expect(findBackgrounding("x=$((a & b)) && echo $x").ops).toEqual([]);
+  });
+
+  test("ignores quoted and commented &", () => {
+    expect(findBackgrounding('echo "a & b"').ops).toEqual([]);
+    expect(findBackgrounding("echo 'a & b'").ops).toEqual([]);
+    expect(findBackgrounding("ls # & nohup").ops).toEqual([]);
+  });
+
+  test("ignores here-doc bodies but not the opener line", () => {
+    expect(findBackgrounding("cat <<EOF\nnohup x &\nEOF").ops).toEqual([]);
+    expect(findBackgrounding("cat <<EOF &\nbody\nEOF").ops.length).toBe(1);
+  });
+
+  test("flags & inside command substitution", () => {
+    expect(findBackgrounding("x=$(nohup y &)").ops.length).toBe(1);
+  });
+
+  test("detects $! except in single quotes", () => {
+    expect(findBackgrounding("echo $!").dollarBang).toBe(true);
+    expect(findBackgrounding('echo "$!"').dollarBang).toBe(true);
+    expect(findBackgrounding("echo '$!'").dollarBang).toBe(false);
+    expect(findBackgrounding("echo dollar-bang").dollarBang).toBe(false);
+  });
+
+  test("fuzz: quote/paren/& soup never throws or hangs", () => {
+    const parts = ["&", "&&", "&>", "2>&1", "$((", "((", "))", "'", '"', "$()", "#", "echo", "x", "<<EOF", "EOF"];
+    let seed = 7;
+    const rand = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const start = Date.now();
+    for (let i = 0; i < 3000; i++) {
+      const n = 1 + Math.floor(rand() * 10);
+      const cmd = Array.from({ length: n }, () => parts[Math.floor(rand() * parts.length)]).join(" ");
+      expect(() => findBackgrounding(cmd)).not.toThrow();
+    }
+    expect(Date.now() - start).toBeLessThan(10_000);
+  });
+});
+
+describe("findDaemonLaunchers", () => {
+  test("flags launchers at command position", () => {
+    expect(findDaemonLaunchers("nohup cargo test > /tmp/x.log 2>&1 &")).toEqual(["nohup"]);
+    expect(findDaemonLaunchers("setsid longrun &")).toEqual(["setsid"]);
+    expect(findDaemonLaunchers("a; disown")).toEqual(["disown"]);
+  });
+
+  test("ignores names as arguments or in quotes", () => {
+    expect(findDaemonLaunchers("man nohup")).toEqual([]);
+    expect(findDaemonLaunchers('echo "nohup"')).toEqual([]);
+    expect(findDaemonLaunchers("ls nohup")).toEqual([]);
   });
 });
 
