@@ -249,10 +249,18 @@ export default function (pi: ExtensionAPI) {
 				const onSettled = () => {
 					unsubscribeSettled();
 					setTimeout(() => {
-						if (ctx.isIdle()) {
-							pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { triggerTurn: true });
-						} else {
-							pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { deliverAs: 'steer' });
+						try {
+							if (ctx.isIdle()) {
+								pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { triggerTurn: true });
+							} else {
+								pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { deliverAs: 'steer' });
+							}
+						} catch {
+							// The ctx went stale before this tick ran (print-mode
+							// shutdown, or a session replace/reload in the same
+							// instant): the advice is undeliverable — drop it
+							// instead of crashing the process with an uncaught
+							// timer exception (live test, session 01a0cd1f).
 						}
 					}, 0);
 				};
