@@ -233,7 +233,30 @@ export default function (pi: ExtensionAPI) {
 					: (stream === 'thinking' ? MSG_THINKING : MSG_OUTPUT)
 							.replaceAll('{tokens}', String(h.tokens))
 							.replaceAll('{delta}', String(h.delta));
-				pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { triggerTurn: true });
+				// The run is aborting (our own ctx.abort() in abortStream): at
+				// message_end the session still reports streaming, so
+				// sendCustomMessage would route this through agent.steer() into
+				// the DYING run, and pi ends the run on an 'aborted' stop without
+				// draining the steering queue — the advice would never be
+				// delivered and the session would sit idle with no recovery turn
+				// (same defect as pi-loop-police, session 01a0cd1f). Defer
+				// delivery until the run has settled: pi starts any run another
+				// extension or the user queued at settle before returning to the
+				// event loop, so a one-tick delay tells the two cases apart —
+				// steer the advice into the live run, or start the recovery turn
+				// ourselves when the session is idle.
+				let unsubscribeSettled: () => void = () => {};
+				const onSettled = () => {
+					unsubscribeSettled();
+					setTimeout(() => {
+						if (ctx.isIdle()) {
+							pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { triggerTurn: true });
+						} else {
+							pi.sendMessage({ customType: 'sequence-loop', content: advice, display: true }, { deliverAs: 'steer' });
+						}
+					}, 0);
+				};
+				unsubscribeSettled = pi.on('agent_settled', onSettled);
 				if (intact) return { message: cleaned };
 				return;
 			}
