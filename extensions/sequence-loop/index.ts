@@ -296,7 +296,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand('sequence-loop', {
 		description: 'Show status; /sequence-loop reset; /sequence-loop set KEY=VAL [KEY=VAL ...]',
-		handler: (args, ctx) => {
+		handler: async (args, ctx) => {
 			const trimmed = args?.trim() ?? '';
 
 			if (trimmed === 'reset') {
