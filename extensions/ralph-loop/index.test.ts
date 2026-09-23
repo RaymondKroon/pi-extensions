@@ -6347,20 +6347,22 @@ describe('ralph-loop extension (global config store)', () => {
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await startLoop(fake, fakeCtx);
 
 		const view = await openConfigUi(fake, fakeCtx);
 		// Rows: Save to, Start fresh context at, Maximum iterations, Compaction
 		// mode, Auto-approve decisions, Auto mode, Cycle: task loop,
 		// Cycle: goal loop, Cycle: auto loop (last).
-		for (let i = 0; i < 8; i++) view.handleInput('\x1b[B');
-		view.handleInput('\r'); // built-in auto policy budget → task
+		for (let i = 0; i < 6; i++) view.handleInput('\x1b[B');
+		view.handleInput('\r'); // active task policy task → budget
 		await flush();
 
 		const store = await readStore();
 		expect(store.dirs![dir]!.default).toMatchObject({
-			cycleOn: { tasks: 'task', goal: 'task', auto: 'task' }
+			cycleOn: { tasks: 'budget', goal: 'task', auto: 'budget' }
 		});
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('cycle (auto loop) task');
+		expect(fake.entries.filter((entry) => entry.customType === 'ralph-loop-state').at(-1)!.data).toMatchObject({ cycleOn: 'budget' });
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('cycle (task loop) budget');
 	});
 });
 

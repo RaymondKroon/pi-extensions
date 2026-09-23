@@ -204,8 +204,9 @@ loop, auto loop): when a fresh iteration starts.
   tasks — the cap weakens; that is the point of the policy.
 
 Built-in per mode: `"task"` for the task and goal loops, `"budget"` for the
-auto loop. The value is captured into the loop state at start, so editing the
-config mid-loop does not change a running loop. Stop conditions are
+auto loop. The active loop uses the configured value for its mode, and
+changing the policy in `/ralph config` updates an active loop of that mode
+immediately. Stop conditions are
 policy-independent: the task loop stops on an empty backlog, the goal loop
 when the goal is done, the auto loop never on an empty backlog. Under
 `"budget"` the goal loop additionally cycles on a **phase change**

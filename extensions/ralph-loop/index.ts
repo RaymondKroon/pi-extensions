@@ -191,7 +191,7 @@ interface RalphState {
 	enabled: boolean;
 	/** Loop policy: the finite task backlog, the single goal, or the auto loop. */
 	mode: 'tasks' | 'goal' | 'auto';
-	/** The cycle policy resolved at loop start (the loop mode's configured value); a mid-loop config edit does not change a running loop. */
+	/** The live cycle policy for this loop, updated when its mode's config setting changes. */
 	cycleOn: 'task' | 'budget';
 	todoPath: string;
 	/** Compact backlog diff inputs at the start of the current loop (never cycled). */
@@ -3872,7 +3872,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Cycle per the loop's policy (cycleOn, resolved at loop start).
+			// Cycle per the loop's current policy (updated live from config).
 			// Under "task", completing an item is a hard context boundary: it must
 			// win over the proactive threshold check below, because each cycle
 			// inserts a marker that removes preceding turns from model context,
@@ -4147,7 +4147,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'cycleOnTasks',
 				label: 'Cycle: task loop',
 				description:
-					'When a fresh iteration starts for the task loop: task — after every completed task (planned, feature-sized backlogs); budget — only at the context budget, working task after task (fine-grained rolling handoff todos). Applies to loops started after the change.',
+					'When a fresh iteration starts for the task loop: task — after every completed task (planned, feature-sized backlogs); budget — only at the context budget, working task after task (fine-grained rolling handoff todos). Applies immediately to active task loops.',
 				currentValue: config.cycleOn.tasks,
 				values: ['task', 'budget']
 			},
@@ -4155,7 +4155,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'cycleOnGoal',
 				label: 'Cycle: goal loop',
 				description:
-					'When a fresh iteration starts for the goal loop: task — after every completed task (and on plan growth); budget — only at the context budget (plus goal phase changes). Applies to loops started after the change.',
+					'When a fresh iteration starts for the goal loop: task — after every completed task (and on plan growth); budget — only at the context budget (plus goal phase changes). Applies immediately to active goal loops.',
 				currentValue: config.cycleOn.goal,
 				values: ['task', 'budget']
 			},
@@ -4163,7 +4163,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'cycleOnAuto',
 				label: 'Cycle: auto loop',
 				description:
-					'When a fresh iteration starts for the auto loop: task — after every completed task; budget — only at the context budget, working task after task. Applies to loops started after the change.',
+					'When a fresh iteration starts for the auto loop: task — after every completed task; budget — only at the context budget, working task after task. Applies immediately to active auto loops.',
 				currentValue: config.cycleOn.auto,
 				values: ['task', 'budget']
 			}
@@ -4195,8 +4195,15 @@ export default function (pi: ExtensionAPI) {
 							syncToolActivation();
 						}
 						if (state?.enabled) {
+							const cycleOn =
+								state.mode === 'goal'
+									? next.cycleOn.goal
+									: state.mode === 'auto'
+										? next.cycleOn.auto
+										: next.cycleOn.tasks;
 							persistState({
 								...state,
+								cycleOn,
 								autoApproveDecisions: next.autoApproveDecisions,
 								maxIterations: next.maxIterations,
 								contextThreshold: contextThresholdFor(next, ctx)
