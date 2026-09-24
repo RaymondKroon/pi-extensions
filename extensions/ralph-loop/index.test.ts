@@ -4655,7 +4655,7 @@ GB
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is stopped · auto mode: on');
 	});
 
-	test('auto mode pre-activates the auto tool set (ralph_todo + ralph_cycle) at session start so arming is cache-neutral', async () => {
+	test('auto mode pre-activates the auto tool set (ralph_todo, ralph_cycle, decision tools) at session start so arming is cache-neutral', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -4663,13 +4663,13 @@ GB
 
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 
-		// The auto tool set (backlog + cycle) is in context before the loop
-		// arms; the goal and decision tools stay out.
+		// The auto tool set (backlog + cycle + decision tools) is in context
+		// before the loop arms; the goal tool stays out.
 		expect(fake.activeTools).toContain('ralph_todo');
 		expect(fake.activeTools).toContain('ralph_cycle');
+		expect(fake.activeTools).toContain('ralph_request_decision');
+		expect(fake.activeTools).toContain('ralph_resolve_decision');
 		expect(fake.activeTools).not.toContain('ralph_goal');
-		expect(fake.activeTools).not.toContain('ralph_request_decision');
-		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
 
 		// Arming the loop at the context budget must not change the tool set —
 		// a changed tool set changes the rendered prompt and invalidates the
@@ -4745,18 +4745,21 @@ GB
 		expect(prompt).toContain('Run the Ralph auto loop');
 		expect(prompt).toContain('Read the backlog.');
 		expect(prompt).toContain('General');
+		// The auto prompt instructs the model to use the decision tool.
+		expect(prompt).toContain('ralph_request_decision');
 		// The state file is created with the auto-created session category.
 		expect(readBacklog().createdLists()).toEqual(['General']);
 		// Status bar: the auto label and the session category.
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
 		expect(status).toContain('category: General');
-		// The auto tool set is activated — not the full ralph tool set.
+		// The auto tool set is activated — not the full ralph tool set (the goal
+		// tool stays out; the decision tools are part of the auto tool set).
 		expect(fake.activeTools).toContain('ralph_todo');
 		expect(fake.activeTools).toContain('ralph_cycle');
+		expect(fake.activeTools).toContain('ralph_request_decision');
+		expect(fake.activeTools).toContain('ralph_resolve_decision');
 		expect(fake.activeTools).not.toContain('ralph_goal');
-		expect(fake.activeTools).not.toContain('ralph_request_decision');
-		expect(fake.activeTools).not.toContain('ralph_resolve_decision');
 	});
 
 	test('auto mode start reuses the per-session auto file and continues the same category on restart', async () => {
@@ -4868,24 +4871,23 @@ GB
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		let finish = fake.userMessages.at(-1)!.text;
 		expect(finish).toContain('OK to leave the code in a bad state');
-		// The handoff logs the iteration's findings for the next round.
-		expect(finish).toContain('rediscover from scratch');
+		// The handoff records durable findings in the project documentation,
+		// only when there is something durable.
+		expect(finish).toContain('record it in the project documentation');
+		expect(finish).toContain('If there is nothing durable, write nothing');
 		// The auto loop has no goal layer.
 		expect(finish).not.toContain('ralph_goal');
 
-		// The fresh iteration 2 prompt carries the findings layer.
+		// The fresh iteration 2 prompt points at the project documentation for
+		// earlier findings (the Findings-todo ritual is gone).
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('message_update', fakeCtx.ctx);
 		const fresh = fake.userMessages.at(-1)!.text;
 		expect(fresh).not.toContain('ralph_goal');
-		expect(fresh).toContain('"next" skips them');
-		expect(fresh).toContain('Findings: ');
-		// Findings entries are consumed (marked done) by the iteration that reads
-		// them, so the backlog does not accumulate open reference entries.
-		expect(fresh).toContain('mark each one done');
-		expect(fresh).not.toContain('never complete them');
+		expect(fresh).toContain('durable findings in the project documentation');
+		expect(fresh).not.toContain('Findings: ');
 		// The auto iteration commits every completed task locally (never pushes).
 		expect(fresh).toContain('Commit the completed task locally');
 		expect(fresh).toContain('Do not push');
@@ -5177,7 +5179,7 @@ GB
 		await flush();
 
 		expect(fake.userMessages).toHaveLength(2);
-		expect(fake.userMessages[1]!.text).toContain('Continue on next task?');
+		expect(fake.userMessages[1]!.text).toContain('Continue the loop: start the next open task now.');
 		const status = statusLine(fakeCtx.widgets);
 		expect(status).toContain('Ralph (auto): on');
 		expect(status).toContain('iteration 1/10');
@@ -5740,7 +5742,7 @@ M list "Plan"
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
 		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
 		// …and the budget nudge keeps the loop moving to the next open task.
-		expect(fake.userMessages.at(-1)!.text).toContain('Continue on next task?');
+		expect(fake.userMessages.at(-1)!.text).toContain('Continue the loop: start the next open task now.');
 	});
 
 	test('task loop under cycleOn "budget": an exhausted backlog still stops the loop at settle', async () => {

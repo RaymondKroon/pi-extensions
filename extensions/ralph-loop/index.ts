@@ -121,8 +121,8 @@ const CYCLE_TOOL_NAME = 'ralph_cycle';
 const RALPH_TOOL_NAMES = ['ralph_todo', 'ralph_goal', 'ralph_request_decision', 'ralph_resolve_decision', CYCLE_TOOL_NAME];
 /** The backlog tool name. With auto mode "on" the auto tool set is pre-activated at session start so arming the loop at the context budget does not change the tool set (a changed tool set changes the rendered prompt and invalidates the provider's prefix cache). */
 const TODO_TOOL_NAME = 'ralph_todo';
-/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool plus the cycle tool, so a model-requested cycle (and its boundary reload) is possible from a plain auto-mode session. */
-const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, CYCLE_TOOL_NAME];
+/** The tools an active auto loop activates (and auto mode "on" pre-activates): the backlog tool, the cycle tool, and the decision tools — so a model-requested cycle (and its boundary reload) is possible from a plain auto-mode session, and blocked work can pause the loop for a user decision. */
+const AUTO_TOOL_NAMES = [TODO_TOOL_NAME, CYCLE_TOOL_NAME, 'ralph_request_decision', 'ralph_resolve_decision'];
 /** On-demand action reference; the compact tool descriptions point here instead of always-in-context text. */
 const REFERENCE_DOC = join(import.meta.dirname, 'docs', 'ralph-backlog.md');
 
@@ -711,6 +711,9 @@ function isBacklogFinished(todo: string, category?: string): boolean {
  * iterations are not work items. ralph_todo "next" skips them on the session
  * backlog so an iteration never stalls on a reference entry. (The larger
  * objective is not a "Goal: " task — the auto loop has no goal layer.)
+ * The Findings layer is deprecated: prompts no longer create these entries
+ * (durable findings go to the project documentation), but existing backlogs
+ * may still contain them, so the skip stays for backward compatibility.
  */
 function isReferenceTaskTitle(title: string): boolean {
 	return title.startsWith('Findings: ');
@@ -950,21 +953,17 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	if (!state.baseline.ralph) {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
+	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, call the ralph_request_decision tool with one precise question. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution and then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, then call ralph_resolve_decision with a concise resolution and continue the blocked work.'}`;
+
 	if (state.mode === 'auto') {
 		const contextNote =
 			reason === 'context-limit'
-				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. The backlog also carries "Findings: " entries with what the previous iteration learned, and DEBUG.md at the project root may carry durable debug findings — read them before starting work instead of rediscovering what they already establish.'
+				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. Earlier iterations may have recorded durable findings in the project documentation — look for them before starting work instead of rediscovering what they already establish.'
 				: reason === 'loop-escape'
 				? 'A reasoning loop was detected, so the previous iteration was cut and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat the reasoning that led to the loop.'
 				: reason === 'model-requested'
 				? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat what the recorded checkpoint lists as already tried.`
 			: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
-		// From the second iteration on, the backlog also carries the findings
-		// layer ("Findings: " reference notes from earlier iterations).
-		const referenceTaskNote =
-			state.iteration > 1
-				? ' Tasks whose title starts with "Findings: " are not work items, and "next" skips them: they are reference notes from earlier iterations. Read the open Findings entries before starting work, then mark each one done with ralph_todo (action "complete") so the backlog does not accumulate open reference entries.'
-				: '';
 		// Closing step per cycle policy: under "task" the commit ends the
 		// iteration (the loop cycles and starts a fresh one); under "budget"
 		// the model keeps working task after task until the context budget.
@@ -975,8 +974,8 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		return renderPrompt('iteration-auto', {
 			contextNote,
 			category: String(state.category),
-			referenceTaskNote,
-			closeStep
+			closeStep,
+			decisionNote
 		});
 	}
 
@@ -1007,8 +1006,6 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	// The closing step is a bullet in every iteration prompt (bullet steps).
 	const ralphCloseStep = closeStep(commitText);
 	const goalCloseStep = closeStep(commitText);
-
-	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, call the ralph_request_decision tool with one precise question. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution and then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, then call ralph_resolve_decision with a concise resolution and continue the blocked work.'}`;
 
 	const goalInfo = goalPhase(state);
 	if (goalInfo) {
@@ -1177,8 +1174,8 @@ function contextCheckpointPromptBody(state: RalphState): string {
  * the code in a bad state and records the remaining work as todo entries for
  * the next iteration; completed work gets its completion log entry and its
  * local commit (broken or half-done work does not). The auto loop adds the
- * findings layer ("Findings: " reference notes). The settled turn starts the
- * fresh iteration.
+ * findings line (durable findings go to the project documentation). The
+ * settled turn starts the fresh iteration.
  */
 function finishUpPrompt(
 	state: RalphState,
@@ -1189,8 +1186,8 @@ function finishUpPrompt(
 	// in their scoped category (or the work's own category when unscoped).
 	const categoryClause =
 		state.category !== undefined ? ` in category "${state.category}"` : isAuto ? '' : ', and the category of the work';
-	// The findings layer is the auto loop's handoff memory; the other loops
-	// keep durable findings in DEBUG.md during the iteration instead.
+	// The findings line is the auto loop's handoff memory (durable findings go
+	// to the project documentation); the other loops have no findings line.
 	const findings = isAuto ? `${renderPrompt('finish-up-findings', {})}\n` : '';
 	const opening =
 		reason === 'phase-changed'
