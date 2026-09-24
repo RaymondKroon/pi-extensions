@@ -799,7 +799,17 @@ function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefi
 /** The goal contract shown to the model in every goal-loop prompt. */
 function goalBlock(goal: Goal): string {
 	const lines = [`The goal (status: ${goal.status}):`];
-	if (goal.body) lines.push(goal.body.trim());
+	if (goal.body) {
+		lines.push(goal.body.trim());
+		// The re-evaluation iteration verifies "every acceptance criterion":
+		// when the body doesn't already label them, say so explicitly so the
+		// model derives them from the body instead of missing unlabeled ones.
+		if (!/acceptance criteria/i.test(goal.body)) {
+			lines.push(
+				'Acceptance criteria: the goal body does not label them explicitly — derive them from the goal body (every verifiable requirement counts) and verify each one.'
+			);
+		}
+	}
 	if (goal.checkpoint) {
 		lines.push(`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${goal.checkpoint}`);
 	}
@@ -953,98 +963,36 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	if (!state.baseline.ralph) {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
-	const decisionNote = `If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, call the ralph_request_decision tool with one precise question. ${state.autoApproveDecisions ? 'Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution and then continue the blocked work. Do not call ralph_resolve_decision.' : 'It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, then call ralph_resolve_decision with a concise resolution and continue the blocked work.'}`;
-
-	if (state.mode === 'auto') {
-		const contextNote =
-			reason === 'context-limit'
-				? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation. Earlier iterations may have recorded durable findings in the project documentation — look for them before starting work instead of rediscovering what they already establish.'
-				: reason === 'loop-escape'
-				? 'A reasoning loop was detected, so the previous iteration was cut and finished up: the remaining work is recorded as todo entries in your session category. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat the reasoning that led to the loop.'
-				: reason === 'model-requested'
-				? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Re-establish facts from the repository and the backlog before continuing; do not rely on the old conversation, and do not repeat what the recorded checkpoint lists as already tried.`
-			: 'This is the first iteration of the Ralph auto loop in this session. Start with a clean review of the repository.';
-		// Closing step per cycle policy: under "task" the commit ends the
-		// iteration (the loop cycles and starts a fresh one); under "budget"
-		// the model keeps working task after task until the context budget.
-		const closeStep =
-			state.cycleOn === 'task'
-				? '- This is the last step of the iteration: stop working when the commit is made.'
-				: '- After committing, immediately go back to the first step and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.';
-		return renderPrompt('iteration-auto', {
-			contextNote,
-			category: String(state.category),
-			closeStep,
-			decisionNote
-		});
-	}
-
-	const contextNote =
-		reason === 'context-limit'
-			? 'The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in the backlog. Re-establish facts from the repository and TODO before continuing; do not rely on the old conversation.'
-			: reason === 'completed-task'
-				? 'A previous TODO item was completed. Start the next independent iteration with a clean review of the repository.'
-				: reason === 'plan-updated'
-					? 'The plan was just updated with new tasks. Start the next independent iteration with a clean review of the repository and the updated plan.'
-			: reason === 'phase-changed'
-					? 'The goal phase changed. Start the next independent iteration with a clean review of the repository and the backlog.'
-					: reason === 'iteration-ended'
-						? 'The previous iteration ended. Start the next independent iteration with a clean review of the repository and the backlog.'
-						: reason === 'loop-escape'
-						? 'A reasoning loop was detected, so the previous iteration was cut. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat the reasoning that led to the loop.'
-						: reason === 'model-requested'
-							? `The previous iteration requested a fresh iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Start the next independent iteration with a clean review of the repository and the backlog; do not repeat what the recorded checkpoint lists as already tried.`
-						: 'This is the first iteration of the Ralph loop in this session. Start with a clean review of the repository.';
+	const isAuto = state.mode === 'auto';
+	const decisionNote = renderPrompt('decision-note', { autoApprove: state.autoApproveDecisions });
+	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
+	const contextNote = isAuto
+		? renderPrompt('context-note-auto', { reason: reason ?? 'first', cycleNoteClause })
+		: renderPrompt('context-note', { reason: reason ?? 'first', cycleNoteClause });
 	// Closing step per cycle policy: under "task" the commit ends the
 	// iteration (the loop cycles and starts a fresh one); under "budget" the
 	// model keeps working task after task until the context budget.
-	const closeStep = (commitText: string) =>
-		state.cycleOn === 'task'
-			? `- ${commitText} This is the last step of the iteration: stop working when the commit is made.`
-			: `- ${commitText} After committing, immediately go back to the first step and start the next open task. Keep working task after task: this iteration only ends when you are told to finish up (context budget) or when no open tasks remain. Do not stop after a completed task while open tasks remain.`;
-	const commitText = `Commit the completed task locally in a single commit. Do not push.`;
-	// The closing step is a bullet in every iteration prompt (bullet steps).
-	const ralphCloseStep = closeStep(commitText);
-	const goalCloseStep = closeStep(commitText);
+	// The closing step is a bullet in every iteration prompt (bullet steps);
+	// only the auto loop carries its commit line inline in the iteration
+	// template, so its close step omits the commit sentence.
+	const closeStep = renderPrompt('close-step', { commit: !isAuto, task: state.cycleOn === 'task' });
 
 	const goalInfo = goalPhase(state);
-	if (goalInfo) {
-		const { phase, goal } = goalInfo;
-		const backlogNote = `The backlog is accessible with the ralph_todo tool.`;
-		const categoryScope = state.category ? ` in category "${state.category}"` : '';
-
-		if (phase === 'planning') {
-			return renderPrompt('iteration-goal-planning', {
-				contextNote,
-				backlogNote,
-				goalBlock: goalBlock(goal),
-				decisionNote
-			});
-		}
-		if (phase === 're-evaluation') {
-			return renderPrompt('iteration-goal-re-evaluation', {
-				contextNote,
-				backlogNote,
-				goalBlock: goalBlock(goal),
-				decisionNote
-			});
-		}
-		return renderPrompt('iteration-goal-execution', {
-			contextNote,
-			backlogNote,
-			goalBlock: goalBlock(goal),
-			categoryScope,
-			goalCloseStep,
-			decisionNote
-		});
-	}
-
 	const categoryScope = state.category ? ` in category "${state.category}"` : '';
-	return renderPrompt('iteration-ralph', {
+	// One consolidated template for all five iteration prompts (auto, ralph,
+	// goal planning/execution/re-evaluation); variables for the branches not
+	// taken are empty strings.
+	return renderPrompt('iteration', {
+		loopWord: isAuto ? 'auto loop' : goalInfo ? 'goal loop' : 'loop',
+		isAuto,
+		isGoal: goalInfo !== undefined,
+		phase: goalInfo?.phase ?? '',
 		contextNote,
+		category: String(state.category),
 		backlogNote: 'The backlog is accessible with the ralph_todo tool.',
+		goalBlock: goalInfo ? goalBlock(goalInfo.goal) : '',
 		categoryScope,
-		ralphCloseStep,
+		closeStep,
 		decisionNote
 	});
 }
@@ -1161,18 +1109,16 @@ function contextCheckpointPromptBody(state: RalphState): string {
 	// Task-less goal iterations (planning/re-evaluation) have no task to
 	// checkpoint: the goal carries the durable state instead.
 	const phase = baselineGoalPhase(state);
-	if (phase !== undefined && phase !== 'execution') {
-		return renderPrompt('context-checkpoint-goal', {});
-	}
-	return renderPrompt('context-checkpoint-ralph', {});
+	return renderPrompt('context-checkpoint', { isGoal: phase !== undefined && phase !== 'execution' });
 }
 
 /**
  * The cycle finish-up prompt: sent as the dedicated finish-up turn when the
  * iteration reaches its context budget, or when the goal phase changes.
  * Finishing the handoff matters more than a clean state: the model may leave
- * the code in a bad state and records the remaining work as todo entries for
- * the next iteration; completed work gets its completion log entry and its
+ * the code in a bad state and records the remaining work (updating the
+ * in-progress task, adding todos for genuinely new work) for the next
+ * iteration; completed work gets its completion log entry and its
  * local commit (broken or half-done work does not). The auto loop adds the
  * findings line (durable findings go to the project documentation). The
  * settled turn starts the fresh iteration.
@@ -1186,23 +1132,15 @@ function finishUpPrompt(
 	// in their scoped category (or the work's own category when unscoped).
 	const categoryClause =
 		state.category !== undefined ? ` in category "${state.category}"` : isAuto ? '' : ', and the category of the work';
-	// The findings line is the auto loop's handoff memory (durable findings go
-	// to the project documentation); the other loops have no findings line.
-	const findings = isAuto ? `${renderPrompt('finish-up-findings', {})}\n` : '';
-	const opening =
-		reason === 'phase-changed'
-			? 'The goal phase changed. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
-		: reason === 'model-requested'
-			? `You requested a fresh Ralph iteration${state.cycleNote ? ` because: ${state.cycleNote}` : ''}. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.`
-		: reason === 'iteration-ended'
-			? 'The current Ralph iteration has ended. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.'
-		: reason === 'loop-escape'
-			? 'A reasoning loop was detected. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog with a clean context.'
-		: 'The current Ralph iteration has reached its configured context budget. Finish up now, then stop working; a fresh Ralph iteration will continue from the backlog.';
+	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
+	const opening = renderPrompt('finish-up-opening', { reason, cycleNoteClause });
+	// The findings line (the auto loop's handoff memory — durable findings go
+	// to the project documentation) is inlined in the template behind isAuto;
+	// the other loops have no findings line.
 	return `${automatedPrefix()}${renderPrompt('finish-up', {
 		opening,
 		categoryClause,
-		findings
+		isAuto
 	})}`;
 }
 
@@ -1220,12 +1158,12 @@ function completionRecordingPromptBody(state: RalphState): string {
 	if (numbers.length > 0) {
 		const singular = numbers.length === 1;
 		const target = singular ? `task ${numbers[0]}` : `tasks ${numbers.join(', ')}`;
+		const intro = singular
+			? `A Ralph TODO task was just completed: ${target}.`
+			: `Ralph TODO tasks were just completed: ${target}.`;
 		return renderPrompt('completion-recording', {
-			targetIntro: `: ${target}`,
-			target,
-			taskRef: singular ? 'the task' : 'a task',
-			entryWord: singular ? 'entry' : 'entry per task',
-			reportWord: singular ? 'entry' : 'entries'
+			intro,
+			target
 		});
 	}
 	// Degenerate case: neither the completion timestamps nor the baseline diff
@@ -1233,11 +1171,8 @@ function completionRecordingPromptBody(state: RalphState): string {
 	// while task ids shifted). The model completed the task in the previous
 	// turn, so it knows which one.
 	return renderPrompt('completion-recording', {
-		targetIntro: '',
-		target: 'the task you just completed',
-		taskRef: 'the task',
-		entryWord: 'entry',
-		reportWord: 'entry'
+		intro: 'A Ralph TODO task was just completed.',
+		target: 'the task you just completed'
 	});
 }
 

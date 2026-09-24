@@ -2869,7 +2869,7 @@ D 2
 		expect(prompt).toContain('action "next"');
 		expect(prompt).toContain('complete the task with a concise note');
 		expect(prompt).not.toContain('planning iteration');
-		expect(prompt).not.toContain('re-evaluation iteration');
+		expect(prompt).not.toContain('This is a re-evaluation iteration');
 	});
 
 	test('re-evaluation prompt: goal open, tasks exist, none open', async () => {
@@ -2881,6 +2881,20 @@ D 2
 		expect(prompt).toContain("add tasks for the missing work to the plan's list");
 		expect(prompt).toContain('complete the goal with ralph_goal');
 		expect(prompt).not.toContain('action "next"');
+	});
+
+	test('goal prompt labels the acceptance criteria when the body does not', async () => {
+		const { fake } = await startGoalLoop(GOAL_REEVALUATION);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Acceptance criteria: the goal body does not label them explicitly');
+	});
+
+	test('goal prompt keeps a body-provided acceptance-criteria label without adding another', async () => {
+		const labeled = GOAL_REEVALUATION.replace('GB\n  - Port the routes.', 'GB\n  Acceptance criteria:\n  - Port the routes.');
+		const { fake } = await startGoalLoop(labeled);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Acceptance criteria:');
+		expect(prompt).not.toContain('does not label them explicitly');
 	});
 
 	test('task-less goal iterations checkpoint via ralph_goal', async () => {

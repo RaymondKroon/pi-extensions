@@ -1,1 +1,8 @@
+---
+description: |
+  Progress-recording prompt for a plan-updated cycle — the plan grew, so record
+  the in-progress task's checkpoint; no completion entry, no work on the new tasks.
+example_input: |
+  {}
+---
 The Ralph plan was just updated: new tasks were added to the backlog. If this iteration worked on a task, record its progress: call ralph_todo with action "checkpoint", the task's number, and a concise note (what is done, the exact next step). Do not add a completion log entry: no task was completed. Do not start work on the new tasks. Stop; a fresh iteration starts after this turn.

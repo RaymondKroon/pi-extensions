@@ -28,7 +28,10 @@ Compact view of the first open task. Prefer it over `list` when you only need
 the next task. Reference entries (titles starting
 with `Findings: `) are not work items and are skipped; when only reference
 entries remain open, the result says so and lists them. (The larger objective
-is not a `Goal: ` task — `next` never skips a `Goal: ` title.)
+is not a `Goal: ` task — `next` never skips a `Goal: ` title.) The Findings
+layer is deprecated — prompts no longer create these entries (durable findings
+go to the project documentation) — but the skip stays for backlogs that still
+contain them.
 
 ### list
 Compact by default: counts, per-list counts, and open tasks.
@@ -168,17 +171,18 @@ only starts via `/ralph start`.
 
 The handoff is deliberately tolerant of a bad state: when an iteration reaches
 its context budget, the model may leave the code broken or half-done — the
-finish-up turn records the remaining work (including what is broken) as
-self-contained todos for the next iteration. Auto mode commits every completed
+finish-up turn records the remaining work (including what is broken) by
+updating the in-progress task to be self-contained about what remains, and
+adds todos only for genuinely new work items. Auto mode commits every completed
 task locally (never pushes): the backlog is the handoff, and the per-task
 commit is the durable checkpoint of finished work. The finish-up turn commits
 completed work that is still uncommitted, but never broken or half-done work.
-Every finish-up also logs the
-iteration's important findings as reference entries (titles starting with
-`Findings: ` — root causes, failed approaches, environment quirks, key code
-locations) so the next round does not rediscover them from scratch; the loop
-reads them before starting work and marks them done once read, so the backlog
-does not accumulate open reference entries.
+Every auto-mode finish-up also records durable, non-obvious findings (root
+causes, failed approaches, environment quirks) in the project documentation —
+only when there is something durable, updating or replacing existing entries
+rather than appending — so the next round does not rediscover them from
+scratch. (Earlier versions used `Findings: ` reference entries in the
+backlog for this; that layer is deprecated.)
 
 Without an active auto loop, `ralph_todo` reads the session backlog unscoped.
 `add`, `add-many`, `update`, and `complete` on the
