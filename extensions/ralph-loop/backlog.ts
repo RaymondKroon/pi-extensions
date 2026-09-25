@@ -40,8 +40,9 @@
 //                                       'reopen' and picks the log marker.
 //                                       Entries always belong to a task.
 //
-// Quoted strings use backslash escaping (" and \). Blank lines and lines
-// starting with "#" outside blocks are ignored.
+// Quoted strings use backslash escaping (\\, \", and \n for a newline,
+// so multi-line values stay on one line). Blank lines and lines starting
+// with "#" outside blocks are ignored.
 //
 // The backlog is a single flat list. Tasks have no keys: each is addressed
 // by its position number in the list ("1", "2", …). Grouping (e.g. by
@@ -249,7 +250,7 @@ function writeSqliteFile(source: SqliteDb, path: string): void {
 }
 
 function quote(value: string): string {
-	return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+	return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
 }
 
 /** ISO-8601 UTC with second precision, as stored in D records. */
@@ -440,9 +441,12 @@ export class Backlog {
 						let closed = false;
 						while (i < trimmed.length) {
 							const ch = trimmed[i];
-							if (ch === '\\' && i + 1 < trimmed.length) {
-								out += trimmed[i + 1];
-								i += 2;
+						if (ch === '\\' && i + 1 < trimmed.length) {
+							// \n decodes to a newline: render() escapes newlines so
+							// multi-line values (goal evidence, titles, meta values)
+							// stay on one physical line and round-trip.
+							out += trimmed[i + 1] === 'n' ? '\n' : trimmed[i + 1];
+							i += 2;
 							} else if (ch === '"') {
 								closed = true;
 								i += 1;

@@ -99,6 +99,40 @@ describe('text format round-trip', () => {
 		expect(backlog.render()).toContain('T 1 - "Say \\\"hi\\\" \\\\ there"');
 	});
 
+	test('escapes newlines so multi-line evidence, titles, and meta values round-trip', () => {
+		const text = '# ralph v2\n\nM source "TODO.md\\nbackup"\n\nG open\nGE "line one\\nline two"\n\nT 1 - "First line\\nSecond line"\n';
+		const backlog = Backlog.parse(text);
+		expect(backlog.listMeta().find((m) => m.key === 'source')?.value).toBe('TODO.md\nbackup');
+		expect(backlog.goal()?.evidence).toBe('line one\nline two');
+		expect(backlog.listTasks()[0].title).toBe('First line\nSecond line');
+		const rendered = backlog.render();
+		// Every record stays on a single physical line.
+		expect(rendered).toContain('M source "TODO.md\\nbackup"');
+		expect(rendered).toContain('GE "line one\\nline two"');
+		expect(rendered).toContain('T 1 - "First line\\nSecond line"');
+		const reloaded = Backlog.parse(rendered);
+		expect(reloaded.render()).toBe(rendered);
+		expect(reloaded.goal()?.evidence).toBe('line one\nline two');
+		expect(reloaded.listTasks()[0].title).toBe('First line\nSecond line');
+	});
+
+	test('a multi-line goal evidence set via claimGoal round-trips through render/parse', () => {
+		const backlog = Backlog.parse('# ralph v2\n\nG open\n');
+		backlog.claimGoal('All routes render.\nbun test: 515 pass.\nNo regressions.');
+		const rendered = backlog.render();
+		const reloaded = Backlog.parse(rendered);
+		expect(reloaded.render()).toBe(rendered);
+		expect(reloaded.goal()?.evidence).toBe('All routes render.\nbun test: 515 pass.\nNo regressions.');
+	});
+
+	test('a value containing a literal backslash-n round-trips as backslash-n, not a newline', () => {
+		const backlog = Backlog.empty();
+		backlog.addTask({ title: 'a\\nb' });
+		const rendered = backlog.render();
+		expect(rendered).toContain('T 1 - "a\\\\nb"');
+		expect(Backlog.parse(rendered).listTasks()[0].title).toBe('a\\nb');
+	});
+
 	test('tolerates legacy section records, task keys, and key log references', () => {
 		const legacy = `# ralph v1
 
