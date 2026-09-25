@@ -1322,7 +1322,7 @@ describe('searchTasks / formatSearchResults', () => {
 });
 
 describe('file persistence (open/save)', () => {
-	const { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } = require('node:fs');
+	const { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } = require('node:fs');
 	const { tmpdir } = require('node:os');
 	const { join } = require('node:path');
 	let dir: string;
@@ -1425,6 +1425,15 @@ describe('file persistence (open/save)', () => {
 		Backlog.open(join(dir, 'session.ralph')); // migrates to .db, removes .ralph
 		// The old .ralph name still resolves to the migrated database.
 		expect(Backlog.open(join(dir, 'session.ralph')).render()).toBe(text);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	test('open does not fall back to the sibling on a non-ENOENT read error', () => {
+		beforeEach();
+		const dbPath = join(dir, 'session.db');
+		mkdirSync(dbPath); // a directory: readFileSync throws EISDIR, not ENOENT
+		writeFileSync(join(dir, 'session.ralph'), populated().render());
+		expect(() => Backlog.open(dbPath)).toThrow(/EISDIR/);
 		rmSync(dir, { recursive: true, force: true });
 	});
 

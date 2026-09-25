@@ -105,6 +105,11 @@ export function isSqliteFile(bytes: Uint8Array): boolean {
 	return true;
 }
 
+/** True when the error is a missing file (ENOENT). */
+function isMissingFileError(error: unknown): boolean {
+	return error instanceof Error && (error as { code?: unknown }).code === 'ENOENT';
+}
+
 /** Thrown when a file exists but holds no ralph backlog (neither SQLite nor ralph text). */
 export class NotRalphBacklogError extends Error {
 	constructor(path: string, detail?: string) {
@@ -626,7 +631,10 @@ export class Backlog {
 			bytes = readFileSync(file);
 		} catch (error) {
 			const sibling = Backlog.formatSibling(path);
-			if (sibling === path) throw error;
+			// Only a missing primary file triggers the sibling fallback (the
+			// migration case); a transient read failure (EMFILE/EBUSY/EIO) must
+			// not silently redirect the read to the other-format file.
+			if (sibling === path || !isMissingFileError(error)) throw error;
 			file = sibling;
 			bytes = readFileSync(file); // throws ENOENT when that is missing too
 		}
