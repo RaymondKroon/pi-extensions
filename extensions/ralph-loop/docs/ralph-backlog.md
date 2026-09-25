@@ -57,7 +57,7 @@ and starts a fresh iteration. Under the `budget` policy (and in the auto
 loop), continue with the next open task.
 
 ### checkpoint
-Loop only. Records a checkpoint note (`note`) on the task.
+Loop only. Records a checkpoint note (`note`) on the task. In the auto loop this is the in-task progress record: the finish-up turn checkpoints the in-progress task instead of rewriting its body, the fresh iteration's `next` shows the checkpoint, and completing the task clears it.
 
 ### add
 Adds a task (`title`, optional `body` as markdown bullets) to a list given by

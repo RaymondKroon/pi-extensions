@@ -228,6 +228,8 @@ interface RalphState {
 	cycleNote?: string;
 	/** Queue an extension reload at the pending cycle boundary: after the recording turn and the context cut, before the fresh iteration's first request. */
 	reloadRequested?: boolean;
+	/** Auto loops started with the checkpoint handoff: the finish-up records the in-progress task's progress in its checkpoint field instead of rewriting its body. Restored loops started before the handoff keep the body-rewrite handoff for the rest of the run. */
+	checkpointHandoff?: boolean;
 }
 
 /**
@@ -334,6 +336,7 @@ function isRalphState(value: unknown): value is RalphState {
 			cycleReason === 'loop-escape') &&
 		(cycleNote === undefined || typeof cycleNote === 'string') &&
 		(state.reloadRequested === undefined || typeof state.reloadRequested === 'boolean') &&
+		(state.checkpointHandoff === undefined || typeof state.checkpointHandoff === 'boolean') &&
 		(cycleCheckpointing === undefined || typeof cycleCheckpointing === 'boolean') &&
 		(state.stopRequested === undefined || typeof state.stopRequested === 'boolean') &&
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
@@ -967,7 +970,11 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	const decisionNote = renderPrompt('decision-note', { autoApprove: state.autoApproveDecisions });
 	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
 	const contextNote = isAuto
-		? renderPrompt('context-note-auto', { reason: reason ?? 'first', cycleNoteClause })
+		? renderPrompt('context-note-auto', {
+				reason: reason ?? 'first',
+				cycleNoteClause,
+				checkpointHandoff: state.checkpointHandoff === true
+			})
 		: renderPrompt('context-note', { reason: reason ?? 'first', cycleNoteClause });
 	// Closing step per cycle policy: under "task" the commit ends the
 	// iteration (the loop cycles and starts a fresh one); under "budget" the
@@ -1128,6 +1135,9 @@ function finishUpPrompt(
 	reason: 'context-limit' | 'phase-changed' | 'model-requested' | 'iteration-ended' | 'loop-escape'
 ): string {
 	const isAuto = state.mode === 'auto';
+	// The checkpoint handoff (auto loops started with it): the in-progress
+	// task's progress goes to its checkpoint field, not a body rewrite.
+	const checkpointHandoff = isAuto && state.checkpointHandoff === true;
 	// The auto loop records its todos in the session category; the other loops
 	// in their scoped category (or the work's own category when unscoped).
 	const categoryClause =
@@ -1140,7 +1150,8 @@ function finishUpPrompt(
 	return `${automatedPrefix()}${renderPrompt('finish-up', {
 		opening,
 		categoryClause,
-		isAuto
+		isAuto,
+		checkpointHandoff
 	})}`;
 }
 
@@ -2213,7 +2224,7 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_todo',
 		label: 'Ralph backlog',
 		description:
-`Create, read, and update the Ralph backlog (ralph-format TODO file). Targets the active loop's backlog, else the session's ralph file (<session-id>.db in the global agent directory); a missing file is created with action "init" (empty) or "import" (from a Markdown TODO), and lists in the session backlog are created when missing. Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (task/goal loop only), add (list created when missing), add-many, new-list, update (title/body of an existing task; category moves it to another list), log, move, delete, import, init. add/update/complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
+`Create, read, and update the Ralph backlog (ralph-format TODO file). Targets the active loop's backlog, else the session's ralph file (<session-id>.db in the global agent directory); a missing file is created with action "init" (empty) or "import" (from a Markdown TODO), and lists in the session backlog are created when missing. Tasks addressed by position number as shown by list/next. Actions: next (first open task), list (open tasks + counts), search (needs query; use instead of grepping the file), complete (mark done; note also logs it), checkpoint (loop only; in the auto loop it records in-task progress without ending the iteration), add (list created when missing), add-many, new-list, update (title/body of an existing task; category moves it to another list), log, move, delete, import, init. add/update/complete start the auto loop first when auto mode is "on" and no loop is active yet. Never read or modify the backlog file by any other means (no file tools, no grep/cat/sed). Read ${REFERENCE_DOC} for per-action parameters and edge cases.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('next'),
@@ -2424,14 +2435,18 @@ export default function (pi: ExtensionAPI) {
 					}
 					case 'checkpoint': {
 						if (!state?.enabled) throw new Error('checkpoint requires an active Ralph loop (start one with /ralph start).');
-						if (state.mode === 'auto') {
-							throw new Error('checkpoint is not available in the auto loop: it records progress with add/update at the context budget.');
-						}
 						if (!params.task || !params.note) throw new Error('checkpoint requires the task number and a note.');
 						const task = backlog.setCheckpoint(params.task, params.note.trim(), state.iteration, scope);
 						mutated = true;
 						const number = backlog.taskNumbers(scope).get(task.id) ?? task.id;
-						output = `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						// In the auto loop a checkpoint records in-task progress
+						// without ending the iteration (the loop cycles at the
+						// context budget); in the task/goal loop it ends the
+						// iteration.
+						output =
+							state.mode === 'auto'
+								? `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Continue working.`
+								: `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
 						break;
 					}
 					case 'add': {
@@ -2951,7 +2966,8 @@ export default function (pi: ExtensionAPI) {
 				blockedItem: undefined,
 				mode: 'auto',
 				cycleOn: cycleOnFor('auto', config),
-				category
+				category,
+				checkpointHandoff: true
 			};
 			persistState(next);
 			syncToolActivation();

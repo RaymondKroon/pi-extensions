@@ -350,6 +350,16 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   mid-task `contextCheckpointPrompt` is kept only for task-less goal
   iterations (planning/re-evaluation checkpoint the goal via
   `ralph_goal checkpoint`) and Markdown backlogs.
+- **Auto-loop checkpoint handoff.** Auto loops started with the checkpoint
+  handoff (`RalphState.checkpointHandoff`, set at loop start) record the
+  in-progress task's progress in its checkpoint field instead of rewriting
+  its body: the finish-up checkpoints the in-progress task (the body stays
+  the task definition), and the fresh iteration's context note points at the
+  checkpoint (`next` and the task details show it). `ralph_todo checkpoint`
+  is available in the auto loop (it records in-task progress without ending
+  the iteration). Restored loops started before the handoff keep the
+  body-rewrite handoff for the rest of the run (the flag is absent from
+  their persisted state).
 - Quality bar unchanged: `bun test` in full (all suites).
 
 ## 13. Model-requested cycles and boundary reloads (`ralph_cycle`)

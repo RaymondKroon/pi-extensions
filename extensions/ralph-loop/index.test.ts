@@ -4942,6 +4942,110 @@ GB
 		expect(next.content[0]!.text).toContain('Finish the parser');
 	});
 
+	test('auto loop: checkpoint records in-task progress without ending the iteration', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'Big task' }, undefined, undefined, fakeCtx.ctx);
+		const result = await tool.execute('t', { action: 'checkpoint', task: '1', note: 'Parser done; next: the renderer.' }, undefined, undefined, fakeCtx.ctx);
+		expect(result.content[0]!.text).toContain('Checkpoint recorded for task 1');
+		// The auto loop keeps working: no stop instruction, no cycle.
+		expect(result.content[0]!.text).toContain('Continue working');
+		expect(result.content[0]!.text).not.toContain('Stop working now');
+
+		// The checkpoint is in the file, iteration-stamped, and shows in next.
+		const file = readBacklog();
+		expect(file.listTasks()[0]?.checkpoint).toBe('Parser done; next: the renderer.');
+		expect(file.listTasks()[0]?.checkpointIteration).toBe(1);
+		const next = await tool.execute('t', { action: 'next' }, undefined, undefined, fakeCtx.ctx);
+		expect(next.content[0]!.text).toContain('Checkpoint (iteration 1):');
+
+		// Completing the task clears the checkpoint.
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+		expect(readBacklog().listTasks()[0]?.checkpoint).toBeNull();
+	});
+
+	test('auto loop finish-up (checkpoint handoff) checkpoints the in-progress task; the fresh iteration is pointed at it', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		// The loop state carries the checkpoint handoff flag.
+		expect(stateEntries(fake).at(-1)!.data).toMatchObject({ enabled: true, mode: 'auto', checkpointHandoff: true });
+
+		// The finish-up records the in-progress task in its checkpoint, not a body rewrite.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		const finish = fake.userMessages.at(-1)!.text;
+		expect(finish).toContain('action "checkpoint"');
+		expect(finish).toContain('the checkpoint note and each new entry include');
+		expect(finish).not.toContain('so its body is self-contained');
+
+		// The fresh iteration's context note points at the checkpoint.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		const fresh = fake.userMessages.at(-1)!.text;
+		expect(fresh).toContain("the in-progress task's checkpoint carries where the previous iteration left off");
+	});
+
+	test('restored auto loop without the checkpoint handoff keeps the body-rewrite finish-up', async () => {
+		await writeAutoConfig();
+		await writeFile(autoFile(), RALPH_V1);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		// A loop state persisted before the checkpoint handoff existed: no
+		// checkpointHandoff field.
+		fakeCtx.branchEntries.push({
+			type: 'custom',
+			customType: 'ralph-loop-state',
+			data: {
+				enabled: true,
+				mode: 'auto',
+				todoPath: autoFile(),
+				loopStart: { ralph: true, completed: 0, openIds: [1, 2, 3], doneIds: [] },
+				baseline: { ralph: true, completed: 0, openIds: [1, 2, 3], doneIds: [] },
+				baselineTime: Date.now(),
+				iteration: 2,
+				taskIteration: 1,
+				maxIterations: 10,
+				contextThreshold: 0.5,
+				autoApproveDecisions: false,
+				cycleQueued: false,
+				cycleCheckpointing: false,
+				stopRequested: false,
+				paused: false,
+				blocked: false,
+				category: 'General'
+			}
+		});
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (auto)');
+
+		// Over budget: the finish-up still rewrites the in-progress task's body.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		const finish = fake.userMessages.at(-1)!.text;
+		expect(finish).toContain('so its body is self-contained');
+		expect(finish).not.toContain('action "checkpoint"');
+
+		// The fresh iteration's context note does not point at a checkpoint.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_update', fakeCtx.ctx);
+		const fresh = fake.userMessages.at(-1)!.text;
+		expect(fresh).not.toContain("the in-progress task's checkpoint carries");
+	});
+
 	test('ralph_todo add records a todo in the session category; complete marks it done with a log entry', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
