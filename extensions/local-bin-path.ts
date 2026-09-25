@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -20,24 +20,14 @@ export default function (pi: ExtensionAPI) {
 		return;
 	}
 
+	// Prepend .pi/bin to process.env.PATH so all bash tool spawns (including
+	// those from better-bash) inherit it. This avoids registering a competing
+	// "bash" tool that would conflict with other extensions.
+	process.env.PATH = prependPath([localBinDir], process.env.PATH);
+
 	const withLocalBin = (env: NodeJS.ProcessEnv = {}) => ({
 		...env,
 		PATH: prependPath([localBinDir], env.PATH ?? process.env.PATH),
-	});
-
-	const bashTool = createBashTool(cwd, {
-		spawnHook: ({ command, cwd, env }) => ({
-			command,
-			cwd,
-			env: withLocalBin(env),
-		}),
-	});
-
-	pi.registerTool({
-		...bashTool,
-		execute: async (id, params, signal, onUpdate, _ctx) => {
-			return bashTool.execute(id, params, signal, onUpdate);
-		},
 	});
 
 	const localBash = createLocalBashOperations();
