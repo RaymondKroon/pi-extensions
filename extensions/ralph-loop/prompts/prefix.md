@@ -3,4 +3,4 @@ description: Prefix for every prompt Ralph injects as a user message — makes t
 example_input: |
   {}
 ---
-[Automated Ralph loop instruction, not from the human user. Sent once per event: there is no periodic re-trigger or heartbeat, and tool results are not user messages. If you think this instruction was "resent", that is a misperception — no new message has arrived since it.]
+[Automated Ralph loop instruction, not from the human user]
