@@ -3340,6 +3340,33 @@ T 2 - "Port the state."
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
 	});
 
+	test('agent_settled stops the goal loop after a completion with multi-line evidence', async () => {
+		const { fake, fakeCtx, run } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
+
+		// Multi-line evidence, like a real verification note: the settle must
+		// diff the backlog by rows, not by re-parsing its own render — the
+		// rendered GE record is a multi-line quoted string the text parser
+		// cannot close (session 01a0d9e6: "line 13: unterminated quoted
+		// string" killed the settle and left the loop dangling on a done goal).
+		const result = await run({
+			action: 'complete',
+			note: 'All criteria verified:\n1. Pure JS: no dependencies.\n2. Duration 54 s: ffprobe PASS.\n3. Audio: no clipping.'
+		});
+		expect(result.terminate).toBe(true);
+
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
+		await run({ action: 'confirm' });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
+		for (const notification of fakeCtx.notifications) {
+			expect(notification.message).not.toContain('could not read');
+		}
+	});
+
 	test('agent_settled stops the goal loop when a planning iteration makes no progress', async () => {
 		const { fake, fakeCtx } = await startGoalLoopWith(GOAL_NO_TASKS);
 
