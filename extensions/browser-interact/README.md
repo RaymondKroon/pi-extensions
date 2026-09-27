@@ -90,8 +90,11 @@ the id so the model has it in context when needed.
 2. `tab_dismiss` — clear any lingering popups (they block clicks and corrupt screenshots).
 3. Interact: `tab_click` / `tab_type` / `tab_press` / `tab_navigate`.
 4. `tab_wait` after anything that changes the page — an SPA click often does not fire `load`.
-5. `tab_screenshot` every step (before/after) + `tab_console` after actions.
-6. If a click is "not found" or "covered": screenshot, look at it, fix the
+5. Use `tab_screenshot` at useful visual checkpoints—for example, before an action
+   that depends on layout or to verify an important visible change. Don't screenshot
+   before and after every action when DOM state is sufficient. Check `tab_console`
+   after actions when errors are relevant.
+6. If a click is "not found" or "covered": screenshot, inspect the page, fix the
    selector — don't retry the same call blindly.
 
 ## Files

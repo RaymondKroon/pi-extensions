@@ -291,7 +291,7 @@ export default function (pi: ExtensionAPI) {
     name: "tab_screenshot",
     label: "Tab Screenshot",
     description:
-      "Save a PNG screenshot of the target tab's viewport and return the file path (read it with the read tool). Screenshot every step of a journey, before and after each action.",
+      "Save a PNG screenshot of the target tab's viewport and return the file path (read it with the read tool). Use screenshots when visual inspection is useful, such as before a visually dependent action or to verify an important page change; don't take one before and after every action if DOM state is sufficient.",
     promptSnippet: "Screenshot the target tab to a PNG file",
     parameters: Type.Object({
       path: Type.Optional(Type.String({ description: "Output PNG path (default /tmp/tab-<host>-shot.png)" })),
