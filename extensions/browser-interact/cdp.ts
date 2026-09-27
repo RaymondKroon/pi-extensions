@@ -340,8 +340,37 @@ export class CdpManager {
           : `no page tabs found in Chrome on port ${this.port}`,
       );
     }
-    // Prefer the shortest matching URL: the app's base tab, not derived
-    // file/preview tabs that share the same host pattern.
+    // With no URL pattern, prefer Chrome's foreground tab. /json does not
+    // report which tab is active, so briefly probe each page's visibility
+    // state. If Chrome is backgrounded or probing fails, retain the historic
+    // shortest-URL fallback.
+    if (!pattern && matches.length > 1) {
+      let visibleTarget: CdpTarget | undefined;
+      for (const candidate of matches) {
+        const probeKey = `__active_probe:${candidate.id}`;
+        try {
+          const probe = await this.connect(candidate, probeKey);
+          const state = await evaluate(
+            probe,
+            "({ visible: document.visibilityState === 'visible', focused: document.hasFocus() })",
+            { timeoutMs: 2_000 },
+          );
+          this.sessions.delete(probeKey);
+          this.lastTargetId.delete(probeKey);
+          probe.close();
+          if (state?.focused) return this.connect(candidate, this.keyFor(pattern));
+          if (state?.visible && !visibleTarget) visibleTarget = candidate;
+        } catch {
+          const probe = this.sessions.get(probeKey);
+          if (probe) probe.close();
+          this.sessions.delete(probeKey);
+          this.lastTargetId.delete(probeKey);
+        }
+      }
+      if (visibleTarget) return this.connect(visibleTarget, this.keyFor(pattern));
+    }
+    // Prefer the shortest matching URL as a stable fallback: the app's base
+    // tab, not derived file/preview tabs that share the same host pattern.
     const t = [...matches].sort((a, b) => a.url.length - b.url.length)[0];
     return this.connect(t, this.keyFor(pattern));
   }

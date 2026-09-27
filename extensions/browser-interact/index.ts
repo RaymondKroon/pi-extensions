@@ -13,7 +13,7 @@
 //   1. the tool's `tab` parameter (URL substring)
 //   2. $BROWSER_INTERACT_TAB
 //   3. .pi/browser-interact.json  { "tab": "localhost:5173", "port": 9222 }
-//   4. the first page tab (shortest URL)
+//   4. the active page tab (shortest URL fallback if Chrome reports none)
 // Port: $BROWSER_INTERACT_PORT, else config `port`, else 9222.
 
 import { existsSync, readFileSync } from "node:fs";
@@ -202,7 +202,7 @@ export default function (pi: ExtensionAPI) {
   const TAB = Type.Optional(
     Type.String({
       description:
-        "URL substring identifying the target tab (default: configured tab via $BROWSER_INTERACT_TAB or .pi/browser-interact.json, else the first page tab)",
+        "URL substring identifying the target tab (default: configured tab via $BROWSER_INTERACT_TAB or .pi/browser-interact.json, else the active page tab)",
     }),
   );
 

@@ -17,7 +17,7 @@ First match wins:
 1. the tool's `tab` parameter — a URL substring, e.g. `localhost:5173`
 2. `$BROWSER_INTERACT_TAB`
 3. `.pi/browser-interact.json` — `{ "tab": "localhost:5173", "port": 9222 }`
-4. the first page tab (shortest URL — the app's base tab, not derived tabs)
+4. the active page tab (detected via `document.hasFocus()` / visibility; falls back to the shortest URL)
 
 Port: `$BROWSER_INTERACT_PORT`, else config `port`, else `9222`.
 
@@ -70,8 +70,10 @@ the pattern), then falls back to the URL pattern.
 ### Tab handles: URL substring vs target id
 
 All tools take `tab` — a URL substring (first match, shortest URL wins, sticky
-per pattern). That is cheap and readable, but ambiguous when several tabs
-share a host. For the destructive case, `tab_close` therefore also accepts the
+per pattern). Without a configured or explicit pattern, tools target Chrome's
+focused tab (or a visible tab if the browser window itself is unfocused), then
+fall back to the shortest URL. That is cheap and readable, but ambiguous when
+several tabs share a host. For the destructive case, `tab_close` therefore also accepts the
 exact CDP **target id** (stable across navigations; dies with the tab), which
 takes precedence and never guesses. `tab_status` and `tab_open` both return
 the id so the model has it in context when needed.
