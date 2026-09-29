@@ -623,6 +623,33 @@ describe('ralph-loop extension', () => {
 		expect((stateEntry?.data as { cycleReason?: string })?.cycleReason).toBe('loop-escape');
 	});
 
+	test('a disputed detection backed by progress is accepted: no forced cycle, a renewed detection re-arms', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(2); // iteration prompt + intercept
+
+		// The model disputes the detection and keeps doing actual work after
+		// it: the settle accepts the dispute instead of forcing the cut.
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash' });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+
+		// No escape cycle: the loop keeps running the current iteration.
+		expect(statusLine(fakeCtx.widgets)).not.toContain('finishing');
+		expect(fake.userMessages.length).toBe(2);
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { cycleQueued?: boolean })?.cycleQueued).toBe(false);
+
+		// A renewed detection re-arms the intercept: the safety net for a
+		// model that disputes while still not progressing.
+		fake.fireEvent('loop-police:detection', { event: 'stagnation' });
+		expect(fake.userMessages.length).toBe(3);
+	});
+
 	test('a renewed detection enforces the escape: the stuck run is aborted and the cycle queued', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1119,7 +1146,7 @@ D 3 2026-01-01T00:00:00Z
 		})) as { action: string; text: string } | undefined;
 		expect(fake.userMessages.length).toBe(1);
 		expect(transform?.action).toBe('transform');
-		expect(transform?.text).toContain('resumed the interrupted loop');
+		expect(transform?.text).toContain('this message resumes it');
 		expect(transform?.text).toContain('focus on the parser first');
 	});
 
@@ -1173,7 +1200,7 @@ D 3 2026-01-01T00:00:00Z
 		})) as { action: string; text: string } | undefined;
 		expect(fake.userMessages.length).toBe(before);
 		expect(transform?.action).toBe('transform');
-		expect(transform?.text).toContain('resumed the interrupted loop');
+		expect(transform?.text).toContain('this message resumes it');
 		expect(transform?.text).toContain('add a test for the parser');
 		// The loop is unpaused: the hint widget is gone.
 		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');

@@ -1037,9 +1037,13 @@ function completionSummary(backlog: Backlog, loopStart: LoopStartSnapshot, categ
  * Sent when a paused loop is resumed by a typed user message without a pending
  * cycle: the current iteration continues from the durable state instead of
  * starting over, and the user's message is extra info for the loop.
+ * Deliberately NOT prefixed with the automated-instruction banner: the text
+ * is the user's own words, and the heavy "not from the human user" banner
+ * misattributed the sender and primed small models to confabulate repeated
+ * resends (session 01a0ebf9: "for the 17th time, via a resume note").
  */
 function resumeWithExtraInfoPrompt(extraInfo: string): string {
-	return `${automatedPrefix()}${renderPrompt('resume-extra-info', { extraInfo })}`;
+	return renderPrompt('resume-extra-info', { extraInfo });
 }
 
 /**
@@ -1695,6 +1699,12 @@ export default function (pi: ExtensionAPI) {
 	// model), not a never-completing task, so the iteration-ended cycle must
 	// not fire for it (session 01a0c340: 20+ empty iterations cycled forever).
 	let runSawWorkToolCall = false;
+	// Count of non-ralph tool calls in the current run (runSawWorkToolCall is
+	// its boolean shadow): the loop-escape settle fallback compares it against
+	// the count at detection time to tell a disputed detection (the model kept
+	// doing work after the intercept) from an ignored one (it only talked back
+	// or kept thinking).
+	let runWorkToolCallCount = 0;
 	// The ralph-provided compaction pending for the in-flight cycle:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
@@ -1717,9 +1727,17 @@ export default function (pi: ExtensionAPI) {
 	// looping model sometimes ignores it, so a renewed detection enforces the
 	// escape (abort + cycle) and the next settle queues the escape cycle as a
 	// fallback — the context cut must not depend on the stuck model's
-	// cooperation. Cleared when any cycle is queued, when the loop stops, and
-	// at the settle that consumes it.
+	// cooperation. The settle fallback yields to a disputed detection: work
+	// tool calls after the detection mean the model was making progress, and
+	// the dispute is accepted instead of the forced cut. Cleared when any
+	// cycle is queued, when the loop stops, and at the settle that consumes it.
 	let loopEscapePending = false;
+	// Work tool calls made when the loop-escape intercept was armed: if more
+	// have been made by the settle, the model disputed the detection with
+	// progress — the settle accepts the dispute instead of forcing the cut
+	// (a renewed detection still enforces the escape). Cleared with
+	// loopEscapePending.
+	let workToolCallsAtEscape = 0;
 	// Set when the extension itself aborts the run to enforce a loop escape:
 	// the settle must not treat that abort as a user Escape (which would pause
 	// the loop) — the escape cycle is already queued and its recording turn
@@ -3172,6 +3190,7 @@ export default function (pi: ExtensionAPI) {
 		loopPoliceEvent = undefined;
 		lastAssistantStopReason = undefined;
 		runSawWorkToolCall = false;
+		runWorkToolCallCount = 0;
 		runSawAssistantMessage = true;
 		runAbortedByUser = false;
 		runSignal = undefined;
@@ -3412,9 +3431,11 @@ export default function (pi: ExtensionAPI) {
 			systemPrompt:
 				`${event.systemPrompt}\n\n` +
 				'Ralph loop: the loop never re-sends its instructions; there is no periodic re-trigger. ' +
-				'While the loop runs, the only new inputs are tool results and user messages carrying the ' +
-				'"[Automated Ralph loop instruction...]" prefix. If your earlier reasoning says an instruction ' +
-				'was "resent" or "periodically re-triggered", that is a misperception — no such message exists. ' +
+				'While the loop runs, the only new inputs are tool results and user messages (loop-injected ' +
+				'ones carry the "[Automated Ralph loop instruction...]" prefix). Each user message appears in ' +
+				'the context exactly once. If your earlier reasoning says an instruction was "resent" or ' +
+				'"periodically re-triggered", or that the user sent the same message multiple times, that is a ' +
+				'misperception — count the actual user messages before believing it. ' +
 				'Continue the current task from the tool results.'
 		};
 	});
@@ -3429,6 +3450,7 @@ export default function (pi: ExtensionAPI) {
 		loopPoliceEvent = undefined;
 		lastAssistantStopReason = undefined;
 		runSawWorkToolCall = false;
+		runWorkToolCallCount = 0;
 		runSawAssistantMessage = false;
 		runAbortedByUser = false;
 		runSignal = (ctx as { signal?: AbortSignal }).signal;
@@ -3443,7 +3465,10 @@ export default function (pi: ExtensionAPI) {
 	// Escape, so the result text is deliberately not inspected.
 	pi.on('tool_execution_end', (event, ctx) => {
 		const toolName = (event as { toolName?: string }).toolName;
-		if (toolName && !RALPH_TOOL_NAMES.includes(toolName)) runSawWorkToolCall = true;
+		if (toolName && !RALPH_TOOL_NAMES.includes(toolName)) {
+			runSawWorkToolCall = true;
+			runWorkToolCallCount++;
+		}
 		if ((ctx as { signal?: AbortSignal }).signal?.aborted) {
 			runAbortedByUser = true;
 		}
@@ -3501,6 +3526,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			loopEscapePending = true;
+			workToolCallsAtEscape = runWorkToolCallCount;
 			if (LOOP_POLICE_STREAM_EVENTS.has(event)) {
 				// The run is being aborted: a steer now would join the dying run
 				// and be dropped (pi ends the run on an aborted stop without
@@ -3676,11 +3702,20 @@ export default function (pi: ExtensionAPI) {
 		// settles without a queued cycle, queue the escape cycle ourselves.
 		// The model-requested cycle (with its stuck-pattern note) always wins
 		// when the model did comply; a requested stop still ends the loop.
+		// A disputed detection is accepted when the model backed it with
+		// progress: work tool calls after the detection mean it was not stuck
+		// (the intercept explicitly allows the dispute). A renewed detection
+		// while it is still not progressing enforces the escape, so accepting
+		// a dispute cannot spin the loop without work.
 		if (loopEscapePending) {
 			loopEscapePending = false;
 			if (!state.cycleQueued && !state.stopRequested) {
-				queueCycle(ctx, 'loop-escape');
-				return;
+				if (runWorkToolCallCount > workToolCallsAtEscape) {
+					ctx.ui.notify('Ralph: loop detection disputed — the model made progress since the detection; letting it continue', 'info');
+				} else {
+					queueCycle(ctx, 'loop-escape');
+					return;
+				}
 			}
 		}
 		if (state.cycleQueued) {

@@ -681,7 +681,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				const text = lastUserText(body);
 				if (text.includes('Finish up now')) return textResponder('Finished up; todos recorded.')(body);
 				if (text.includes('Run the Ralph loop')) return textResponder('Continuing from the checkpoint.')(body);
-				if (text.includes('resumed the interrupted loop')) return textResponder('Continuing the interrupted iteration.')(body);
+				if (text.includes('this message resumes it')) return textResponder('Continuing the interrupted iteration.')(body);
 				return endlessWork(body);
 			};
 			endpoint = startMockEndpoint(
@@ -712,7 +712,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// message history, so only the last user message counts.)
 			await new Promise((r) => setTimeout(r, 2000));
 			const afterAbort = endpoint!.requests.slice(countAtAbort);
-			const continuationTexts = ['Run the Ralph loop', 'Finish up now', 'resumed the interrupted loop'];
+			const continuationTexts = ['Run the Ralph loop', 'Finish up now', 'this message resumes it'];
 			expect(afterAbort.every((r) => continuationTexts.every((t) => !lastUserText(r.body).includes(t)))).toBe(true);
 
 			// A typed message resumes the loop: a post-abort request is triggered
@@ -723,7 +723,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				() =>
 					endpoint!.requests
 						.slice(countAtAbort)
-						.some((r) => lastUserText(r.body).includes('Finish up now') || lastUserText(r.body).includes('resumed the interrupted loop')),
+						.some((r) => lastUserText(r.body).includes('Finish up now') || lastUserText(r.body).includes('this message resumes it')),
 				'post-resume request',
 				30000
 			);
