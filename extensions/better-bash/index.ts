@@ -1087,7 +1087,7 @@ export default function (pi: ExtensionAPI) {
       .sort((a, b) => a - b);
     const activeJobs = activeIds.length > 0 ? activeIds.join(", ") : "none";
     return (
-      `No persisted record for job j${id} in this session. Call the jobs tool with no arguments to list recoverable jobs. ` +
+      `No persisted record for job j${id} in this session. Call jobs {"action":"list"} to list recoverable jobs. ` +
       `Current active jobs are: ${activeJobs}.`
     );
   };
@@ -1362,7 +1362,7 @@ export default function (pi: ExtensionAPI) {
     label: bashMeta.label,
     description:
       bashMeta.description +
-      " Pass background: true to run a long command as a tracked background job: the call returns immediately with a job id, pid, and log path, and the job keeps running (its timeout becomes a kill deadline, exempt from the cap). Wait on it with wait_for {job: N} or alarm {job: N}; list or kill it with the jobs tool. Do not background commands with &, nohup, or $! — those are blocked.",
+      " Pass background: true to run a long command as a tracked background job: the call returns immediately with a job id, pid, and log path, and the job keeps running (its timeout becomes a kill deadline, exempt from the cap). Wait on it with wait_for {job: N} or alarm {job: N}; list with jobs {\"action\":\"list\"} or kill with jobs {\"action\":\"kill\",\"jobId\":N}. Do not background commands with &, nohup, or $! — those are blocked.",
     promptSnippet: bashMeta.promptSnippet,
     promptGuidelines: [
       ...(bashMeta.promptGuidelines ?? []),
@@ -1386,7 +1386,7 @@ export default function (pi: ExtensionAPI) {
           `pid: ${entry.pid}`,
           `log: ${entry.logPath}`,
           params.timeout ? `kill deadline: ${params.timeout}s` : null,
-          `Its tracking is saved for this session, so wait_for/jobs can recover it after reload or resume. Use wait_for {job: ${entry.id}} or alarm {job: ${entry.id}}; list or kill it with the jobs tool.`,
+          `Its tracking is saved for this session, so wait_for/jobs can recover it after reload or resume. Use wait_for {job: ${entry.id}} or alarm {job: ${entry.id}}; list with jobs {"action":"list"} or kill with jobs {"action":"kill","jobId":${entry.id}}.`,
         ].filter(Boolean);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -1452,7 +1452,7 @@ export default function (pi: ExtensionAPI) {
       "Job metadata is saved per session and restored after extension reload/resume; if a process exits while pi is offline, its exit code may be unavailable but its log remains. " +
       "For an external process or other condition, provide a one-shot `command` and omit `job`. The condition is re-run every `interval` seconds, so do not put loops or sleep inside it.",
     promptGuidelines: [
-      "When calling wait_for, include exactly one of `job` or `command` and omit the other property entirely (do not send an empty command). For a displayed job `jN`, pass `job: N`; if it is missing, call the `jobs` tool with no arguments to list jobs restored for this session. If still missing, use the PID/log from the original start result. For an external condition, send only `command`.",
+      "When calling wait_for, include exactly one of `job` or `command` and omit the other property entirely (do not send an empty command). For a displayed job `jN`, pass `job: N`; if it is missing, call `jobs {\"action\":\"list\"}` to list jobs restored for this session. If still missing, use the PID/log from the original start result. For an external condition, send only `command`.",
     ],
     parameters: Type.Object({
       job: Type.Optional(Type.Number({
@@ -1508,7 +1508,7 @@ export default function (pi: ExtensionAPI) {
         const alternatives = [
           registry.jobs.has(params.job!)
             ? `- Wait for tracked job j${params.job}: \`wait_for ${JSON.stringify(withOptions({ job: params.job }))}\``
-            : `- Wait for a tracked job: call \`jobs\` for a valid id, then call \`wait_for {\"job\": N}\`.`,
+            : `- Wait for a tracked job: call \`jobs {"action":"list"}\` for a valid id, then call \`wait_for {\"job\": N}\`.`,
           hasCommand
             ? `- Poll the supplied condition: \`wait_for ${JSON.stringify(withOptions({ command: params.command! }))}\``
             : "- Poll a condition: provide a non-empty `command` and omit `job`.",
@@ -1530,7 +1530,7 @@ export default function (pi: ExtensionAPI) {
             type: "text",
             text:
               "Invalid wait_for arguments: no job or condition was supplied. Choose exactly one:\n" +
-              "- Wait for a tracked job: `wait_for {\"job\": N}` (use a numeric id from `jobs` or the bash background-job result; displayed `j22` means 22).\n" +
+              "- Wait for a tracked job: `wait_for {\"job\": N}` (use a numeric id from `jobs {\"action\":\"list\"}` or the bash background-job result; displayed `j22` means 22).\n" +
               "- Poll a condition: `wait_for {\"command\": \"<one-shot shell test>\"}`.\n" +
               "Omit the other field.",
           }],
@@ -1723,7 +1723,7 @@ export default function (pi: ExtensionAPI) {
 
       if (params.job != null && !registry.jobs.has(params.job)) {
         return {
-          content: [{ type: "text", text: `No job with id ${params.job} — use the jobs tool to list tracked jobs.` }],
+          content: [{ type: "text", text: `No job with id ${params.job} — use jobs {"action":"list"} to list tracked jobs.` }],
           isError: true,
           details: undefined,
         };
@@ -1852,21 +1852,33 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ---- jobs: list or kill tracked background jobs ----
-  const jobsParamsSchema = Type.Object({
-    kill: Type.Optional(Type.Number({ description: "Job id to terminate (SIGTERM to its whole process tree) instead of listing." })),
-  });
+  const jobsParamsSchema = Type.Union([
+    Type.Object({ action: Type.Literal("list") }),
+    Type.Object({
+      action: Type.Literal("kill"),
+      jobId: Type.Integer({ minimum: 1, description: "Job id to terminate (SIGTERM to its whole process tree)." }),
+    }),
+  ]);
   pi.registerTool<typeof jobsParamsSchema, { killed?: number; jobs?: string[] } | undefined>({
     name: "jobs",
     label: "Jobs",
     description:
-      "List background jobs saved for this session (including jobs restored after extension reload/resume) with id, status, pid, runtime, exit code, and log path — or kill one. Call with no arguments to list jobs. If a process exited while pi was offline, its exit code may be unavailable.",
+      "Use action `list` to show jobs saved for this session (including jobs restored after extension reload/resume), with status, pid, runtime, exit code, and log path. Use action `kill` with a positive jobId to send SIGTERM to that job's whole process tree. A process that exited while pi was offline may have an unknown exit code.",
     parameters: jobsParamsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const registry = getJobRegistry(ctx);
-      if (params.kill != null) {
-        const job = registry.jobs.get(params.kill);
+      if ((params as { action?: unknown }).action === "kill") {
+        const jobId = (params as { jobId?: number }).jobId;
+        if (!Number.isSafeInteger(jobId) || jobId! < 1) {
+          return {
+            content: [{ type: "text", text: "Invalid jobs request: action `kill` requires a positive integer `jobId`. Use {\"action\":\"list\"} to list jobs." }],
+            isError: true,
+            details: undefined,
+          };
+        }
+        const job = registry.jobs.get(jobId!);
         if (!job) {
-          return { content: [{ type: "text", text: missingJobMessage(params.kill, registry) }], isError: true, details: undefined };
+          return { content: [{ type: "text", text: missingJobMessage(jobId!, registry) }], isError: true, details: undefined };
         }
         refreshRestoredJob(registry, job);
         if (job.exitCode != null || job.exitedAt != null) {
@@ -1889,6 +1901,13 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: `Sent SIGTERM to job j${job.id} (pid ${job.pid}).` }],
           details: { killed: job.id },
+        };
+      }
+      if ((params as { action?: unknown }).action !== "list") {
+        return {
+          content: [{ type: "text", text: "Invalid jobs request. Choose action `list` or `kill` with a positive integer `jobId`." }],
+          isError: true,
+          details: undefined,
         };
       }
       for (const job of registry.jobs.values()) refreshRestoredJob(registry, job);

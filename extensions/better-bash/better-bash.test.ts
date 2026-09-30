@@ -43,6 +43,11 @@ function createJobHarness(sessionId: string, sessionDir: string) {
     },
   };
   return {
+    schema(name: string) {
+      const tool = tools.get(name);
+      if (!tool) throw new Error(`Tool ${name} was not registered`);
+      return tool.parameters;
+    },
     async call(name: string, params: Record<string, unknown>) {
       const tool = tools.get(name);
       if (!tool) throw new Error(`Tool ${name} was not registered`);
@@ -322,6 +327,10 @@ describe("background-job recovery integration", () => {
     const sessionDir = createSessionDir();
     const sessionId = "resume-live-job";
     const first = createJobHarness(sessionId, sessionDir);
+    const jobsSchema = first.schema("jobs");
+    expect(jobsSchema.anyOf.map((branch: any) => branch.properties.action.const)).toEqual(["list", "kill"]);
+    expect(jobsSchema.anyOf.map((branch: any) => branch.required)).toEqual([["action"], ["action", "jobId"]]);
+    expect(jobsSchema.anyOf[1].properties.jobId.minimum).toBe(1);
     const started = await first.call("bash", {
       command: `node -e 'console.log("recovered-output"); setTimeout(() => {}, 1500)'`,
       background: true,
@@ -330,13 +339,21 @@ describe("background-job recovery integration", () => {
     expect(pid).toBeGreaterThan(0);
     integrationProcessGroups.push(pid);
 
-    const invalidJob = await first.call("jobs", { kill: 0 });
+    const missingAction = await first.call("jobs", {});
+    expect(resultText(missingAction)).toBe(
+      "Invalid jobs request. Choose action `list` or `kill` with a positive integer `jobId`.",
+    );
+    const invalidJob = await first.call("jobs", { action: "kill", jobId: 0 });
     expect(resultText(invalidJob)).toBe(
-      "No persisted record for job j0 in this session. Call the jobs tool with no arguments to list recoverable jobs. Current active jobs are: 1.",
+      "Invalid jobs request: action `kill` requires a positive integer `jobId`. Use {\"action\":\"list\"} to list jobs.",
+    );
+    const missingJob = await first.call("jobs", { action: "kill", jobId: 99 });
+    expect(resultText(missingJob)).toBe(
+      "No persisted record for job j99 in this session. Call jobs {\"action\":\"list\"} to list recoverable jobs. Current active jobs are: 1.",
     );
 
     const resumed = createJobHarness(sessionId, sessionDir);
-    const listing = await resumed.call("jobs", {});
+    const listing = await resumed.call("jobs", { action: "list" });
     expect(resultText(listing)).toContain("j1  running");
     expect(resultText(listing)).toContain(`pid ${pid}`);
 
@@ -352,6 +369,12 @@ describe("background-job recovery integration", () => {
     const nextPid = Number(resultText(next).match(/pid: (\d+)/)?.[1]);
     expect(nextPid).toBeGreaterThan(0);
     integrationProcessGroups.push(nextPid);
+    expect(resultText(await resumed.call("jobs", { action: "list" }))).toContain(`j2  running (pid ${nextPid})`);
+    const killed = await resumed.call("jobs", { action: "kill", jobId: 2 });
+    expect(resultText(killed)).toContain(`Sent SIGTERM to job j2 (pid ${nextPid}).`);
+    await waitUntil(() => {
+      try { process.kill(nextPid, 0); return false; } catch { return true; }
+    });
   }, 15_000);
 
   test("a process that exited while pi was offline is recovered with unknown exit code", async () => {
@@ -378,7 +401,7 @@ describe("background-job recovery integration", () => {
     writeFileSync(filePath, JSON.stringify(registry));
 
     const resumed = createJobHarness(sessionId, sessionDir);
-    const listing = await resumed.call("jobs", {});
+    const listing = await resumed.call("jobs", { action: "list" });
     expect(resultText(listing)).toContain("j1  exited (exit code unavailable)");
     const waited = await resumed.call("wait_for", { job: 1, timeout: 1, interval: 1 });
     expect(resultText(waited)).toContain("process ended while pi was offline; exit code unavailable");
@@ -425,15 +448,15 @@ describe("background-job recovery integration", () => {
     }));
 
     const resumed = createJobHarness(sessionId, sessionDir);
-    const listing = await resumed.call("jobs", {});
+    const listing = await resumed.call("jobs", { action: "list" });
     expect(resultText(listing)).toContain("j1  exited (exit code unavailable)");
     expect(resultText(listing)).toContain("j2  exited (exit code unavailable)");
     expect(resultText(listing)).toContain(`j3  unknown (pid ${pid} not verified)`);
     for (const id of [1, 2]) {
-      const killed = await resumed.call("jobs", { kill: id });
+      const killed = await resumed.call("jobs", { action: "kill", jobId: id });
       expect(resultText(killed)).toContain("process is gone (exit code unavailable)");
     }
-    const legacyKill = await resumed.call("jobs", { kill: 3 });
+    const legacyKill = await resumed.call("jobs", { action: "kill", jobId: 3 });
     expect(resultText(legacyKill)).toContain("cannot be safely verified after reload");
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(existsSync(signaledPath)).toBe(false);
@@ -458,7 +481,7 @@ describe("background-job recovery integration", () => {
     writeFileSync(filePath, JSON.stringify(registry));
 
     const resumed = createJobHarness("deadline-session", sessionDir);
-    expect(resultText(await resumed.call("jobs", {}))).toContain("j1  running");
+    expect(resultText(await resumed.call("jobs", { action: "list" }))).toContain("j1  running");
     const waited = await resumed.call("wait_for", { job: 1, timeout: 5, interval: 1 });
     expect(resultText(waited)).toMatch(/Job j1 (finished with exit code 0|process ended while pi was offline)/);
     await waitUntil(() => {
@@ -466,7 +489,7 @@ describe("background-job recovery integration", () => {
     });
 
     const isolated = createJobHarness("other-session", sessionDir);
-    expect(resultText(await isolated.call("jobs", {}))).toContain("No recoverable background jobs");
+    expect(resultText(await isolated.call("jobs", { action: "list" }))).toContain("No recoverable background jobs");
     const otherStarted = await isolated.call("bash", {
       command: `node -e 'setTimeout(() => {}, 10000)'`,
       background: true,
@@ -474,8 +497,8 @@ describe("background-job recovery integration", () => {
     const otherPid = Number(resultText(otherStarted).match(/pid: (\d+)/)?.[1]);
     expect(otherPid).toBeGreaterThan(0);
     integrationProcessGroups.push(otherPid);
-    expect(resultText(await isolated.call("jobs", {}))).toContain("j1  running");
-    expect(resultText(await resumed.call("jobs", {}))).toContain("j1  exited");
+    expect(resultText(await isolated.call("jobs", { action: "list" }))).toContain("j1  running");
+    expect(resultText(await resumed.call("jobs", { action: "list" }))).toContain("j1  exited");
   }, 15_000);
 });
 

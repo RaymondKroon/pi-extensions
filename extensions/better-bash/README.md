@@ -41,9 +41,10 @@ Wait discipline for pi's `bash` tool. (Formerly `require-bash-timeout.ts`.)
    - `alarm` — schedule a later wake-up (timed, job-based, or
      condition-based, with `list` / `cancel` / `repeat`) so the agent can
      do other work.
-   - `jobs` — list this session's recoverable jobs (status, pid, runtime,
-     exit code, log path) or kill one (`kill: N`, SIGTERM to the whole process
-     tree). Call with no arguments to list.
+   - `jobs` — use `{"action":"list"}` to show this session's recoverable jobs
+     (status, pid, runtime, exit code, log path), or
+     `{"action":"kill","jobId":N}` to SIGTERM a job's whole process tree.
+     Kill IDs must be positive integers; zero is invalid.
 
 ## Condition guards
 
