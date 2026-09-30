@@ -1080,9 +1080,15 @@ export default function (pi: ExtensionAPI) {
   // ---- background jobs (bash background: true) ----
   const jobRegistries = new Map<string, JobRegistry>();
 
-  const missingJobMessage = (id: number, action: "wait" | "kill"): string => {
+  const missingJobMessage = (id: number, action: "wait" | "kill", registry: JobRegistry): string => {
+    const activeIds = [...registry.jobs.values()]
+      .filter((job) => job.exitCode == null && job.exitedAt == null)
+      .map((job) => job.id)
+      .sort((a, b) => a - b);
+    const activeJobs = activeIds.length > 0 ? activeIds.join(", ") : "none";
     const status =
       `No persisted record for job j${id} in this session. Call the jobs tool with no arguments to list recoverable jobs. ` +
+      `Current active jobs are: ${activeJobs}. ` +
       `Jobs started before persistence was enabled, or after their registry was deleted, cannot be recovered by job id. ` +
       "If you have the original start result, use its PID and log path.";
     if (process.platform === "win32") {
@@ -1552,7 +1558,7 @@ export default function (pi: ExtensionAPI) {
         const job = registry.jobs.get(params.job);
         if (!job) {
           return {
-            content: [{ type: "text", text: missingJobMessage(params.job, "wait") }],
+            content: [{ type: "text", text: missingJobMessage(params.job, "wait", registry) }],
             isError: true,
             details: { met: false, blocked: true },
           };
@@ -1871,7 +1877,7 @@ export default function (pi: ExtensionAPI) {
       if (params.kill != null) {
         const job = registry.jobs.get(params.kill);
         if (!job) {
-          return { content: [{ type: "text", text: missingJobMessage(params.kill, "kill") }], isError: true, details: undefined };
+          return { content: [{ type: "text", text: missingJobMessage(params.kill, "kill", registry) }], isError: true, details: undefined };
         }
         refreshRestoredJob(registry, job);
         if (job.exitCode != null || job.exitedAt != null) {
