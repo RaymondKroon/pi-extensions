@@ -331,8 +331,9 @@ describe("background-job recovery integration", () => {
     integrationProcessGroups.push(pid);
 
     const invalidJob = await first.call("jobs", { kill: 0 });
-    expect(resultText(invalidJob)).toContain("No persisted record for job j0 in this session.");
-    expect(resultText(invalidJob)).toContain("Current active jobs are: 1.");
+    expect(resultText(invalidJob)).toBe(
+      "No persisted record for job j0 in this session. Call the jobs tool with no arguments to list recoverable jobs. Current active jobs are: 1.",
+    );
 
     const resumed = createJobHarness(sessionId, sessionDir);
     const listing = await resumed.call("jobs", {});

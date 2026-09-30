@@ -1080,27 +1080,16 @@ export default function (pi: ExtensionAPI) {
   // ---- background jobs (bash background: true) ----
   const jobRegistries = new Map<string, JobRegistry>();
 
-  const missingJobMessage = (id: number, action: "wait" | "kill", registry: JobRegistry): string => {
+  const missingJobMessage = (id: number, registry: JobRegistry): string => {
     const activeIds = [...registry.jobs.values()]
       .filter((job) => job.exitCode == null && job.exitedAt == null)
       .map((job) => job.id)
       .sort((a, b) => a - b);
     const activeJobs = activeIds.length > 0 ? activeIds.join(", ") : "none";
-    const status =
+    return (
       `No persisted record for job j${id} in this session. Call the jobs tool with no arguments to list recoverable jobs. ` +
-      `Current active jobs are: ${activeJobs}. ` +
-      `Jobs started before persistence was enabled, or after their registry was deleted, cannot be recovered by job id. ` +
-      "If you have the original start result, use its PID and log path.";
-    if (process.platform === "win32") {
-      const next = action === "wait"
-        ? 'Verify with "Get-Process -Id PID"; wait for exit with wait_for {"command":"if (Get-Process -Id PID -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }"}.'
-        : 'Verify with "Get-Process -Id PID"; stop the process tree with "taskkill /PID PID /T".';
-      return `${status} Check the saved log with "Get-Content -Tail 50 LOG_PATH". ${next}`;
-    }
-    const next = action === "wait"
-      ? 'Wait for the process to exit with wait_for {"command":"! kill -0 PID 2>/dev/null"}.'
-      : 'After verifying the PID, stop its process group with "kill -TERM -- -PID".';
-    return `${status} Verify with "ps -p PID -o pid,cmd" and inspect the log with "tail -n 50 LOG_PATH". ${next}`;
+      `Current active jobs are: ${activeJobs}.`
+    );
   };
 
   const unverifiedJobMessage = (job: JobEntry, action: "wait" | "kill"): string => {
@@ -1558,7 +1547,7 @@ export default function (pi: ExtensionAPI) {
         const job = registry.jobs.get(params.job);
         if (!job) {
           return {
-            content: [{ type: "text", text: missingJobMessage(params.job, "wait", registry) }],
+            content: [{ type: "text", text: missingJobMessage(params.job, registry) }],
             isError: true,
             details: { met: false, blocked: true },
           };
@@ -1877,7 +1866,7 @@ export default function (pi: ExtensionAPI) {
       if (params.kill != null) {
         const job = registry.jobs.get(params.kill);
         if (!job) {
-          return { content: [{ type: "text", text: missingJobMessage(params.kill, "kill", registry) }], isError: true, details: undefined };
+          return { content: [{ type: "text", text: missingJobMessage(params.kill, registry) }], isError: true, details: undefined };
         }
         refreshRestoredJob(registry, job);
         if (job.exitCode != null || job.exitedAt != null) {
