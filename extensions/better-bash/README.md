@@ -19,7 +19,12 @@ Wait discipline for pi's `bash` tool. (Formerly `require-bash-timeout.ts`.)
    spawn, so it reaps the child and knows the **exit code** — no `$!`
    parsing, no `/proc` guessing by the model. With `background: true` the
    `timeout` parameter becomes the job's kill deadline (exempt from the
-   cap). Jobs survive the session ending (nohup semantics).
+   cap). Job metadata is saved per session and restored after extension
+   reload/resume. On Linux, restored PIDs are checked against their saved
+   `/proc` start-time token before signaling, including when a kill deadline
+   fires; unverifiable PIDs are never signaled. If the process exits while pi
+   is offline, its exit code may be unavailable, but the process status and log
+   remain recoverable.
 4. **No manual backgrounding.** Bare `&` operators, `$!`, and daemon
    launchers at command position (`nohup`, `disown`, `setsid`) are blocked
    with a reason steering the model to `background: true` —
@@ -29,13 +34,16 @@ Wait discipline for pi's `bash` tool. (Formerly `require-bash-timeout.ts`.)
 5. **`wait_for` / `alarm` / `jobs` tools** for waiting on background work
    without busy-waiting:
    - `wait_for` — block (up to the cap) until a job finishes (`job: N`) or
-     a shell condition exits 0 (`command`). Job waits report the exit code
-     and, on failure, the last log lines.
+     a shell condition exits 0 (`command`). Pass **exactly one** of those
+     fields and omit the other entirely: a displayed job `j22` means
+     `job: 22` (job ids start at 1); for a condition, pass only `command`.
+     Job waits report the exit code and, on failure, the last log lines.
    - `alarm` — schedule a later wake-up (timed, job-based, or
      condition-based, with `list` / `cancel` / `repeat`) so the agent can
      do other work.
-   - `jobs` — list tracked jobs (status, pid, runtime, exit code, log
-     path) or kill one (`kill: N`, SIGTERM to the whole process tree).
+   - `jobs` — list this session's recoverable jobs (status, pid, runtime,
+     exit code, log path) or kill one (`kill: N`, SIGTERM to the whole process
+     tree). Call with no arguments to list.
 
 ## Condition guards
 

@@ -8,9 +8,9 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
-import { closeSync, openSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /**
  * better-bash — wait discipline for the bash tool.
@@ -683,11 +683,62 @@ interface JobEntry {
   exitCode: number | null;
   exitedAt: number | null;
   killTimer?: NodeJS.Timeout;
+  /** Linux /proc start-time token used to distinguish this process from a reused PID after reload. */
+  processStartToken?: string;
+  killDeadlineAt?: number;
+  /** True when reconstructed from disk rather than launched by this extension instance. */
+  restored?: boolean;
+  /** Whether the restored PID was verified as the original process. */
+  processVerified?: boolean;
+}
+
+interface JobRegistry {
+  sessionId: string;
+  filePath: string;
+  nextId: number;
+  jobs: Map<number, JobEntry>;
 }
 
 /** Truncate a command for a single-line tool-call display. */
 function clipCommand(cmd: string, max = 80): string {
   return cmd.length > max ? `${cmd.slice(0, max - 1)}…` : cmd;
+}
+
+/** Linux process start time (field 22 of /proc/PID/stat), stable across extension reloads. */
+function readProcessStartToken(pid: number): string | undefined {
+  if (process.platform !== "linux" || pid <= 0) return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closeParen = stat.lastIndexOf(")");
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+    return fields[19];
+  } catch {
+    return undefined;
+  }
+}
+
+function processExists(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function serializeJob(job: JobEntry) {
+  return {
+    id: job.id,
+    pid: job.pid,
+    command: job.command,
+    logPath: job.logPath,
+    startedAt: job.startedAt,
+    exitCode: job.exitCode,
+    exitedAt: job.exitedAt,
+    processStartToken: job.processStartToken,
+    killDeadlineAt: job.killDeadlineAt,
+  };
 }
 
 /** Extract the patterns of `pgrep -f` / `pkill -f` invocations in a shell command. */
@@ -1016,8 +1067,162 @@ export default function (pi: ExtensionAPI) {
   let alarmSeq = 0;
 
   // ---- background jobs (bash background: true) ----
-  const jobs = new Map<number, JobEntry>();
-  let jobSeq = 0;
+  const jobRegistries = new Map<string, JobRegistry>();
+
+  const missingJobMessage = (id: number, action: "wait" | "kill"): string => {
+    const status =
+      `No persisted record for job j${id} in this session. Call the jobs tool with no arguments to list recoverable jobs. ` +
+      `Jobs started before persistence was enabled, or after their registry was deleted, cannot be recovered by job id. ` +
+      "If you have the original start result, use its PID and log path.";
+    if (process.platform === "win32") {
+      const next = action === "wait"
+        ? 'Verify with "Get-Process -Id PID"; wait for exit with wait_for {"command":"if (Get-Process -Id PID -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }"}.'
+        : 'Verify with "Get-Process -Id PID"; stop the process tree with "taskkill /PID PID /T".';
+      return `${status} Check the saved log with "Get-Content -Tail 50 LOG_PATH". ${next}`;
+    }
+    const next = action === "wait"
+      ? 'Wait for the process to exit with wait_for {"command":"! kill -0 PID 2>/dev/null"}.'
+      : 'After verifying the PID, stop its process group with "kill -TERM -- -PID".';
+    return `${status} Verify with "ps -p PID -o pid,cmd" and inspect the log with "tail -n 50 LOG_PATH". ${next}`;
+  };
+
+  const unverifiedJobMessage = (job: JobEntry, action: "wait" | "kill"): string => {
+    const status = `Job j${job.id} is saved, but PID ${job.pid} cannot be safely verified after reload. I will not signal a possibly reused PID. `;
+    if (process.platform === "win32") {
+      return `${status}Confirm it with Get-Process -Id ${job.pid}; inspect the log with Get-Content -Tail 50 "${job.logPath}". ` +
+        (action === "wait"
+          ? `After confirming, wait with a process check for PID ${job.pid}.`
+          : `After confirming, stop its process tree with taskkill /PID ${job.pid} /T.`);
+    }
+    return `${status}Confirm it with ps -p ${job.pid} -o pid,cmd; inspect the log with tail -n 50 "${job.logPath}". ` +
+      (action === "wait"
+        ? `After confirming, wait with wait_for {"command":"! kill -0 ${job.pid} 2>/dev/null"}.`
+        : `After confirming, stop its process group with kill -TERM -- -${job.pid}.`);
+  };
+
+  const registryPathFor = (ctx: { sessionManager: { getSessionId(): string; getSessionDir(): string } }): { sessionId: string; filePath: string } => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const safeId = sessionId.replace(/[^A-Za-z0-9._-]/g, "_");
+    return {
+      sessionId,
+      filePath: join(ctx.sessionManager.getSessionDir(), "better-bash-jobs", `${safeId}.json`),
+    };
+  };
+
+  const readRegistryFile = (filePath: string): { version: number; nextId: number; jobs: unknown[] } | undefined => {
+    try {
+      const value = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+      if (value.version !== 1 || !Array.isArray(value.jobs)) return undefined;
+      return {
+        version: 1,
+        nextId: typeof value.nextId === "number" ? value.nextId : 0,
+        jobs: value.jobs,
+      };
+    } catch {
+      return undefined;
+    }
+  };
+
+  const persistJobEntry = (registry: JobRegistry, job: JobEntry): void => {
+    const previous = readRegistryFile(registry.filePath);
+    const records = new Map<number, ReturnType<typeof serializeJob>>();
+    for (const item of previous?.jobs ?? []) {
+      if (item && typeof item === "object" && typeof (item as { id?: unknown }).id === "number") {
+        records.set((item as { id: number }).id, item as ReturnType<typeof serializeJob>);
+      }
+    }
+    records.set(job.id, serializeJob(job));
+    const nextId = Math.max(registry.nextId, previous?.nextId ?? 0, job.id);
+    const payload = JSON.stringify({ version: 1, nextId, jobs: [...records.values()] });
+    mkdirSync(dirname(registry.filePath), { recursive: true });
+    const tempPath = `${registry.filePath}.${process.pid}.tmp`;
+    writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600 });
+    try {
+      renameSync(tempPath, registry.filePath);
+    } catch {
+      writeFileSync(registry.filePath, payload, { encoding: "utf8", mode: 0o600 });
+      try { unlinkSync(tempPath); } catch { /* fallback write may have moved it */ }
+    }
+  };
+
+  const savedJobEntry = (registry: JobRegistry, id: number): Partial<JobEntry> | undefined => {
+    const item = readRegistryFile(registry.filePath)?.jobs.find(
+      (entry) => entry && typeof entry === "object" && (entry as { id?: unknown }).id === id,
+    );
+    return item && typeof item === "object" ? item as Partial<JobEntry> : undefined;
+  };
+
+  const refreshRestoredJob = (registry: JobRegistry, job: JobEntry): void => {
+    if (!job.restored || job.exitCode != null || job.exitedAt != null) return;
+
+    // A previous extension instance may have recorded the real exit code after this one loaded.
+    const saved = savedJobEntry(registry, job.id);
+    if (saved && (saved.exitCode != null || saved.exitedAt != null)) {
+      job.exitCode = saved.exitCode ?? null;
+      job.exitedAt = saved.exitedAt ?? null;
+      return;
+    }
+
+    const alive = processExists(job.pid);
+    if (!alive) {
+      job.exitedAt = Date.now();
+      job.processVerified = false;
+      persistJobEntry(registry, job);
+      return;
+    }
+    const currentToken = readProcessStartToken(job.pid);
+    if (job.processStartToken && currentToken === job.processStartToken) {
+      job.processVerified = true;
+    } else if (job.processStartToken && currentToken && currentToken !== job.processStartToken) {
+      // PID was reused: the original job process is gone; do not signal this process.
+      job.exitedAt = Date.now();
+      job.processVerified = false;
+      persistJobEntry(registry, job);
+    } else {
+      // On platforms without a reliable process identity token, leave it unverified.
+      job.processVerified = false;
+    }
+  };
+
+  const getJobRegistry = (ctx: { sessionManager: { getSessionId(): string; getSessionDir(): string } }): JobRegistry => {
+    const { sessionId, filePath } = registryPathFor(ctx);
+    const cached = jobRegistries.get(sessionId);
+    if (cached) return cached;
+
+    const registry: JobRegistry = { sessionId, filePath, nextId: 0, jobs: new Map() };
+    const saved = readRegistryFile(filePath);
+    if (saved) {
+      registry.nextId = saved.nextId;
+      for (const item of saved.jobs) {
+        if (!item || typeof item !== "object") continue;
+        const raw = item as Partial<JobEntry>;
+        if (
+          typeof raw.id !== "number" || typeof raw.pid !== "number" || typeof raw.command !== "string" ||
+          typeof raw.logPath !== "string" || typeof raw.startedAt !== "number"
+        ) continue;
+        registry.nextId = Math.max(registry.nextId, raw.id);
+        registry.jobs.set(raw.id, {
+          id: raw.id,
+          pid: raw.pid,
+          command: raw.command,
+          logPath: raw.logPath,
+          startedAt: raw.startedAt,
+          exitCode: typeof raw.exitCode === "number" ? raw.exitCode : null,
+          exitedAt: typeof raw.exitedAt === "number" ? raw.exitedAt : null,
+          processStartToken: typeof raw.processStartToken === "string" ? raw.processStartToken : undefined,
+          killDeadlineAt: typeof raw.killDeadlineAt === "number" ? raw.killDeadlineAt : undefined,
+          restored: true,
+          processVerified: false,
+        });
+      }
+    }
+    jobRegistries.set(sessionId, registry);
+    for (const job of registry.jobs.values()) {
+      refreshRestoredJob(registry, job);
+      if (job.processVerified) armKillDeadline(job, registry);
+    }
+    return registry;
+  };
 
   const SIGNAL_NUMBERS: Record<string, number> = {
     SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15, SIGSEGV: 11,
@@ -1029,8 +1234,8 @@ export default function (pi: ExtensionAPI) {
    * it and know the exit code — no $! parsing or /proc guessing needed.
    * Jobs survive the session ending (nohup semantics).
    */
-  const startBackgroundJob = (command: string, cwd: string, killDeadlineSec?: number): JobEntry => {
-    const id = ++jobSeq;
+  const startBackgroundJob = (command: string, cwd: string, registry: JobRegistry, killDeadlineSec?: number): JobEntry => {
+    const id = ++registry.nextId;
     const logPath = join(tmpdir(), `better-bash-job-${id}-${Date.now()}.log`);
     const shellConfig = getShellConfig();
     const out = openSync(logPath, "a");
@@ -1049,40 +1254,66 @@ export default function (pi: ExtensionAPI) {
       startedAt: Date.now(),
       exitCode: null,
       exitedAt: null,
+      processStartToken: readProcessStartToken(child.pid ?? -1),
+      killDeadlineAt: killDeadlineSec != null && killDeadlineSec > 0 ? Date.now() + killDeadlineSec * 1000 : undefined,
+      processVerified: true,
     };
     child.on("exit", (code, signal) => {
       entry.exitCode = code ?? (signal ? 128 + (SIGNAL_NUMBERS[signal] ?? 0) : null);
       entry.exitedAt = Date.now();
       if (entry.killTimer) clearTimeout(entry.killTimer);
+      persistJobEntry(registry, entry);
     });
     child.on("error", () => {
       entry.exitCode = entry.exitCode ?? 127;
       entry.exitedAt = Date.now();
+      persistJobEntry(registry, entry);
     });
-    if (killDeadlineSec != null && killDeadlineSec > 0) {
-      entry.killTimer = setTimeout(() => {
-        killJob(entry);
-      }, killDeadlineSec * 1000);
-      entry.killTimer.unref?.();
-    }
+    armKillDeadline(entry, registry);
     child.unref();
-    jobs.set(id, entry);
+    registry.jobs.set(id, entry);
+    persistJobEntry(registry, entry);
     return entry;
   };
 
   /** Kill a job's whole process tree (it leads its own session). */
-  const killJob = (job: JobEntry): void => {
+  const killJob = (job: JobEntry, registry?: JobRegistry): boolean => {
+    if (job.restored) {
+      if (!job.processVerified) return false;
+      if (process.platform === "linux" && job.processStartToken !== readProcessStartToken(job.pid)) {
+        // Re-check immediately before signaling: a verified PID may have exited and been reused since restore.
+        job.processVerified = false;
+        job.exitedAt = Date.now();
+        if (registry) persistJobEntry(registry, job);
+        return false;
+      }
+    }
     try {
       if (process.platform !== "win32") process.kill(-job.pid, "SIGTERM");
       else process.kill(job.pid, "SIGTERM");
+      return true;
     } catch {
-      /* already gone */
+      return false;
     }
+  };
+
+  const armKillDeadline = (job: JobEntry, registry?: JobRegistry): void => {
+    if (job.killDeadlineAt == null || job.exitCode != null || job.exitedAt != null) return;
+    if (job.restored && !job.processVerified) return;
+    if (job.killTimer) clearTimeout(job.killTimer);
+    job.killTimer = setTimeout(() => { killJob(job, registry); }, Math.max(0, job.killDeadlineAt - Date.now()));
+    job.killTimer.unref?.();
   };
 
   const describeJob = (j: JobEntry): string => {
     const now = Date.now();
-    const status = j.exitCode == null ? `running (pid ${j.pid})` : `exited ${j.exitCode}`;
+    const status = j.exitCode != null
+      ? `exited ${j.exitCode}`
+      : j.exitedAt != null
+        ? "exited (exit code unavailable)"
+        : j.restored && !j.processVerified
+          ? `unknown (pid ${j.pid} not verified)`
+          : `running (pid ${j.pid})`;
     const dur = Math.round(((j.exitedAt ?? now) - j.startedAt) / 1000);
     return `j${j.id}  ${status}  ${dur}s  \`${clipCommand(j.command, 50)}\`  log: ${j.logPath}`;
   };
@@ -1124,13 +1355,14 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       if (params.background) {
-        const entry = startBackgroundJob(params.command, ctx.cwd, params.timeout);
+        const registry = getJobRegistry(ctx);
+        const entry = startBackgroundJob(params.command, ctx.cwd, registry, params.timeout);
         const lines = [
           `Background job j${entry.id} started.`,
           `pid: ${entry.pid}`,
           `log: ${entry.logPath}`,
           params.timeout ? `kill deadline: ${params.timeout}s` : null,
-          `Wait on it with wait_for {job: ${entry.id}} or alarm {job: ${entry.id}}; list or kill it with the jobs tool.`,
+          `Its tracking is saved for this session, so wait_for/jobs can recover it after reload or resume. Use wait_for {job: ${entry.id}} or alarm {job: ${entry.id}}; list or kill it with the jobs tool.`,
         ].filter(Boolean);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -1191,16 +1423,20 @@ export default function (pi: ExtensionAPI) {
     name: "wait_for",
     label: "Wait For",
     description:
-      "Block until a background job finishes (job: N) or a shell condition is met (command) — use to wait for background work instead of busy-waiting. " +
-      "Prefer `job` for jobs started via bash background: true — the exit code and log are reported. " +
-      "A `command` is a one-shot test re-run every `interval` seconds — no loops or sleep inside it.",
+      "Wait for exactly one thing: either a tracked background job (`job`) or a shell condition (`command`); never provide both, even as an empty string. " +
+      "For a job started with bash `background: true`, copy its numeric id exactly (the displayed `j22` means `job: 22`) and omit `command`. " +
+      "Job metadata is saved per session and restored after extension reload/resume; if a process exits while pi is offline, its exit code may be unavailable but its log remains. " +
+      "For an external process or other condition, provide a one-shot `command` and omit `job`. The condition is re-run every `interval` seconds, so do not put loops or sleep inside it.",
+    promptGuidelines: [
+      "When calling wait_for, include exactly one of `job` or `command` and omit the other property entirely (do not send an empty command). For a displayed job `jN`, pass `job: N`; if it is missing, call the `jobs` tool with no arguments to list jobs restored for this session. If still missing, use the PID/log from the original start result. For an external condition, send only `command`.",
+    ],
     parameters: Type.Object({
       job: Type.Optional(Type.Number({
-        description: "Id of a background job (from a background: true bash call) to wait for. Preferred over shell conditions — the exit code and log path are reported.",
+        description: "Use this OR `command`, never both. Copy the numeric id from the background-job result exactly (`j22` means 22); ids start at 1. Omit `command` entirely when waiting on a job.",
       })),
       command: Type.Optional(Type.String({
         description:
-          "Shell command to run as the check; exit code 0 means the condition is met. Provide either `job` or `command`, not both. " +
+          "Use this OR `job`, never both; omit `job` entirely. Must be a non-empty one-shot shell test; exit code 0 means the condition is met. " +
           "For processes you did not launch via background: true, prefer a robust completion check (e.g. `[ ! -d /proc/$PID ]` " +
           "or a marker file the job writes when done) over `pgrep -f` — the polling shell's own " +
           "command line contains the pattern, so `pgrep -f` self-matches and the condition can never be true (use a bracket pattern like `pgrep -f 'cargo[ ]test'` if you must).",
@@ -1210,7 +1446,16 @@ export default function (pi: ExtensionAPI) {
     }),
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("wait_for "));
-      text += theme.fg("accent", args.job != null ? `job j${args.job}` : clipCommand(args.command ?? ""));
+      const hasJob = args.job != null;
+      const hasCommand = args.command != null;
+      if (hasJob && hasCommand) {
+        const condition = args.command!.trim()
+          ? `command \`${clipCommand(args.command!)}\``
+          : "empty command";
+        text += theme.fg("warning", `job j${args.job} + ${condition} (choose one)`);
+      } else {
+        text += theme.fg("accent", hasJob ? `job j${args.job}` : clipCommand(args.command ?? ""));
+      }
       const parts: string[] = [];
       parts.push(`every ${args.interval ?? 2}s`);
       if (args.timeout) parts.push(`timeout: ${args.timeout}s`);
@@ -1226,16 +1471,45 @@ export default function (pi: ExtensionAPI) {
       return new Text(theme.fg(color, msg), 0, 0);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (params.job != null && params.command) {
+      const registry = getJobRegistry(ctx);
+      const hasJob = params.job != null;
+      const hasCommand = typeof params.command === "string" && params.command.trim().length > 0;
+      const commandWasProvided = typeof params.command === "string";
+      if (hasJob && commandWasProvided) {
+        const withOptions = (choice: { job?: number; command?: string }) => ({
+          ...choice,
+          ...(params.timeout != null ? { timeout: params.timeout } : {}),
+          ...(params.interval != null ? { interval: params.interval } : {}),
+        });
+        const alternatives = [
+          registry.jobs.has(params.job!)
+            ? `- Wait for tracked job j${params.job}: \`wait_for ${JSON.stringify(withOptions({ job: params.job }))}\``
+            : `- Wait for a tracked job: call \`jobs\` for a valid id, then call \`wait_for {\"job\": N}\`.`,
+          hasCommand
+            ? `- Poll the supplied condition: \`wait_for ${JSON.stringify(withOptions({ command: params.command! }))}\``
+            : "- Poll a condition: provide a non-empty `command` and omit `job`.",
+        ];
         return {
-          content: [{ type: "text", text: "Provide either `job` or `command`, not both." }],
+          content: [{
+            type: "text",
+            text:
+              `Invalid wait_for: choose one and retry:\n` +
+              alternatives.join("\n"),
+          }],
           isError: true,
           details: { met: false, blocked: true },
         };
       }
-      if (params.job == null && !params.command) {
+      if (!hasJob && !hasCommand) {
         return {
-          content: [{ type: "text", text: "Provide `job` (id of a background: true bash job) or `command` (shell condition)." }],
+          content: [{
+            type: "text",
+            text:
+              "Invalid wait_for arguments: no job or condition was supplied. Choose exactly one:\n" +
+              "- Wait for a tracked job: `wait_for {\"job\": N}` (use a numeric id from `jobs` or the bash background-job result; displayed `j22` means 22).\n" +
+              "- Poll a condition: `wait_for {\"command\": \"<one-shot shell test>\"}`.\n" +
+              "Omit the other field.",
+          }],
           isError: true,
           details: { met: false, blocked: true },
         };
@@ -1246,10 +1520,10 @@ export default function (pi: ExtensionAPI) {
       let checks = 0;
 
       if (params.job != null) {
-        const job = jobs.get(params.job);
+        const job = registry.jobs.get(params.job);
         if (!job) {
           return {
-            content: [{ type: "text", text: `No job with id ${params.job} — use the jobs tool to list tracked jobs.` }],
+            content: [{ type: "text", text: missingJobMessage(params.job, "wait") }],
             isError: true,
             details: { met: false, blocked: true },
           };
@@ -1262,18 +1536,35 @@ export default function (pi: ExtensionAPI) {
             };
           }
           checks++;
-          if (job.exitCode != null) {
+          refreshRestoredJob(registry, job);
+          if (job.exitCode != null || job.exitedAt != null) {
             const s = (Date.now() - start) / 1000;
-            const ranFor = Math.round((job.exitedAt! - job.startedAt) / 1000);
+            const ranFor = job.exitCode != null && job.exitedAt != null
+              ? ` (ran ${Math.round((job.exitedAt - job.startedAt) / 1000)}s)`
+              : "";
+            const completion = job.exitCode != null
+              ? `finished with exit code ${job.exitCode}`
+              : "process ended while pi was offline; exit code unavailable";
             const tail = job.exitCode !== 0 ? tailLog(job.logPath) : null;
             return {
               content: [{
                 type: "text",
                 text:
-                  `Job j${job.id} finished with exit code ${job.exitCode} (ran ${ranFor}s). Log: ${job.logPath}` +
+                  `Job j${job.id} ${completion}${ranFor}. Log: ${job.logPath}` +
                   (tail ? `\n\nLast log lines:\n${tail}` : ""),
               }],
-              details: { met: true, elapsedSec: Number(s.toFixed(1)), jobExitCode: job.exitCode },
+              details: {
+                met: true,
+                elapsedSec: Number(s.toFixed(1)),
+                ...(job.exitCode != null ? { jobExitCode: job.exitCode } : {}),
+              },
+            };
+          }
+          if (job.restored && !job.processVerified) {
+            return {
+              content: [{ type: "text", text: unverifiedJobMessage(job, "wait") }],
+              isError: true,
+              details: { met: false, blocked: true },
             };
           }
           if (Date.now() - start >= capMs) {
@@ -1374,6 +1665,7 @@ export default function (pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const registry = getJobRegistry(ctx);
       if (params.list) {
         const items = [...alarms.entries()].map(([id, e]) => describeAlarm(id, e));
         return {
@@ -1405,7 +1697,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (params.job != null && !jobs.has(params.job)) {
+      if (params.job != null && !registry.jobs.has(params.job)) {
         return {
           content: [{ type: "text", text: `No job with id ${params.job} — use the jobs tool to list tracked jobs.` }],
           isError: true,
@@ -1460,15 +1752,23 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (params.job != null) {
-        const job = jobs.get(params.job)!;
+        const job = registry.jobs.get(params.job)!;
         const intervalMs = entry.intervalSec! * 1000;
         const capMs = Math.min(Math.max(1, params.timeout ?? MAX_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS) * 1000;
         const repeat = entry.repeat!;
         const start = Date.now();
         void (async () => {
           while (!entry.cancelled) {
-            if (job.exitCode != null) {
-              fire(`job j${job.id} finished with exit code ${job.exitCode} — log: ${job.logPath}`);
+            refreshRestoredJob(registry, job);
+            if (job.exitCode != null || job.exitedAt != null) {
+              const result = job.exitCode != null
+                ? `finished with exit code ${job.exitCode}`
+                : "process exited; exit code unavailable after reload";
+              fire(`job j${job.id} ${result} — log: ${job.logPath}`);
+              return;
+            }
+            if (job.restored && !job.processVerified) {
+              fire(`cannot verify job j${job.id} after reload; check PID ${job.pid} and log ${job.logPath}`);
               return;
             }
             if (!repeat && Date.now() - start >= capMs) {
@@ -1535,26 +1835,42 @@ export default function (pi: ExtensionAPI) {
     name: "jobs",
     label: "Jobs",
     description:
-      "List tracked background jobs (started via bash background: true) with id, status, pid, runtime, exit code, and log path — or kill one. Check this after launching background work to see what is still running.",
+      "List background jobs saved for this session (including jobs restored after extension reload/resume) with id, status, pid, runtime, exit code, and log path — or kill one. Call with no arguments to list jobs. If a process exited while pi was offline, its exit code may be unavailable.",
     parameters: jobsParamsSchema,
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const registry = getJobRegistry(ctx);
       if (params.kill != null) {
-        const job = jobs.get(params.kill);
+        const job = registry.jobs.get(params.kill);
         if (!job) {
-          return { content: [{ type: "text", text: `No job with id ${params.kill}.` }], isError: true, details: undefined };
+          return { content: [{ type: "text", text: missingJobMessage(params.kill, "kill") }], isError: true, details: undefined };
         }
-        if (job.exitCode != null) {
-          return { content: [{ type: "text", text: `Job j${job.id} already finished (exit ${job.exitCode}). Log: ${job.logPath}` }], details: undefined };
+        refreshRestoredJob(registry, job);
+        if (job.exitCode != null || job.exitedAt != null) {
+          const result = job.exitCode != null ? `already finished (exit ${job.exitCode})` : "process is gone (exit code unavailable)";
+          return { content: [{ type: "text", text: `Job j${job.id} ${result}. Log: ${job.logPath}` }], details: undefined };
         }
-        killJob(job);
+        if (!killJob(job, registry)) {
+          if (job.exitedAt != null) {
+            return {
+              content: [{ type: "text", text: `Job j${job.id} process is gone (exit code unavailable). Log: ${job.logPath}` }],
+              details: undefined,
+            };
+          }
+          return {
+            content: [{ type: "text", text: unverifiedJobMessage(job, "kill") }],
+            isError: true,
+            details: undefined,
+          };
+        }
         return {
           content: [{ type: "text", text: `Sent SIGTERM to job j${job.id} (pid ${job.pid}).` }],
           details: { killed: job.id },
         };
       }
-      const items = [...jobs.values()].sort((a, b) => a.id - b.id).map(describeJob);
+      for (const job of registry.jobs.values()) refreshRestoredJob(registry, job);
+      const items = [...registry.jobs.values()].sort((a, b) => a.id - b.id).map(describeJob);
       return {
-        content: [{ type: "text", text: items.length ? items.join("\n") : "No tracked background jobs." }],
+        content: [{ type: "text", text: items.length ? items.join("\n") : "No recoverable background jobs are recorded for this session." }],
         details: { jobs: items },
       };
     },

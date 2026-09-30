@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import betterBash from "./index.ts";
 import {
   auditPgrepCondition,
   auditPgrepSelfMatch,
@@ -12,6 +16,63 @@ import {
   findRootSearch,
   guardWaitCondition,
 } from "./index.ts";
+
+const integrationSessionDirs: string[] = [];
+const integrationProcessGroups: number[] = [];
+
+afterEach(() => {
+  for (const pid of integrationProcessGroups.splice(0)) {
+    try { process.kill(-pid, "SIGKILL"); } catch {}
+  }
+  for (const dir of integrationSessionDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function createJobHarness(sessionId: string, sessionDir: string) {
+  const tools = new Map<string, any>();
+  const api = {
+    registerTool: (tool: any) => tools.set(tool.name, tool),
+    on: () => {},
+    sendMessage: () => {},
+  } as unknown as ExtensionAPI;
+  betterBash(api);
+  const ctx = {
+    cwd: process.cwd(),
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionDir: () => sessionDir,
+    },
+  };
+  return {
+    async call(name: string, params: Record<string, unknown>) {
+      const tool = tools.get(name);
+      if (!tool) throw new Error(`Tool ${name} was not registered`);
+      return tool.execute("integration-test", params, undefined, undefined, ctx);
+    },
+  };
+}
+
+function createSessionDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "better-bash-session-"));
+  integrationSessionDirs.push(dir);
+  return dir;
+}
+
+function registryFile(sessionDir: string, sessionId: string): string {
+  const safeId = sessionId.replace(/[^A-Za-z0-9._-]/g, "_");
+  return join(sessionDir, "better-bash-jobs", `${safeId}.json`);
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt >= timeoutMs) throw new Error("Condition was not met before timeout");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+function resultText(result: any): string {
+  return result.content?.find((item: any) => item.type === "text")?.text ?? "";
+}
 
 describe("extractCommandNames", () => {
   test("simple command", () => {
@@ -254,6 +315,152 @@ describe("findBackgrounding", () => {
     }
     expect(Date.now() - start).toBeLessThan(10_000);
   });
+});
+
+describe("background-job recovery integration", () => {
+  test("a fresh extension instance lists and waits for a live job", async () => {
+    const sessionDir = createSessionDir();
+    const sessionId = "resume-live-job";
+    const first = createJobHarness(sessionId, sessionDir);
+    const started = await first.call("bash", {
+      command: `node -e 'console.log("recovered-output"); setTimeout(() => {}, 1500)'`,
+      background: true,
+    });
+    const pid = Number(resultText(started).match(/pid: (\d+)/)?.[1]);
+    expect(pid).toBeGreaterThan(0);
+    integrationProcessGroups.push(pid);
+
+    const resumed = createJobHarness(sessionId, sessionDir);
+    const listing = await resumed.call("jobs", {});
+    expect(resultText(listing)).toContain("j1  running");
+    expect(resultText(listing)).toContain(`pid ${pid}`);
+
+    const waited = await resumed.call("wait_for", { job: 1, timeout: 8, interval: 1 });
+    expect(resultText(waited)).toContain("Job j1 finished with exit code 0");
+    expect(waited.details).toMatchObject({ met: true, jobExitCode: 0 });
+
+    const next = await resumed.call("bash", {
+      command: `node -e 'setTimeout(() => {}, 10000)'`,
+      background: true,
+    });
+    expect(resultText(next)).toContain("Background job j2 started.");
+    const nextPid = Number(resultText(next).match(/pid: (\d+)/)?.[1]);
+    expect(nextPid).toBeGreaterThan(0);
+    integrationProcessGroups.push(nextPid);
+  }, 15_000);
+
+  test("a process that exited while pi was offline is recovered with unknown exit code", async () => {
+    const sessionDir = createSessionDir();
+    const sessionId = "resume-offline-exit";
+    const first = createJobHarness(sessionId, sessionDir);
+    const started = await first.call("bash", { command: "node -e 'process.exit(9)'", background: true });
+    const pid = Number(resultText(started).match(/pid: (\d+)/)?.[1]);
+    expect(pid).toBeGreaterThan(0);
+    integrationProcessGroups.push(pid);
+
+    const filePath = registryFile(sessionDir, sessionId);
+    await waitUntil(() => {
+      try {
+        const registry = JSON.parse(readFileSync(filePath, "utf8"));
+        return registry.jobs[0]?.exitCode === 9;
+      } catch {
+        return false;
+      }
+    });
+    const registry = JSON.parse(readFileSync(filePath, "utf8"));
+    registry.jobs[0].exitCode = null;
+    registry.jobs[0].exitedAt = null;
+    writeFileSync(filePath, JSON.stringify(registry));
+
+    const resumed = createJobHarness(sessionId, sessionDir);
+    const listing = await resumed.call("jobs", {});
+    expect(resultText(listing)).toContain("j1  exited (exit code unavailable)");
+    const waited = await resumed.call("wait_for", { job: 1, timeout: 1, interval: 1 });
+    expect(resultText(waited)).toContain("process ended while pi was offline; exit code unavailable");
+    expect(waited.details).toMatchObject({ met: true });
+    expect(waited.details).not.toHaveProperty("jobExitCode");
+  }, 10_000);
+
+  test("restored PID start-token mismatch prevents signaling a reused PID", async () => {
+    const sessionDir = createSessionDir();
+    const sessionId = "resume-reused-pid";
+    const readyPath = join(sessionDir, "decoy-ready");
+    const signaledPath = join(sessionDir, "decoy-signaled");
+    const script = [
+      `require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready')`,
+      `process.on('SIGTERM', () => require('node:fs').writeFileSync(${JSON.stringify(signaledPath)}, 'signaled'))`,
+      "setTimeout(() => {}, 30000)",
+    ].join(";");
+    const decoy = spawn(process.execPath, ["-e", script], { detached: true, stdio: "ignore" });
+    const pid = decoy.pid!;
+    integrationProcessGroups.push(pid);
+    await waitUntil(() => existsSync(readyPath));
+
+    const filePath = registryFile(sessionDir, sessionId);
+    mkdirSync(join(sessionDir, "better-bash-jobs"), { recursive: true });
+    const registry = {
+      version: 1,
+      nextId: 1,
+      jobs: [{
+        id: 1,
+        pid,
+        command: "original tracked process",
+        logPath: join(sessionDir, "job.log"),
+        startedAt: Date.now() - 1000,
+        exitCode: null,
+        exitedAt: null,
+        processStartToken: "stale-process-start-token",
+      }],
+    };
+    writeFileSync(filePath, JSON.stringify(registry));
+
+    const resumed = createJobHarness(sessionId, sessionDir);
+    const listing = await resumed.call("jobs", {});
+    expect(resultText(listing)).toContain("j1  exited (exit code unavailable)");
+    const killed = await resumed.call("jobs", { kill: 1 });
+    expect(resultText(killed)).toContain("process is gone (exit code unavailable)");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(existsSync(signaledPath)).toBe(false);
+    expect(() => process.kill(pid, 0)).not.toThrow();
+  }, 10_000);
+
+  test("restored kill deadline is armed and session IDs are isolated", async () => {
+    const sessionDir = createSessionDir();
+    const first = createJobHarness("deadline-session", sessionDir);
+    const started = await first.call("bash", {
+      command: `node -e 'process.on("SIGTERM", () => process.exit(0)); setTimeout(() => {}, 30000)'`,
+      background: true,
+      timeout: 60,
+    });
+    const pid = Number(resultText(started).match(/pid: (\d+)/)?.[1]);
+    expect(pid).toBeGreaterThan(0);
+    integrationProcessGroups.push(pid);
+
+    const filePath = registryFile(sessionDir, "deadline-session");
+    const registry = JSON.parse(readFileSync(filePath, "utf8"));
+    registry.jobs[0].killDeadlineAt = Date.now() + 500;
+    writeFileSync(filePath, JSON.stringify(registry));
+
+    const resumed = createJobHarness("deadline-session", sessionDir);
+    expect(resultText(await resumed.call("jobs", {}))).toContain("j1  running");
+    const waited = await resumed.call("wait_for", { job: 1, timeout: 5, interval: 1 });
+    expect(resultText(waited)).toMatch(/Job j1 (finished with exit code 0|process ended while pi was offline)/);
+    await waitUntil(() => {
+      try { process.kill(pid, 0); return false; } catch { return true; }
+    });
+
+    const isolated = createJobHarness("other-session", sessionDir);
+    expect(resultText(await isolated.call("jobs", {}))).toContain("No recoverable background jobs");
+    const otherStarted = await isolated.call("bash", {
+      command: `node -e 'setTimeout(() => {}, 10000)'`,
+      background: true,
+    });
+    const otherPid = Number(resultText(otherStarted).match(/pid: (\d+)/)?.[1]);
+    expect(otherPid).toBeGreaterThan(0);
+    integrationProcessGroups.push(otherPid);
+    expect(resultText(await isolated.call("jobs", {}))).toContain("j1  running");
+    expect(resultText(await resumed.call("jobs", {}))).toContain("j1  exited");
+  }, 15_000);
 });
 
 describe("findDaemonLaunchers", () => {
