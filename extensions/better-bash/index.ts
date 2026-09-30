@@ -683,7 +683,8 @@ interface JobEntry {
   exitCode: number | null;
   exitedAt: number | null;
   killTimer?: NodeJS.Timeout;
-  /** Linux /proc start-time token used to distinguish this process from a reused PID after reload. */
+  /** Linux boot ID and /proc start-time token identify the same process across reloads and reboot boundaries. */
+  processBootId?: string;
   processStartToken?: string;
   killDeadlineAt?: number;
   /** True when reconstructed from disk rather than launched by this extension instance. */
@@ -705,6 +706,15 @@ function clipCommand(cmd: string, max = 80): string {
 }
 
 /** Linux process start time (field 22 of /proc/PID/stat), stable across extension reloads. */
+function readLinuxBootId(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function readProcessStartToken(pid: number): string | undefined {
   if (process.platform !== "linux" || pid <= 0) return undefined;
   try {
@@ -736,6 +746,7 @@ function serializeJob(job: JobEntry) {
     startedAt: job.startedAt,
     exitCode: job.exitCode,
     exitedAt: job.exitedAt,
+    processBootId: job.processBootId,
     processStartToken: job.processStartToken,
     killDeadlineAt: job.killDeadlineAt,
   };
@@ -1170,16 +1181,22 @@ export default function (pi: ExtensionAPI) {
       persistJobEntry(registry, job);
       return;
     }
+    const currentBootId = readLinuxBootId();
     const currentToken = readProcessStartToken(job.pid);
-    if (job.processStartToken && currentToken === job.processStartToken) {
-      job.processVerified = true;
-    } else if (job.processStartToken && currentToken && currentToken !== job.processStartToken) {
-      // PID was reused: the original job process is gone; do not signal this process.
+    const bootChanged = !!job.processBootId && !!currentBootId && currentBootId !== job.processBootId;
+    const processChanged = !!job.processStartToken && !!currentToken && currentToken !== job.processStartToken;
+    if (bootChanged || processChanged) {
+      // The boot changed or PID was reused: the original job process is gone.
       job.exitedAt = Date.now();
       job.processVerified = false;
       persistJobEntry(registry, job);
+    } else if (
+      job.processBootId && currentBootId === job.processBootId &&
+      job.processStartToken && currentToken === job.processStartToken
+    ) {
+      job.processVerified = true;
     } else {
-      // On platforms without a reliable process identity token, leave it unverified.
+      // Missing identity data (including registries from before boot IDs were saved) is unverified.
       job.processVerified = false;
     }
   };
@@ -1209,6 +1226,7 @@ export default function (pi: ExtensionAPI) {
           startedAt: raw.startedAt,
           exitCode: typeof raw.exitCode === "number" ? raw.exitCode : null,
           exitedAt: typeof raw.exitedAt === "number" ? raw.exitedAt : null,
+          processBootId: typeof raw.processBootId === "string" ? raw.processBootId : undefined,
           processStartToken: typeof raw.processStartToken === "string" ? raw.processStartToken : undefined,
           killDeadlineAt: typeof raw.killDeadlineAt === "number" ? raw.killDeadlineAt : undefined,
           restored: true,
@@ -1254,6 +1272,7 @@ export default function (pi: ExtensionAPI) {
       startedAt: Date.now(),
       exitCode: null,
       exitedAt: null,
+      processBootId: readLinuxBootId(),
       processStartToken: readProcessStartToken(child.pid ?? -1),
       killDeadlineAt: killDeadlineSec != null && killDeadlineSec > 0 ? Date.now() + killDeadlineSec * 1000 : undefined,
       processVerified: true,
@@ -1280,12 +1299,22 @@ export default function (pi: ExtensionAPI) {
   const killJob = (job: JobEntry, registry?: JobRegistry): boolean => {
     if (job.restored) {
       if (!job.processVerified) return false;
-      if (process.platform === "linux" && job.processStartToken !== readProcessStartToken(job.pid)) {
-        // Re-check immediately before signaling: a verified PID may have exited and been reused since restore.
-        job.processVerified = false;
-        job.exitedAt = Date.now();
-        if (registry) persistJobEntry(registry, job);
-        return false;
+      if (process.platform === "linux") {
+        const currentBootId = readLinuxBootId();
+        const currentToken = readProcessStartToken(job.pid);
+        const identityMatches =
+          !!job.processBootId && currentBootId === job.processBootId &&
+          !!job.processStartToken && currentToken === job.processStartToken;
+        if (!identityMatches) {
+          // Re-check immediately before signaling: the boot or PID may have changed since restore.
+          job.processVerified = false;
+          if (
+            (job.processBootId && currentBootId && currentBootId !== job.processBootId) ||
+            (job.processStartToken && currentToken && currentToken !== job.processStartToken)
+          ) job.exitedAt = Date.now();
+          if (registry && job.exitedAt != null) persistJobEntry(registry, job);
+          return false;
+        }
       }
     }
     try {

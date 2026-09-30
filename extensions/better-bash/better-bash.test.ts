@@ -381,7 +381,7 @@ describe("background-job recovery integration", () => {
     expect(waited.details).not.toHaveProperty("jobExitCode");
   }, 10_000);
 
-  test("restored PID start-token mismatch prevents signaling a reused PID", async () => {
+  test.skipIf(process.platform !== "linux")("boot ID and start-token mismatches prevent signaling a reused PID", async () => {
     const sessionDir = createSessionDir();
     const sessionId = "resume-reused-pid";
     const readyPath = join(sessionDir, "decoy-ready");
@@ -396,29 +396,40 @@ describe("background-job recovery integration", () => {
     integrationProcessGroups.push(pid);
     await waitUntil(() => existsSync(readyPath));
 
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const actualStartToken = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const baseRecord = {
+      pid,
+      command: "original tracked process",
+      logPath: join(sessionDir, "job.log"),
+      startedAt: Date.now() - 1000,
+      exitCode: null,
+      exitedAt: null,
+    };
     const filePath = registryFile(sessionDir, sessionId);
     mkdirSync(join(sessionDir, "better-bash-jobs"), { recursive: true });
-    const registry = {
+    writeFileSync(filePath, JSON.stringify({
       version: 1,
-      nextId: 1,
-      jobs: [{
-        id: 1,
-        pid,
-        command: "original tracked process",
-        logPath: join(sessionDir, "job.log"),
-        startedAt: Date.now() - 1000,
-        exitCode: null,
-        exitedAt: null,
-        processStartToken: "stale-process-start-token",
-      }],
-    };
-    writeFileSync(filePath, JSON.stringify(registry));
+      nextId: 3,
+      jobs: [
+        { ...baseRecord, id: 1, processBootId: bootId, processStartToken: "stale-process-start-token" },
+        { ...baseRecord, id: 2, processBootId: "stale-boot-id", processStartToken: actualStartToken },
+        { ...baseRecord, id: 3, processStartToken: actualStartToken },
+      ],
+    }));
 
     const resumed = createJobHarness(sessionId, sessionDir);
     const listing = await resumed.call("jobs", {});
     expect(resultText(listing)).toContain("j1  exited (exit code unavailable)");
-    const killed = await resumed.call("jobs", { kill: 1 });
-    expect(resultText(killed)).toContain("process is gone (exit code unavailable)");
+    expect(resultText(listing)).toContain("j2  exited (exit code unavailable)");
+    expect(resultText(listing)).toContain(`j3  unknown (pid ${pid} not verified)`);
+    for (const id of [1, 2]) {
+      const killed = await resumed.call("jobs", { kill: id });
+      expect(resultText(killed)).toContain("process is gone (exit code unavailable)");
+    }
+    const legacyKill = await resumed.call("jobs", { kill: 3 });
+    expect(resultText(legacyKill)).toContain("cannot be safely verified after reload");
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(existsSync(signaledPath)).toBe(false);
     expect(() => process.kill(pid, 0)).not.toThrow();

@@ -21,10 +21,10 @@ Wait discipline for pi's `bash` tool. (Formerly `require-bash-timeout.ts`.)
    `timeout` parameter becomes the job's kill deadline (exempt from the
    cap). Job metadata is saved per session and restored after extension
    reload/resume. On Linux, restored PIDs are checked against their saved
-   `/proc` start-time token before signaling, including when a kill deadline
-   fires; unverifiable PIDs are never signaled. If the process exits while pi
-   is offline, its exit code may be unavailable, but the process status and log
-   remain recoverable.
+   boot ID and `/proc` start-time token before signaling, including when a kill
+   deadline fires; unverifiable PIDs are never signaled. If the process exits
+   while pi is offline, its exit code may be unavailable, but its status and
+   log remain recoverable.
 4. **No manual backgrounding.** Bare `&` operators, `$!`, and daemon
    launchers at command position (`nohup`, `disown`, `setsid`) are blocked
    with a reason steering the model to `background: true` —
