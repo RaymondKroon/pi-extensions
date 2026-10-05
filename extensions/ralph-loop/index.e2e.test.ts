@@ -264,7 +264,8 @@ async function createRalphSession(
 	port: number,
 	config: Record<string, unknown>,
 	bindings?: Record<string, unknown>,
-	onPi?: (pi: { events: { emit: (channel: string, data: unknown) => void } }) => void
+	onPi?: (pi: { events: { emit: (channel: string, data: unknown) => void } }) => void,
+	flagGoal?: string
 ) {
 	await writeFile(join(projectDir, '.pi', 'ralph-loop.json'), `${JSON.stringify(config, null, '\t')}\n`);
 
@@ -321,6 +322,11 @@ async function createRalphSession(
 		// real ~/.pi/agent/settings.json (e.g. compaction.keepRecentTokens).
 		agentDir
 	});
+	if (flagGoal !== undefined) {
+		// Mirror the real CLI order: the runner holds the --ralph-goal value
+		// BEFORE session_start fires (bindExtensions fires it below).
+		created.session.extensionRunner.setFlagValue('ralph-goal', flagGoal);
+	}
 	// Pi's interactive/rpc modes call this during startup; a bare SDK session must
 	// bind extensions itself or they never receive session_start (and the ralph
 	// extension would never load its .pi/ralph-loop.json config).
@@ -1185,6 +1191,102 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await new Promise((resolve) => setTimeout(resolve, 500));
 			expect(endpoint!.requests.length).toBe(2);
 			expect(lastStateEntry(sess)?.paused).toBe(false);
+		}
+	);
+
+	test(
+		'--ralph-goal (inline text): the goal loop starts at session start and the backlog is created when missing',
+		{ timeout: 60000 },
+		async () => {
+			// A fresh session: no session ralph file (beforeEach seeded one).
+			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
+			endpoint = startMockEndpoint([textResponder('Planning from the goal.')]);
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				undefined,
+				'Implement the flag end-to-end'
+			);
+
+			// The goal is persisted to the session ralph file (created by the
+			// flag handler) before the loop starts.
+			const backlog = Backlog.open(join(agentDir, 'ralph', 'e2e-session.db'));
+			expect(backlog.goal()?.body).toBe('Implement the flag end-to-end');
+			expect(backlog.goal()?.status).toBe('open');
+
+			// The first LLM request is the goal-loop iteration prompt carrying
+			// the goal — no /ralph start or user prompt was typed.
+			const text = await waitForRequestContaining('Implement the flag end-to-end');
+			expect(text).toContain('[Automated Ralph loop instruction, not from the human user]');
+			expect(text).toContain('goal loop');
+			expect(lastStateEntry(sess)).toBeDefined();
+			void sess;
+		}
+	);
+
+	test(
+		'--ralph-goal (goal file): a project-relative file is read as the goal, leading H1 marker stripped',
+		{ timeout: 60000 },
+		async () => {
+			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
+			await writeFile(join(projectDir, 'goal.md'), '# Ship the thing\n\nThe body criteria.\n');
+			endpoint = startMockEndpoint([textResponder('Planning from the goal.')]);
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				undefined,
+				'goal.md'
+			);
+
+			const backlog = Backlog.open(join(agentDir, 'ralph', 'e2e-session.db'));
+			expect(backlog.goal()?.body).toBe('Ship the thing\n\nThe body criteria.');
+
+			const text = await waitForRequestContaining('The body criteria.');
+			expect(text).toContain('goal loop');
+			void sess;
+		}
+	);
+
+	test(
+		'--ralph-goal (claimed goal): refused, the existing goal and the loop stay untouched',
+		{ timeout: 60000 },
+		async () => {
+			// The seeded backlog carries a claimed goal: setting a new goal must
+			// be refused (the set-goal rules) and the loop must not start.
+			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
+			await writeFile(
+				join(agentDir, 'ralph', 'e2e-session.ralph'),
+				'# ralph v2\n\nG claimed\nGB\n  - Old goal body.\n'
+			);
+			endpoint = startMockEndpoint([textResponder('Planning from the goal.')]);
+			await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				undefined,
+				'New goal text'
+			);
+
+			// No goal-loop iteration prompt was sent: no LLM request at all.
+			await new Promise((resolve) => setTimeout(resolve, 800));
+			expect(endpoint!.requests.length).toBe(0);
+			const backlog = Backlog.open(join(agentDir, 'ralph', 'e2e-session.ralph'));
+			expect(backlog.goal()?.body).toBe('- Old goal body.');
+			expect(backlog.goal()?.status).toBe('claimed');
 		}
 	);
 });

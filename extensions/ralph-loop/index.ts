@@ -1340,6 +1340,70 @@ async function setGoalFromFile(
 	return { ok: true, level: 'info', message: `${set}. Start the goal loop with: /ralph start --goal` };
 }
 
+/**
+ * The goal for `pi --ralph-goal <value>`: a value that resolves to an
+ * existing file inside the project is read as a goal file (the set-goal
+ * rules apply: whole file is the goal, leading H1 marker stripped); anything
+ * else is the goal text itself.
+ */
+async function goalFromFlagValue(
+	cwd: string,
+	value: string
+): Promise<{ ok: true; goal: string } | { ok: false; message: string }> {
+	const text = value.trim();
+	if (!text) {
+		return { ok: false, message: 'Usage: pi --ralph-goal <goal-text | goal-file.md>' };
+	}
+	const goalPath = resolveProjectFile(cwd, text);
+	if (goalPath && (await pathExists(goalPath))) {
+		let fileText: string;
+		try {
+			fileText = await readFile(goalPath, 'utf8');
+		} catch (error) {
+			return { ok: false, message: `Could not read ${text}: ${error instanceof Error ? error.message : String(error)}` };
+		}
+		const goal = goalFromFile(fileText);
+		if (!goal) {
+			return { ok: false, message: `No goal in ${text}: the file must not be empty` };
+		}
+		return { ok: true, goal };
+	}
+	return { ok: true, goal: text };
+}
+
+/**
+ * Set (or replace) the goal of the session's ralph file for `pi --ralph-goal`
+ * — the backlog is created when missing. An existing goal that is not open
+ * must be resolved first (set-goal rules).
+ */
+async function setSessionGoalForFlag(todoPath: string, goal: string): Promise<SetGoalOutcome> {
+	let backlog: Backlog;
+	try {
+		backlog = Backlog.open(todoPath);
+	} catch (error) {
+		if (isMissingFileError(error)) {
+			backlog = Backlog.empty();
+		} else {
+			return { ok: false, level: 'error', message: `${todoPath} is not a ralph-format backlog — delete or replace it first` };
+		}
+	}
+	const existing = backlog.goal();
+	if (existing && existing.status !== 'open') {
+		return {
+			ok: false,
+			level: 'warning',
+			message: `The goal is ${existing.status} — resolve it first (confirm or withdraw a claimed goal, delete a done goal), then set the new goal`
+		};
+	}
+	backlog.setGoal(goal);
+	try {
+		backlog.save(todoPath);
+	} catch (error) {
+		return { ok: false, level: 'error', message: `Could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	return { ok: true, level: 'info', message: existing ? `Replaced the goal in ${todoPath}` : `Set the goal in ${todoPath}` };
+}
+
 /** Restrict generated Ralph documents to files below the project root. */
 function resolveProjectFile(cwd: string, file: string): string | undefined {
 	if (!file || isAbsolute(file)) return undefined;
@@ -3177,7 +3241,7 @@ export default function (pi: ExtensionAPI) {
 	// one addition that would otherwise land mid-session (ralph_todo when the
 	// auto loop arms at the context budget) is moved to session start.
 
-	pi.on('session_start', async (_event, ctx) => {
+	pi.on('session_start', async (event, ctx) => {
 		state = undefined;
 		taskCount = undefined;
 		goalState = undefined;
@@ -3355,6 +3419,24 @@ export default function (pi: ExtensionAPI) {
 		}
 		updateStatus(ctx);
 		syncToolActivation();
+		// `pi --ralph-goal <text|file>`: start the goal loop at session start
+		// (the command-line form of /ralph set-goal + /ralph start --goal).
+		// The flag value lives for the whole process, so a reload (or
+		// resume/fork) must not re-start a stopped loop on the stale value.
+		if (event.reason === 'startup' && pi.getFlag('ralph-goal') !== undefined) {
+			if (state?.enabled) {
+				ctx.ui.notify('A Ralph loop is already active in this session — --ralph-goal was ignored', 'warning');
+				return;
+			}
+			const goal = await goalFromFlagValue(ctx.cwd, String(pi.getFlag('ralph-goal')));
+			if (!goal.ok) {
+				ctx.ui.notify(goal.message, 'error');
+				return;
+			}
+			const outcome = await setSessionGoalForFlag(autoTodoPath(ctx), goal.goal);
+			ctx.ui.notify(outcome.message, outcome.level);
+			if (outcome.ok) await startLoop(ctx as ExtensionCommandContext, { goal: true });
+		}
 	});
 
 	pi.on('model_select', (_event, ctx) => {
@@ -4359,6 +4441,12 @@ export default function (pi: ExtensionAPI) {
 		}, { overlay: true, overlayOptions: { width: '100%', maxHeight: OVERLAY_MAX_HEIGHT } });
 	};
 
+	pi.registerFlag('ralph-goal', {
+		description:
+			'Start the Ralph goal loop at session start: inline goal text, or a path to a goal file inside the project (a leading H1 heading marker is stripped)',
+		type: 'string'
+	});
+
 	pi.registerCommand('ralph', {
 		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|new|import|set-goal|stop|reload|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
@@ -4366,7 +4454,7 @@ export default function (pi: ExtensionAPI) {
 				{
 					value: 'start',
 					label: 'start',
-					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal). Markdown TODOs must be imported first: /ralph import TODO.md.'
+					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal) or pi --ralph-goal <goal-text | goal-file.md> at session start. Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start.' },
 				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },

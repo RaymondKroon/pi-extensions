@@ -72,6 +72,8 @@ function createFakePi() {
 		registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => unknown }) => {
 			commands.set(name, command);
 		},
+		registerFlag: () => {},
+		getFlag: () => undefined,
 		appendEntry: (customType: string, data: unknown) => {
 			entries.push({ type: 'custom', customType, data });
 		},
