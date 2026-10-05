@@ -1404,7 +1404,7 @@ async function setSessionGoalForFlag(todoPath: string, goal: string): Promise<Se
 	return { ok: true, level: 'info', message: existing ? `Replaced the goal in ${todoPath}` : `Set the goal in ${todoPath}` };
 }
 
-/** The context threshold (fraction) for `pi --ralph-context <percent>`: 0 < percent <= 100. */
+/** The context threshold (fraction) for `pi --ralph-max-context <percent>`: 0 < percent <= 100. */
 function contextThresholdFromFlagValue(value: string): number | undefined {
 	const parsed = Number.parseFloat(value.trim());
 	if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) return undefined;
@@ -3406,16 +3406,16 @@ export default function (pi: ExtensionAPI) {
 		// continues from the backlog. The loop also arms on the first
 		// ralph_todo add/complete; /ralph start begins it immediately.
 		//
-		// `pi --ralph-context <percent>` / `pi --ralph-cycle <task|budget>`:
+		// `pi --ralph-max-context <percent>` / `pi --ralph-cycle <task|budget>`:
 		// process-lifetime overrides of the session config, applied before the
 		// auto loop arms and the goal loop starts so both pick them up. Invalid
 		// values are refused and the session setting stays in effect.
 		if (event.reason === 'startup') {
-			const contextFlag = pi.getFlag('ralph-context');
+			const contextFlag = pi.getFlag('ralph-max-context');
 			if (contextFlag !== undefined) {
 				const threshold = contextThresholdFromFlagValue(String(contextFlag));
 				if (threshold === undefined) {
-					ctx.ui.notify(`--ralph-context: expected a percentage between 0 and 100 (got "${String(contextFlag)}")`, 'error');
+					ctx.ui.notify(`--ralph-max-context: expected a percentage between 0 and 100 (got "${String(contextFlag)}")`, 'error');
 				} else {
 					// Both the active model's key and the default: the per-model
 					// entry wins in contextThresholdFor, so the override must
@@ -4494,7 +4494,7 @@ export default function (pi: ExtensionAPI) {
 			'Start the Ralph goal loop at session start: inline goal text, or a path to a goal file inside the project (a leading H1 heading marker is stripped)',
 		type: 'string'
 	});
-	pi.registerFlag('ralph-context', {
+	pi.registerFlag('ralph-max-context', {
 		description: 'Context percentage (0-100) at which Ralph starts a fresh iteration — overrides the session setting for this process',
 		type: 'string'
 	});
@@ -4510,7 +4510,7 @@ export default function (pi: ExtensionAPI) {
 				{
 					value: 'start',
 					label: 'start',
-					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal) or pi --ralph-goal <goal-text | goal-file.md> at session start (pi --ralph-context <percent> and pi --ralph-cycle <task|budget> override its context threshold and cycle mode). Markdown TODOs must be imported first: /ralph import TODO.md.'
+					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal) or pi --ralph-goal <goal-text | goal-file.md> at session start (pi --ralph-max-context <percent> and pi --ralph-cycle <task|budget> override its context threshold and cycle mode). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start.' },
 				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },

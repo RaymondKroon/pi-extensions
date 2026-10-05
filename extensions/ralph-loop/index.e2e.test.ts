@@ -324,7 +324,7 @@ async function createRalphSession(
 	});
 	const ralphFlags: Record<keyof NonNullable<typeof flags>, string> = {
 		goal: 'ralph-goal',
-		context: 'ralph-context',
+		context: 'ralph-max-context',
 		cycle: 'ralph-cycle'
 	};
 	for (const [key, value] of Object.entries(flags ?? {})) {
@@ -1296,7 +1296,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'--ralph-context and --ralph-cycle: the flag overrides reach the loop state at session start',
+		'--ralph-max-context and --ralph-cycle: the flag overrides reach the loop state at session start',
 		{ timeout: 60000 },
 		async () => {
 			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
@@ -1328,7 +1328,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
-		'--ralph-context and --ralph-cycle (invalid values): refused, the session settings stay in effect',
+		'--ralph-max-context and --ralph-cycle (invalid values): refused, the session settings stay in effect',
 		{ timeout: 60000 },
 		async () => {
 			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
