@@ -265,7 +265,7 @@ async function createRalphSession(
 	config: Record<string, unknown>,
 	bindings?: Record<string, unknown>,
 	onPi?: (pi: { events: { emit: (channel: string, data: unknown) => void } }) => void,
-	flagGoal?: string
+	flags?: { goal?: string; context?: string; cycle?: string }
 ) {
 	await writeFile(join(projectDir, '.pi', 'ralph-loop.json'), `${JSON.stringify(config, null, '\t')}\n`);
 
@@ -322,10 +322,15 @@ async function createRalphSession(
 		// real ~/.pi/agent/settings.json (e.g. compaction.keepRecentTokens).
 		agentDir
 	});
-	if (flagGoal !== undefined) {
-		// Mirror the real CLI order: the runner holds the --ralph-goal value
-		// BEFORE session_start fires (bindExtensions fires it below).
-		created.session.extensionRunner.setFlagValue('ralph-goal', flagGoal);
+	const ralphFlags: Record<keyof NonNullable<typeof flags>, string> = {
+		goal: 'ralph-goal',
+		context: 'ralph-context',
+		cycle: 'ralph-cycle'
+	};
+	for (const [key, value] of Object.entries(flags ?? {})) {
+		// Mirror the real CLI order: the runner holds the flag values BEFORE
+		// session_start fires (bindExtensions fires it below).
+		created.session.extensionRunner.setFlagValue(ralphFlags[key as keyof typeof ralphFlags], value);
 	}
 	// Pi's interactive/rpc modes call this during startup; a bare SDK session must
 	// bind extensions itself or they never receive session_start (and the ralph
@@ -1210,7 +1215,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				},
 				undefined,
 				undefined,
-				'Implement the flag end-to-end'
+				{ goal: 'Implement the flag end-to-end' }
 			);
 
 			// The goal is persisted to the session ralph file (created by the
@@ -1245,7 +1250,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				},
 				undefined,
 				undefined,
-				'goal.md'
+				{ goal: 'goal.md' }
 			);
 
 			const backlog = Backlog.open(join(agentDir, 'ralph', 'e2e-session.db'));
@@ -1278,7 +1283,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				},
 				undefined,
 				undefined,
-				'New goal text'
+				{ goal: 'New goal text' }
 			);
 
 			// No goal-loop iteration prompt was sent: no LLM request at all.
@@ -1287,6 +1292,68 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			const backlog = Backlog.open(join(agentDir, 'ralph', 'e2e-session.ralph'));
 			expect(backlog.goal()?.body).toBe('- Old goal body.');
 			expect(backlog.goal()?.status).toBe('claimed');
+		}
+	);
+
+	test(
+		'--ralph-context and --ralph-cycle: the flag overrides reach the loop state at session start',
+		{ timeout: 60000 },
+		async () => {
+			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
+			endpoint = startMockEndpoint([textResponder('Planning from the goal.')]);
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				undefined,
+				{ goal: 'Ship with a budget cycle', context: '10', cycle: 'budget' }
+			);
+
+			// The goal loop started with the overridden settings (the session
+			// config said 0.9 / the goal default is "task").
+			const stateEntry = [...sess.sessionManager.getEntries()].reverse().find(
+				(e) => e.type === 'custom' && e.customType === 'ralph-loop-state'
+			) as { data?: { contextThreshold?: number; cycleOn?: string; mode?: string } } | undefined;
+			expect(stateEntry?.data?.contextThreshold).toBe(0.1);
+			expect(stateEntry?.data?.cycleOn).toBe('budget');
+			expect(stateEntry?.data?.mode).toBe('goal');
+
+			// The loop is really running: the iteration prompt carries the goal.
+			await waitForRequestContaining('Ship with a budget cycle');
+		}
+	);
+
+	test(
+		'--ralph-context and --ralph-cycle (invalid values): refused, the session settings stay in effect',
+		{ timeout: 60000 },
+		async () => {
+			await rm(join(agentDir, 'ralph', 'e2e-session.ralph'));
+			endpoint = startMockEndpoint([textResponder('Planning from the goal.')]);
+			const sess = await createRalphSession(
+				endpoint.port,
+				{
+					contextThresholds: { __default__: 0.9 },
+					autoApproveDecisions: false,
+					maxIterations: 10
+				},
+				undefined,
+				undefined,
+				{ goal: 'Ship despite bad flags', context: 'not-a-number', cycle: 'weekly' }
+			);
+
+			// The invalid flags are refused: the loop starts with the session
+			// settings (0.9 / the goal default "task").
+			const stateEntry = [...sess.sessionManager.getEntries()].reverse().find(
+				(e) => e.type === 'custom' && e.customType === 'ralph-loop-state'
+			) as { data?: { contextThreshold?: number; cycleOn?: string; mode?: string } } | undefined;
+			expect(stateEntry?.data?.contextThreshold).toBe(0.9);
+			expect(stateEntry?.data?.cycleOn).toBe('task');
+
+			await waitForRequestContaining('Ship despite bad flags');
 		}
 	);
 });
