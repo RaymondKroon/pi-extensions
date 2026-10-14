@@ -122,20 +122,6 @@ const VISIBLE_FN = `(sel) => {
   return { tag: el.tagName, text: (el.textContent || '').trim().slice(0, 120) };
 }`;
 
-// One Runtime.evaluate with awaitPromise: raw CDP has no short per-command
-// timeout, so a single in-page async poll loop is reliable here (unlike the
-// Bun.WebView chrome backend, which forced the watcher+poll design).
-const WAIT_FN = `async (expr, timeoutMs) => {
-  const t0 = Date.now();
-  for (;;) {
-    let r;
-    try { r = eval(expr); } catch (e) { return { done: true, error: String(e), ms: Date.now() - t0 }; }
-    if (r) return { done: true, result: r, ms: Date.now() - t0 };
-    if (Date.now() - t0 > timeoutMs) return { done: true, result: null, ms: Date.now() - t0 };
-    await new Promise((res) => setTimeout(res, 500));
-  }
-}`;
-
 // Generic popup dismissal: modal dialogs, then toasts/notifications.
 // Best effort — it reports what it clicked so the caller can verify.
 // Project config (.pi/browser-interact.json → "dismiss") adds app-specific
@@ -299,22 +285,30 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 60_000, 1000), 300_000);
-      const expr = `(${WAIT_FN})(${JSON.stringify(params.expression)}, ${timeoutMs})`;
+      // Poll from the extension side: each iteration is a plain
+      // Runtime.evaluate (debug channel, exempt from page CSP). An in-page
+      // eval() loop would be blocked by strict CSP pages (e.g. Slack).
       const result = await run(params.tab, ctx.cwd, async (s) => {
-        for (let attempt = 0; attempt < 3; attempt++) {
+        const t0 = Date.now();
+        for (;;) {
           try {
-            return await evaluate(s, expr, { awaitPromise: true, timeoutMs: timeoutMs + 15_000 });
+            const r = await evaluate(s, params.expression, { timeoutMs: 10_000 });
+            if (r) return { done: true, result: r, ms: Date.now() - t0 };
           } catch (e: any) {
-            // A full page reload destroys the execution context and kills
-            // the promise — retry the wait on the (same, re-usable) session.
-            if (/context|navigat|destroyed/i.test(String(e?.message ?? e)) && attempt < 2) {
+            const msg = String(e?.message ?? e);
+            // A full page reload destroys the execution context — retry on
+            // the (same, re-usable) session. Anything else (e.g. a syntax
+            // error in the expression) is reported and stops the wait.
+            if (/context|navigat|destroyed/i.test(msg)) {
+              if (Date.now() - t0 > timeoutMs) return { done: true, result: null, ms: Date.now() - t0 };
               await new Promise((r) => setTimeout(r, 1000));
               continue;
             }
-            throw e;
+            return { done: true, error: msg, ms: Date.now() - t0 };
           }
+          if (Date.now() - t0 > timeoutMs) return { done: true, result: null, ms: Date.now() - t0 };
+          await new Promise((r) => setTimeout(r, 500));
         }
-        return null;
       });
       return { content: [{ type: "text", text: text(result ?? { done: true, result: null }) }] };
     },
@@ -390,10 +384,12 @@ export default function (pi: ExtensionAPI) {
     name: "tab_hover",
     label: "Tab Hover",
     description:
-      "Hover the mouse over a CSS selector in the target tab: polls until the element is visible and not covered, then dispatches a TRUSTED CDP mouseMoved to its centre so :hover / mouseenter / mouseover / hover styles fire (tooltips, hover menus, image previews). The mouse stays over the element, so a follow-up tab_click can click what the hover revealed. Pass waitFor to also wait for a result element (e.g. a tooltip or menu item) and return its tag/text. Fails with a reason: not-found, not-visible, covered-by-<el>.",
-    promptSnippet: "Trusted hover (mouseMoved) on a CSS selector in the target tab",
+      "Move the mouse in the target tab: over a CSS selector (polls until visible and not covered, then a TRUSTED CDP mouseMoved to its centre) or to exact viewport COORDINATES x/y (no polling; negative coords move the mouse outside the page). Fires :hover / mouseenter / mouseover so tooltips, hover menus and previews appear; the mouse STAYS where it is, so a follow-up tab_click can click what the hover revealed. The result reports elementAt — what is actually under the cursor: hover-generated overlays (link previews, menus) can land there, and the next jump may re-hover them. To UNHOVER reliably, move to an empty spot (e.g. x:-500, y:-500) — hovering body can land on a hover overlay and keep the hover alive. Pass waitFor to also wait for a result element (e.g. a tooltip or menu item) and return its tag/text. Selector mode fails with a reason: not-found, not-visible, covered-by-<el>.",
+    promptSnippet: "Trusted hover (mouseMoved) on a CSS selector or x/y coordinates in the target tab",
     parameters: Type.Object({
-      selector: Type.String({ description: "CSS selector of the element to hover" }),
+      selector: Type.Optional(Type.String({ description: "CSS selector of the element to hover (alternative to x/y)" })),
+      x: Type.Optional(Type.Number({ description: "Viewport x coordinate to move the mouse to (alternative to selector; pair with y). Negative = outside the page (unhover)." })),
+      y: Type.Optional(Type.Number({ description: "Viewport y coordinate to move the mouse to (alternative to selector; pair with x). Negative = outside the page (unhover)." })),
       waitFor: Type.Optional(
         Type.String({
           description:
@@ -404,28 +400,47 @@ export default function (pi: ExtensionAPI) {
       tab: TAB,
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      const byCoords = params.x !== undefined || params.y !== undefined;
+      if (byCoords === (params.selector !== undefined)) {
+        throw new Error("tab_hover: pass either a selector or BOTH x and y coordinates");
+      }
       const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 500), 120_000);
       const result = await run(params.tab, ctx.cwd, async (s) => {
-        const t0 = Date.now();
-        let last: any = null;
-        let st: any = null;
-        for (;;) {
-          st = await evaluate(s, `(${HOVER_ACTIONABILITY})(${JSON.stringify(params.selector)})`, {
-            timeoutMs: 10_000,
-          });
-          if (st?.ok) break;
-          last = st;
-          if (Date.now() - t0 > timeoutMs) {
-            throw new Error(
-              `hover: selector "${params.selector}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
-            );
+        let st: { x: number; y: number; tag?: string; text?: string };
+        if (params.selector !== undefined) {
+          const t0 = Date.now();
+          let last: any = null;
+          for (;;) {
+            const chk = await evaluate(s, `(${HOVER_ACTIONABILITY})(${JSON.stringify(params.selector)})`, {
+              timeoutMs: 10_000,
+            });
+            if (chk?.ok) {
+              st = chk;
+              break;
+            }
+            last = chk;
+            if (Date.now() - t0 > timeoutMs) {
+              throw new Error(
+                `hover: selector "${params.selector}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
+              );
+            }
+            await new Promise((r) => setTimeout(r, 500));
           }
-          await new Promise((r) => setTimeout(r, 500));
+        } else {
+          st = { x: Number(params.x), y: Number(params.y) };
         }
         // The trusted mouse move IS the hover: Blink fires mousemove/
-        // mouseover/mouseenter at the new position, and the position is
+        // mouseover/mouseenter at the new position (full enter/leave chains
+        // when the jump crosses element boundaries), and the position is
         // retained for the next action.
         await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: st.x, y: st.y }, 10_000);
+        // What is ACTUALLY under the cursor now — hover overlays can
+        // intercept; null means outside the page content (unhovered).
+        const elementAt = await evaluate(
+          s,
+          `(() => { const el = document.elementFromPoint(${st.x}, ${st.y}); return el ? { tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) } : null })()`,
+          { timeoutMs: 10_000 },
+        );
         let wait: { selector: string; found: boolean; tag?: string; text?: string; ms: number } | undefined;
         if (params.waitFor) {
           const wt0 = Date.now();
@@ -442,7 +457,7 @@ export default function (pi: ExtensionAPI) {
             ms: Date.now() - wt0,
           };
         }
-        return { ok: true, trusted: true, hovered: { tag: st.tag, text: st.text }, ...(wait ? { wait } : {}) };
+        return { ok: true, trusted: true, hovered: st.tag ? { tag: st.tag, text: st.text } : { x: st.x, y: st.y }, elementAt, ...(wait ? { wait } : {}) };
       });
       return { content: [{ type: "text", text: text(result) }] };
     },

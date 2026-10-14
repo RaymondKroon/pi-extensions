@@ -5,8 +5,9 @@
 //
 // Unlike a per-process WebView bridge (short per-command timeouts, in-page
 // console hook), raw CDP:
-//   - has no per-command timeout, so `wait` is ONE Runtime.evaluate with
-//     awaitPromise (an in-page async poll loop) instead of a watcher + poll;
+//   - has no per-command timeout, but `evaluate` adds one; `wait` polls
+//     from the extension side (each poll is a plain Runtime.evaluate —
+//     an in-page eval() loop would be blocked by strict CSP pages);
 //   - delivers console events (Runtime.consoleAPICalled / exceptionThrown)
 //     directly, surviving full page reloads — no in-page hook to reinstall;
 //   - can dispatch TRUSTED input (Input.dispatchMouseEvent / insertText /
