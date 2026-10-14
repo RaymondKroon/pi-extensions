@@ -58,6 +58,7 @@ the pattern), then falls back to the URL pattern.
 | `tab_wait "<expr>" [ms]` | wait until a **synchronous** expression is truthy (default 60 s, max 300 s). One in-page async poll loop — raw CDP has no short per-command timeout, so no watcher+poll workaround is needed. Survives full reloads (retries on destroyed context). |
 | `tab_screenshot [path]` | PNG of the viewport (default `/tmp/tab-<host>-shot.png`); read the file with the `read` tool |
 | `tab_click "<selector>" [ms]` | polls actionability (default 10 s), then a **trusted** CDP mouse sequence at the element's centre. Fails with a reason: `not-found`, `not-visible`, `disabled`, `covered-by-<el>` (fix the overlay/selector, don't retry blindly) |
+| `tab_hover "<selector>" [waitFor] [ms]` | trusted CDP `mouseMoved` to the element's centre — fires `:hover` / `mouseenter` / `mouseover` / hover styles (tooltips, hover menus, previews). The mouse **stays** over the element, so a follow-up `tab_click` can click what the hover revealed. `waitFor` is a selector that should appear as a result of the hover (e.g. a tooltip); its tag/text is returned. Fails with `not-found`, `not-visible`, `covered-by-<el>` (no `disabled` gate — hover on disabled elements is valid) |
 | `tab_type "<text>"` | trusted `Input.insertText` into the **focused** element (click the field first); fires `input`, no `keydown` |
 | `tab_press "<key>"` | trusted key event: Enter (**submits the focused form** — the keyDown carries `text: "\r"`, which is what triggers Blink's implicit form submission; a bare keyDown does not), Tab, Escape, Backspace, Delete, arrows, Home/End, PageUp/Down, Space, or one character |
 | `tab_scroll <x> <y>` / `tab_scroll "<selector>"` | scroll by offset or element into view |
@@ -88,7 +89,7 @@ the id so the model has it in context when needed.
 
 1. `tab_status` — which page is the tab on?
 2. `tab_dismiss` — clear any lingering popups (they block clicks and corrupt screenshots).
-3. Interact: `tab_click` / `tab_type` / `tab_press` / `tab_navigate`.
+3. Interact: `tab_click` / `tab_hover` / `tab_type` / `tab_press` / `tab_navigate`.
 4. `tab_wait` after anything that changes the page — an SPA click often does not fire `load`.
 5. Use `tab_screenshot` at useful visual checkpoints—for example, before an action
    that depends on layout or to verify an important visible change. Don't screenshot

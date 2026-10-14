@@ -2,7 +2,7 @@
 //
 // Drives ONE Chrome tab (already running with --remote-debugging-port=9222)
 // over raw CDP: status, list, evaluate, wait, screenshot, click (trusted input),
-// type, press, scroll, console, dismiss, navigate, open, close.
+// hover, type, press, scroll, console, dismiss, navigate, open, close.
 //
 // Same discipline as a dedicated app bridge (one persistent attach per tab,
 // dismiss before interacting, wait after navigation, console as evidence)
@@ -87,6 +87,39 @@ const ACTIONABILITY = `(sel) => {
     return { ok: false, reason: 'covered-by-' + (top.tagName || '?').toLowerCase() + (cls ? '.' + cls : '') };
   }
   return { ok: true, x, y, tag: el.tagName, text: (el.textContent || el.value || '').trim().slice(0, 80) };
+}`;
+
+// Hover actionability: same as click, minus the disabled check — hover is
+// still meaningful on disabled elements (tooltips on greyed-out buttons),
+// and a disabled parent must not block hovering a live child.
+const HOVER_ACTIONABILITY = `(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: 'not-found' };
+  const style = getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden') return { ok: false, reason: 'not-visible' };
+  let r = el.getBoundingClientRect();
+  if (r.width === 0 && r.height === 0) return { ok: false, reason: 'not-visible' };
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  r = el.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  const top = document.elementFromPoint(x, y);
+  if (top && top !== el && !el.contains(top)) {
+    const cls = String(top.className || '').split(/\\s+/)[0];
+    return { ok: false, reason: 'covered-by-' + (top.tagName || '?').toLowerCase() + (cls ? '.' + cls : '') };
+  }
+  return { ok: true, x, y, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) };
+}`;
+
+// Is `sel` in the DOM and visible? Returns { tag, text } or null — used to
+// confirm a hover produced its result (tooltip, hover menu, preview).
+const VISIBLE_FN = `(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return null;
+  const cs = getComputedStyle(el);
+  if (cs.display === 'none' || cs.visibility === 'hidden') return null;
+  const r = el.getBoundingClientRect();
+  if (r.width === 0 && r.height === 0) return null;
+  return { tag: el.tagName, text: (el.textContent || '').trim().slice(0, 120) };
 }`;
 
 // One Runtime.evaluate with awaitPromise: raw CDP has no short per-command
@@ -348,6 +381,68 @@ export default function (pi: ExtensionAPI) {
           }
           await new Promise((r) => setTimeout(r, 500));
         }
+      });
+      return { content: [{ type: "text", text: text(result) }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "tab_hover",
+    label: "Tab Hover",
+    description:
+      "Hover the mouse over a CSS selector in the target tab: polls until the element is visible and not covered, then dispatches a TRUSTED CDP mouseMoved to its centre so :hover / mouseenter / mouseover / hover styles fire (tooltips, hover menus, image previews). The mouse stays over the element, so a follow-up tab_click can click what the hover revealed. Pass waitFor to also wait for a result element (e.g. a tooltip or menu item) and return its tag/text. Fails with a reason: not-found, not-visible, covered-by-<el>.",
+    promptSnippet: "Trusted hover (mouseMoved) on a CSS selector in the target tab",
+    parameters: Type.Object({
+      selector: Type.String({ description: "CSS selector of the element to hover" }),
+      waitFor: Type.Optional(
+        Type.String({
+          description:
+            "CSS selector that should APPEAR as a result of the hover (e.g. a tooltip or hover-menu item); waits for it before returning",
+        }),
+      ),
+      timeoutMs: Type.Optional(Type.Number({ description: "Max wait for actionability / waitFor in ms (default 10000)" })),
+      tab: TAB,
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 500), 120_000);
+      const result = await run(params.tab, ctx.cwd, async (s) => {
+        const t0 = Date.now();
+        let last: any = null;
+        let st: any = null;
+        for (;;) {
+          st = await evaluate(s, `(${HOVER_ACTIONABILITY})(${JSON.stringify(params.selector)})`, {
+            timeoutMs: 10_000,
+          });
+          if (st?.ok) break;
+          last = st;
+          if (Date.now() - t0 > timeoutMs) {
+            throw new Error(
+              `hover: selector "${params.selector}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
+            );
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        // The trusted mouse move IS the hover: Blink fires mousemove/
+        // mouseover/mouseenter at the new position, and the position is
+        // retained for the next action.
+        await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: st.x, y: st.y }, 10_000);
+        let wait: { selector: string; found: boolean; tag?: string; text?: string; ms: number } | undefined;
+        if (params.waitFor) {
+          const wt0 = Date.now();
+          let found: any = null;
+          for (;;) {
+            found = await evaluate(s, `(${VISIBLE_FN})(${JSON.stringify(params.waitFor)})`, { timeoutMs: 10_000 });
+            if (found || Date.now() - wt0 > timeoutMs) break;
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          wait = {
+            selector: params.waitFor,
+            found: !!found,
+            ...(found ? { tag: found.tag, text: found.text } : {}),
+            ms: Date.now() - wt0,
+          };
+        }
+        return { ok: true, trusted: true, hovered: { tag: st.tag, text: st.text }, ...(wait ? { wait } : {}) };
       });
       return { content: [{ type: "text", text: text(result) }] };
     },
