@@ -16,11 +16,11 @@
 //   4. the active page tab (shortest URL fallback if Chrome reports none)
 // Port: $BROWSER_INTERACT_PORT, else config `port`, else 9222.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { CdpManager, evaluate, screenshot, type CdpTarget } from "./cdp";
+import { CdpManager, evaluate, screenshot, type CdpSession, type CdpTarget } from "./cdp";
 
 const DEFAULT_PORT = 9222;
 
@@ -166,6 +166,208 @@ function dismissExpression(dismiss?: DismissConfig): string {
 })()`;
 }
 
+// --------------------------------------------------------------------- lens
+
+// In-page "lens" overlay, injected with Page.addScriptToEvaluateOnNewDocument
+// (CSP-exempt like Runtime.evaluate, and it re-installs automatically on every
+// reload/navigation of the attached target). The USER draws bounding boxes on
+// the live page, types a note for each, and the agent reads them back with
+// tab_lens (which also saves a cropped screenshot per box).
+//
+// State lives in window.__piLens (idempotent install: the guard returns the
+// existing API) plus sessionStorage, so notes and the on/off state survive a
+// reload in the same tab. Boxes are stored in DOCUMENT coordinates so they
+// stay anchored while scrolling; markers re-render on scroll.
+// NOTE: no backticks / template interpolation inside — this is one big TS
+// template literal and the page code uses plain string concatenation.
+// (LENS_V is the one controlled interpolation.)
+const LENS_V = 5;
+const LENS_SCRIPT = `(() => {
+  const LENS_V = ${LENS_V};
+  if (window.__piLens && window.__piLens.__v !== LENS_V) {
+    // Upgrade: drop a stale overlay version before installing the new one.
+    // Remove its WINDOW listeners too — otherwise every old version keeps
+    // re-rendering duplicate markers on scroll/click.
+    try {
+      const L = window.__piLensListeners;
+      if (L) {
+        window.removeEventListener("mousedown", L.mousedown, true);
+        window.removeEventListener("mousemove", L.mousemove, true);
+        window.removeEventListener("mouseup", L.mouseup, true);
+        window.removeEventListener("keydown", L.keydown, true);
+        window.removeEventListener("scroll", L.scroll);
+      }
+      document.querySelectorAll("[data-pi-lens], #__pi_lens_btn, #__pi_lens_box, #__pi_lens_panel, .pi-lens-marker, .pi-lens-chip").forEach((n) => n.remove());
+    } catch (e) {}
+    window.__piLensListeners = null;
+    window.__piLens = undefined;
+  }
+  if (window.__piLens) return window.__piLens;
+  const NKEY = "__pi_lens_notes";
+  const EKEY = "__pi_lens_enabled";
+  let notes = [];
+  try { notes = JSON.parse(sessionStorage.getItem(NKEY) || "[]"); } catch (e) { notes = []; }
+  let enabled = false;
+  try { enabled = sessionStorage.getItem(EKEY) === "1"; } catch (e) {}
+  const Z = 2147483647;
+  const style = document.createElement("style");
+  style.setAttribute("data-pi-lens", "style");
+  style.textContent =
+    "html.__pi_lens_on, html.__pi_lens_on body { cursor: crosshair !important; }" +
+    "#__pi_lens_btn { position: fixed; right: 16px; bottom: 16px; z-index: " + Z + "; pointer-events: auto; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 999px; padding: 6px 12px; font: 12px/1.4 ui-sans-serif, system-ui, sans-serif; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.4); }" +
+    "#__pi_lens_btn.on { background: #1d4ed8; border-color: #3b82f6; color: #fff; }" +
+    "#__pi_lens_box { position: fixed; z-index: " + (Z - 1) + "; pointer-events: none; display: none; border: 2px solid #2563eb; background: rgba(37,99,235,.10); }" +
+    ".pi-lens-marker { position: fixed; z-index: " + (Z - 2) + "; pointer-events: none; border: 1px solid rgba(37,99,235,.8); background: rgba(37,99,235,.06); }" +
+    ".pi-lens-chip { position: fixed; z-index: " + (Z - 1) + "; pointer-events: auto; cursor: pointer; background: #2563eb; color: #fff; border-radius: 4px 4px 4px 0; padding: 1px 6px; font: 11px/1.5 ui-sans-serif, system-ui, sans-serif; white-space: nowrap; }" +
+    ".pi-lens-chip:hover { background: #dc2626; }" +
+    "#__pi_lens_panel { position: fixed; z-index: " + Z + "; pointer-events: auto; display: none; background: #fff; color: #111827; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.25); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }" +
+    "#__pi_lens_input { width: 320px; max-width: 60vw; padding: 6px 8px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; }" +
+    "#__pi_lens_hint { margin-top: 4px; color: #6b7280; font-size: 11px; }";
+  document.documentElement.appendChild(style);
+  const box = document.createElement("div"); box.id = "__pi_lens_box";
+  const panel = document.createElement("div"); panel.id = "__pi_lens_panel";
+  const input = document.createElement("input"); input.id = "__pi_lens_input"; input.maxLength = 500; input.placeholder = "note for the agent...";
+  const hint = document.createElement("div"); hint.id = "__pi_lens_hint"; hint.textContent = "enter = save · esc = cancel";
+  panel.appendChild(input); panel.appendChild(hint);
+  const btn = document.createElement("button"); btn.id = "__pi_lens_btn";
+  document.documentElement.appendChild(box);
+  document.documentElement.appendChild(panel);
+  document.documentElement.appendChild(btn);
+  const markers = [];
+  const place = (el, x, y, w, h) => { el.style.left = x + "px"; el.style.top = y + "px"; el.style.width = w + "px"; el.style.height = h + "px"; };
+  const save = () => { try { sessionStorage.setItem(NKEY, JSON.stringify(notes)); } catch (e) {} };
+  // Signal queue for the extension (polled; console events are dropped by
+  // the Browser Bridge proxy, so the page cannot push directly).
+  let signals = [];
+  const push = (sig) => { signals.push(sig); };
+  const removeNote = (i) => {
+    if (i < 1 || i > notes.length) return;
+    notes.splice(i - 1, 1); save(); render();
+    push({ type: "note-removed", index: i });
+  };
+  const render = () => {
+    for (const m of markers) m.remove(); markers.length = 0;
+    if (!enabled) return;
+    notes.forEach((n, i) => {
+      const x = n.docX - window.scrollX, y = n.docY - window.scrollY;
+      if (x > window.innerWidth || y > window.innerHeight || x + n.w < 0 || y + n.h < 0) return;
+      const d = document.createElement("div"); d.className = "pi-lens-marker"; place(d, Math.max(0, x), Math.max(0, y), n.w, n.h);
+      document.documentElement.appendChild(d); markers.push(d);
+      const c = document.createElement("div"); c.className = "pi-lens-chip";
+      c.textContent = (i + 1) + (n.text ? " " + n.text : "") + " \u2715";
+      c.title = "click to remove this note";
+      c.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); removeNote(i + 1); }, true);
+      c.style.left = Math.max(0, x) + "px";
+      c.style.top = Math.max(0, y - 18) + "px";
+      document.documentElement.appendChild(c); markers.push(c);
+    });
+  };
+  let drag = null, pending = null;
+  const overLens = (t) => !!(t && t.closest && (t.closest("#__pi_lens_panel") || t.closest("#__pi_lens_btn") || t.closest(".pi-lens-chip")));
+  const setEnabled = (on) => {
+    enabled = !!on;
+    try { sessionStorage.setItem(EKEY, enabled ? "1" : "0"); } catch (e) {}
+    document.documentElement.classList.toggle("__pi_lens_on", enabled);
+    btn.classList.toggle("on", enabled);
+    btn.textContent = enabled ? "🔍 pi-lens ON (esc to turn off)" : "🔍 pi-lens";
+    if (!enabled) {
+      box.style.display = "none"; panel.style.display = "none";
+      drag = null; pending = null;
+      for (const m of markers) m.remove(); markers.length = 0;
+    } else {
+      render();
+    }
+  };
+  btn.addEventListener("click", () => setEnabled(!enabled));
+  const onMousedown = (e) => {
+    if (!enabled || e.button !== 0 || overLens(e.target)) return;
+    e.preventDefault();
+    drag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY };
+    box.style.display = "block";
+  };
+  const onMousemove = (e) => {
+    if (!drag) return;
+    drag.x1 = e.clientX; drag.y1 = e.clientY;
+    place(box, Math.min(drag.x0, drag.x1), Math.min(drag.y0, drag.y1), Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0));
+  };
+  const onMouseup = (e) => {
+    if (!drag) return;
+    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
+    const w = Math.abs(drag.x1 - drag.x0), h = Math.abs(drag.y1 - drag.y0);
+    drag = null;
+    if (w < 8 || h < 8) { box.style.display = "none"; return; } // accidental click, ignore
+    pending = { x, y, w, h };
+    input.value = "";
+    panel.style.display = "block";
+    const pw = 340;
+    panel.style.left = Math.max(8, Math.min(x + w / 2, window.innerWidth - pw)) + "px";
+    const above = y - 90 > 8 ? y - 90 : y + h + 10; // prefer above the box
+    panel.style.top = Math.max(8, Math.min(above, window.innerHeight - 90)) + "px";
+    input.focus();
+  };
+  window.addEventListener("mousedown", onMousedown, true);
+  window.addEventListener("mousemove", onMousemove, true);
+  window.addEventListener("mouseup", onMouseup, true);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (!pending) return;
+      notes.push({
+        docX: Math.round(pending.x + window.scrollX),
+        docY: Math.round(pending.y + window.scrollY),
+        w: Math.round(pending.w),
+        h: Math.round(pending.h),
+        text: input.value.trim(),
+        t: new Date().toISOString(),
+      });
+      save();
+      pending = null;
+      panel.style.display = "none";
+      box.style.display = "none";
+      render();
+      push({ type: "note-saved", index: notes.length, text: notes[notes.length - 1].text });
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      pending = null;
+      panel.style.display = "none";
+      box.style.display = "none";
+    }
+  });
+  const onKeydown = (e) => {
+    if (e.key !== "Escape" || !enabled || e.target === input) return; // input handler owns its own esc
+    if (pending) { pending = null; panel.style.display = "none"; box.style.display = "none"; return; }
+    setEnabled(false);
+  };
+  const onScroll = () => { if (enabled) render(); };
+  window.addEventListener("keydown", onKeydown, true);
+  window.addEventListener("scroll", onScroll, { passive: true });
+  // Track window listeners so a newer overlay version can remove them.
+  window.__piLensListeners = { mousedown: onMousedown, mousemove: onMousemove, mouseup: onMouseup, keydown: onKeydown, scroll: onScroll };
+  const snapshot = () => ({
+    enabled: enabled,
+    url: location.href,
+    title: document.title,
+    notes: notes.map((n, i) => ({
+      index: i + 1,
+      x: Math.round(n.docX - window.scrollX), // viewport coords at snapshot time
+      y: Math.round(n.docY - window.scrollY),
+      docX: n.docX, docY: n.docY, w: n.w, h: n.h,
+      text: n.text,
+      time: n.t,
+    })),
+  });
+  window.__piLens = {
+    __v: LENS_V,
+    setEnabled: setEnabled,
+    snapshot: snapshot,
+    clear: () => { notes = []; save(); render(); },
+    remove: removeNote,
+    popSignals: () => { const out = signals; signals = []; return out; },
+  };
+  setEnabled(enabled);
+  return window.__piLens;
+})();`;
+
 const KEYS: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
   Enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
   Tab: { key: "Tab", code: "Tab", keyCode: 9 },
@@ -207,6 +409,19 @@ function keySpec(key: string): { key: string; code: string; keyCode: number; tex
 export default function (pi: ExtensionAPI) {
   const mgr = new CdpManager();
 
+  // Auto-push: when the user saves a lens note in the browser, the overlay
+  // pings us via a [pi-lens] console signal; surface it as a user message so
+  // the agent checks the lens without being told.
+  mgr.onPageSignal = (sig) => {
+    if (sig.type !== "note-saved") return;
+    const index = String(sig.index ?? "?");
+    const text = typeof sig.text === "string" && sig.text ? `: "${sig.text}"` : "";
+    pi.sendUserMessage(
+      `[lens] note ${index} saved${text} on the page — call tab_lens to read the annotations and their cropped screenshots.`,
+      { deliverAs: "steer" },
+    );
+  };
+
   const resolveConfig = (cwd: string): void => {
     const cfg = loadConfig(cwd);
     mgr.port = Number(process.env.BROWSER_INTERACT_PORT) || cfg.port || DEFAULT_PORT;
@@ -234,6 +449,143 @@ export default function (pi: ExtensionAPI) {
       host = new URL(url).hostname || "page";
     } catch {}
     return `/tmp/tab-${host.replace(/[^a-z0-9.-]/gi, "_")}-shot.png`;
+  };
+
+  // ------------------------------------------------------------------ lens --
+
+  /** Install the lens overlay on the target: best-effort per-document install
+   * script (auto re-install on reload) plus a runtime check — if the current
+   * document lacks the overlay (registration lost to a re-attach or proxy
+   * quirk), inject it directly. Notes survive all of this via sessionStorage. */
+  const ensureLens = async (s: CdpSession): Promise<void> => {
+    // Re-register the new-document script when the source changed (extension
+    // update) — a stale registration would keep installing the old overlay.
+    if (!s.lensScriptId || s.lensScriptSource !== LENS_SCRIPT) {
+      if (s.lensScriptId) {
+        await s.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: s.lensScriptId }, 5_000).catch(() => {});
+      }
+      const { identifier } = await s.send(
+        "Page.addScriptToEvaluateOnNewDocument",
+        { source: LENS_SCRIPT },
+        10_000,
+      );
+      s.lensScriptId = identifier;
+      s.lensScriptSource = LENS_SCRIPT;
+    }
+    const has = await evaluate(s, `!!(window.__piLens && window.__piLens.__v === ${LENS_V})`, { timeoutMs: 10_000 }).catch(
+      () => false,
+    );
+    if (!has) await evaluate(s, LENS_SCRIPT, { timeoutMs: 10_000 });
+    startLensPoll();
+  };
+
+  // Signal poller: the Browser Bridge proxy drops Runtime.consoleAPICalled
+  // events, so the overlay cannot push note events from the page. While any
+  // attached session has the lens installed, pop its signal queue and
+  // deliver them via mgr.onPageSignal (which pushes into the pi session).
+  let lensPoll: ReturnType<typeof setInterval> | null = null;
+  let lensPollBusy = false;
+  const pollLensSignals = async () => {
+    if (lensPollBusy) return;
+    lensPollBusy = true;
+    try {
+      let anyLens = false;
+      for (const a of mgr.attached()) {
+        const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
+        if (!s || !s.lensScriptId) continue;
+        anyLens = true;
+        const sigs = await evaluate(s, "window.__piLens ? window.__piLens.popSignals() : []", {
+          timeoutMs: 3_000,
+        }).catch(() => []);
+        if (Array.isArray(sigs)) for (const sig of sigs) if (sig && typeof sig === "object") mgr.onPageSignal?.(sig);
+      }
+      if (!anyLens && lensPoll) {
+        clearInterval(lensPoll);
+        lensPoll = null;
+      }
+    } finally {
+      lensPollBusy = false;
+    }
+  };
+  const startLensPoll = () => {
+    if (lensPoll) return;
+    lensPoll = setInterval(pollLensSignals, 1_500);
+  };
+
+  const LENS_ACTIONS = ["on", "off", "list", "clear"] as const;
+  type LensAction = (typeof LENS_ACTIONS)[number];
+
+  /** Shared by the tab_lens tool and the /tab lens command; returns text. */
+  const lensAction = async (action: LensAction, cwd: string, tab?: string): Promise<string> => {
+    if (action === "on" || action === "off") {
+      await run(tab, cwd, async (s) => {
+        await ensureLens(s);
+        await evaluate(s, `window.__piLens && window.__piLens.setEnabled(${action === "on"})`, {
+          timeoutMs: 10_000,
+        });
+      });
+      return action === "on"
+        ? "lens armed — in the browser: drag a box around what to show, type the note in the pop-up and press Enter (drag more boxes for more notes; Esc turns the lens off). Read it back with tab_lens {action:'list'}."
+        : "lens disarmed — annotations are kept; read them with tab_lens {action:'list'}";
+    }
+    if (action === "clear") {
+      await run(tab, cwd, async (s) => {
+        await ensureLens(s);
+        await evaluate(s, "window.__piLens && window.__piLens.clear()", { timeoutMs: 10_000 });
+      });
+      return "ok — lens annotations cleared";
+    }
+    // list: read the annotations, then save a cropped screenshot per box.
+    const snap: any = await run(tab, cwd, async (s) => {
+      await ensureLens(s);
+      const r = await evaluate(s, "window.__piLens ? window.__piLens.snapshot() : null", { timeoutMs: 10_000 });
+      if (!r) throw new Error("lens is not installed on this page — arm it with action:'on' (or /tab lens on)");
+      return r;
+    });
+    let host = "page";
+    try {
+      host = new URL(snap.url).hostname || "page";
+    } catch {}
+    host = host.replace(/[^a-z0-9.-]/gi, "_");
+    const annotated: any[] = [];
+    for (const n of snap.notes ?? []) {
+      const p = `/tmp/tab-${host}-lens-${n.index}.png`;
+      await run(tab, cwd, async (s) => {
+        // Scroll the box into view first so lazy-loaded content (images,
+        // iframes) renders. The clip itself is in DOCUMENT coordinates with
+        // captureBeyondViewport — a viewport-relative clip captures the wrong
+        // region (verified: dark top-margin instead of the box).
+        await evaluate(s, `window.scrollTo(0, ${Math.max(0, n.docY - 100)})`, { timeoutMs: 10_000 });
+        await new Promise((r) => setTimeout(r, 250)); // let lazy content settle
+        const { data } = await s.send(
+          "Page.captureScreenshot",
+          {
+            format: "png",
+            captureBeyondViewport: true,
+            clip: {
+              x: Math.round(n.docX),
+              y: Math.round(n.docY),
+              width: Math.round(n.w),
+              height: Math.round(n.h),
+              scale: 1,
+            },
+          },
+          30_000,
+        );
+        writeFileSync(p, Buffer.from(String(data), "base64"));
+      });
+      annotated.push({ ...n, screenshot: p });
+    }
+    return text({
+      url: snap.url,
+      title: snap.title,
+      lensEnabled: !!snap.enabled,
+      count: (snap.notes ?? []).length,
+      notes: annotated,
+      hint: annotated.length
+        ? "read each note's screenshot with the read tool to see exactly what the user framed"
+        : "no annotations yet — arm the lens (action:'on') and ask the user to drag a box in the browser, type the note and press Enter",
+    });
   };
 
   pi.registerTool({
@@ -326,6 +678,35 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const out = await run(params.tab, ctx.cwd, (s) => screenshot(s, params.path ?? defaultShot(s.url)));
+      return { content: [{ type: "text", text: out }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "tab_lens",
+    label: "Tab Lens",
+    description:
+      "A LENS the USER uses to show you things on the page. action 'on': arms bounding-box selection in the live browser tab (floating 'pi-lens' button, crosshair; the user drags a box around a region, types a note in the pop-up input and presses Enter; repeat for multiple boxes; Esc disarms). 'off': disarms (annotations kept). 'list' (default): returns the annotations (viewport + document coords, note text, timestamp) and saves a cropped PNG of each box to /tmp. 'clear': removes all annotations (removing a single box: the user clicks its numbered chip in the browser). Saving a note pushes a message into the session automatically. After the user has drawn boxes, call action:'list' and read the returned screenshot files with the read tool to see what they framed.",
+    promptSnippet: "Lens: user-drawn bounding boxes + notes on the page, read back with cropped screenshots",
+    parameters: Type.Object({
+      action: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("on"),
+            Type.Literal("off"),
+            Type.Literal("list"),
+            Type.Literal("clear"),
+          ],
+          {
+            description:
+              "on = arm box selection in the browser; off = disarm; list = read annotations + save cropped screenshots (default); clear = remove all annotations",
+          },
+        ),
+      ),
+      tab: TAB,
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const out = await lensAction(params.action ?? "list", ctx.cwd, params.tab);
       return { content: [{ type: "text", text: out }] };
     },
   });
@@ -676,15 +1057,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    if (lensPoll) clearInterval(lensPoll);
+    lensPoll = null;
     mgr.closeAll();
   });
 
   pi.registerCommand("tab", {
     description:
-      "browser-interact: show tab status, check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
+      "browser-interact: show tab status, arm the page lens with /tab lens [on|off|list|clear], check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
     getArgumentCompletions: (prefix) => {
       if (/\s/.test(prefix)) return null; // only complete the subcommand itself
       const subs = [
+        { value: "lens ", label: "lens [on|off|list|clear]", description: "arm/read the page lens (user draws boxes + notes in the browser)" },
         { value: "check ", label: "check <url>", description: "check a URL against the CDT allowlist" },
         { value: "shutdown", label: "shutdown", description: "close all CDP sessions" },
       ];
@@ -696,6 +1080,16 @@ export default function (pi: ExtensionAPI) {
       if (args?.trim() === "shutdown") {
         mgr.closeAll();
         ctx.ui.notify("browser-interact: all CDP sessions closed", "info");
+        return;
+      }
+      const lens = args?.trim().match(/^lens(?:\s+(on|off|list|clear))?$/);
+      if (lens) {
+        try {
+          const out = await lensAction((lens[1] ?? "list") as LensAction, ctx.cwd);
+          ctx.ui.notify(out, "info");
+        } catch (e: any) {
+          ctx.ui.notify(String(e?.message ?? e), "error");
+        }
         return;
       }
       const check = args?.trim().match(/^check\s+(.+)$/);
@@ -720,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
       const arg = args?.trim();
       if (arg) {
         ctx.ui.notify(
-          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab check <url>, or /tab shutdown`,
+          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab lens [on|off|list|clear], /tab check <url>, or /tab shutdown`,
           "error",
         );
         return;

@@ -41,7 +41,12 @@ export class CdpSession {
   closed = false;
   /** console.error / console.warn / uncaught exceptions, oldest first, capped. */
   consoleBuffer: string[] = [];
-  private ws: WebSocket;
+  /** id from Page.addScriptToEvaluateOnNewDocument, set once the lens overlay
+   * is armed on this target (so it re-installs automatically on every reload). */
+  lensScriptId?: string;
+  /** source of the installed new-document script (re-register when it changes,
+   * e.g. after an extension update). */
+  lensScriptSource?: string;  private ws: WebSocket;
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private listeners = new Map<string, Set<(params: any) => void>>();
@@ -171,6 +176,11 @@ export async function evaluate(
 export class CdpManager {
   port = 9222;
   defaultTab?: string;
+  /** Fired when the lens overlay delivers a queued note signal (polled from
+   * the page — see the lens poller in index.ts; console events are dropped by
+   * the Browser Bridge proxy, so the page queues signals and the extension
+   * pops them). */
+  onPageSignal?: (signal: Record<string, unknown>) => void;
   private sessions = new Map<string, CdpSession>();
   /** Last attached target id per key — lets us re-attach even after the tab
    * navigated to a URL that no longer matches the pattern. */
@@ -178,6 +188,11 @@ export class CdpManager {
 
   keyFor(pattern?: string): string {
     return pattern ?? this.defaultTab ?? "*";
+  }
+
+  /** The live session for a pattern, if any (used by the lens signal poller). */
+  sessionFor(pattern?: string): CdpSession | undefined {
+    return this.sessions.get(this.keyFor(pattern));
   }
 
   /** Is Chrome reachable on the debug port? (Cheap: one /json fetch.) */
