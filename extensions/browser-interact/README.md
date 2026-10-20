@@ -64,6 +64,7 @@ the pattern), then falls back to the URL pattern.
 | `tab_press "<key>"` | trusted key event: Enter (**submits the focused form** — the keyDown carries `text: "\r"`, which is what triggers Blink's implicit form submission; a bare keyDown does not), Tab, Escape, Backspace, Delete, arrows, Home/End, PageUp/Down, Space, or one character |
 | `tab_scroll <x> <y>` / `tab_scroll "<selector>"` | scroll by offset or element into view |
 | `tab_console [clear]` | `console.error`/`warn` + uncaught exceptions captured via CDP events (survives reloads — no in-page hook) |
+| `tab_network [filter] [types] [failedOnly] [limit] [clear]` | HTTP requests captured via the CDP **Network domain** since attach (survives reloads; buffer capped at 250; redirect hops excluded). Each row: method, status (number, or `pending`/`failed`), resource type, response size, duration, url. `filter` matches a URL substring; `types` filters by resource type (default `document`, `xhr`, `fetch` — pass e.g. `["script","image"]` for assets); `failedOnly` shows failures/pending/4xx/5xx only; `limit` caps the rows (default 30, max 200, newest last); `clear` empties the buffer. Types are normalized to lowercase (Chrome reports `Fetch`/`XHR` capitalized) |
 | `tab_dismiss` | detect and close visible modal dialogs / toasts (app-specific extras via config); returns `{dismissed, items[]}` — `type: "waiting"` items are visible but cannot be dismissed. **Run before navigating or interacting.** |
 | `tab_navigate "<url>"` | navigate and wait for `readyState === "complete"` |
 | `tab_open [url]` | open a **new** tab (`/json/new`); returns the new tab's target id + url. Does not touch existing tabs |
@@ -84,8 +85,43 @@ the id so the model has it in context when needed.
 
 - `/tab` — show attached tabs and their current page
 - `/tab lens [on|off|list|clear]` — arm/read the page lens (see `tab_lens`); arming with `on` makes the floating **🔍 pi-lens** button appear and selection mode active
+- `/tab chat [on|off]` — open (default) / minimize the in-page chat dock in the browser
 - `/tab check <url>` — open + attach a URL to verify the CDT allowlist (the tab is left open)
 - `/tab shutdown` — detach all CDP sessions
+
+## Chat dock
+
+A floating in-page chat panel over **this** pi session, injected into the page's
+main world. The dock appears on any tab the extension has attached an overlay
+to (the first `tab_lens` call or `/tab chat`).
+
+- **Input:** the user types tasks into the dock (Enter = send, Shift+Enter =
+  newline). Text arrives in the session as a user message prefixed
+  `[browser chat]`; while an agent run is active it is queued as a follow-up.
+- **Output:** agent replies and one line per tool call render in the dock via a
+  live ~1 s poller (busy state shown as a dot); a shutdown flush delivers
+  updates queued at session end, so one-shot sessions don't lose the final
+  reply. The floating **💬 pi** button opens the panel; drag the header to
+  move, the bottom-right corner to resize, `–` to minimize, `✕` to close,
+  and the header's **🔍** toggles the lens.
+- **State:** the transcript tail (last 50 messages), open state, and
+  position/size live in `sessionStorage`, so everything survives a reload in
+  the same tab — the overlay re-installs on every document via
+  `Page.addScriptToEvaluateOnNewDocument` (plus a runtime re-injection when a
+  re-attach lost the registration).
+- **Trust model:** the dock renders agent text in the page's DOM, so **the
+  page can read the replies** — secrets never leave the process, but don't
+  treat the dock as confidential to the site. The reverse direction is
+  guarded: chat text reaching the session only comes from **isTrusted** user
+  events (input/keydown/click) — a page script can set the input's value or
+  dispatch synthetic events, but none of that triggers a send.
+
+> **CDP quirks** found during implementation: at new-document script time
+> `document.documentElement` is still `NULL` (DOM boot is deferred to
+> `DOMContentLoaded`), and the Browser Bridge proxy drops
+> `Runtime.consoleAPICalled` but passes `Network.*` events — which is why the
+> page↔pi channels are polled rather than event-driven, and why `tab_network`
+> works in the first place.
 
 ## Workflow
 
@@ -107,5 +143,6 @@ the id so the model has it in context when needed.
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command |
-| `cdp.ts` | Minimal CDP client: session manager, attach/re-attach, console capture, evaluate, screenshot |
+| `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command; chat-dock/lens event broadcasting, page-signal polling, network formatting |
+| `cdp.ts` | Minimal CDP client: session manager, attach/re-attach, console + Network-domain capture (250-entry cap), evaluate, screenshot |
+| `overlay.ts` | The in-page overlay (one main-world script, single template literal): user-facing lens + chat dock — DOM/UI, `sessionStorage` state, isTrusted input guards, the `tick()` bridge polled by the extension |
