@@ -152,6 +152,49 @@ describe("OVERLAY_SCRIPT", () => {
       expect(stored[0].thinking).toBe("let me think");
     });
 
+    test("renders markdown tables (th/td, inline md + escaping in cells)", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([
+        {
+          kind: "msg",
+          role: "agent",
+          text: ["| Tool | Purpose |", "|------|---------|", "| `tab` | Click **things** |", "| <img src=x onerror=alert(1)> | y |"].join("\n"),
+        },
+      ]);
+      const body = win.document.querySelector(".pi-chat-md");
+      const table = body.querySelector("table.pi-md-table");
+      expect(table).not.toBeNull();
+      expect([...table.querySelectorAll("thead th")].map((t) => t.textContent)).toEqual(["Tool", "Purpose"]);
+      const rows = table.querySelectorAll("tbody tr");
+      expect(rows.length).toBe(2);
+      expect(rows[0].querySelector("td code")?.textContent).toBe("tab");
+      expect(rows[0].querySelectorAll("td")[1].querySelector("strong")?.textContent).toBe("things");
+      // raw HTML in a cell stays inert text
+      expect(table.querySelector("img")).toBeNull();
+      expect(table.textContent).toContain("<img");
+    });
+
+    test("pipe lines without a separator row are not tables", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "msg", role: "agent", text: "either/or | fallback\nnext line" }]);
+      const body = win.document.querySelector(".pi-chat-md");
+      expect(body.querySelector("table")).toBeNull();
+      expect(body.textContent).toContain("either/or | fallback");
+    });
+
+    test("chat messages do not scroll internally (no per-message max-height)", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      const css = win.document.querySelector("style")?.textContent || "";
+      const msgRule = css.match(/\.pi-chat-msg \{[^}]*\}/)?.[0] || "";
+      expect(msgRule).not.toContain("max-height");
+      expect(msgRule).not.toContain("overflow-y");
+      // the log itself still scrolls
+      expect(css).toContain("#__pi_chat_log { flex: 1; overflow-y: auto;");
+    });
+
     test("user messages (from stored transcript) and thinking-less agent messages stay plain (no markdown, no details)", () => {
       const win = new Window({ url: "http://localhost/" }) as any;
       win.sessionStorage.setItem("__pi_chat_msgs", JSON.stringify([{ role: "user", text: "**not md** <b>x</b>" }]));

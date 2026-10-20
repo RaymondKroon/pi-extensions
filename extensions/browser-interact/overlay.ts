@@ -30,7 +30,7 @@
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
 
-export const OVERLAY_V = 6;
+export const OVERLAY_V = 7;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -72,6 +72,18 @@ export const OVERLAY_SCRIPT = `(() => {
       .replace(/(^|[^*\\w])\\*([^*\\n]+)\\*(?!\\*)/g, "$1<em>$2</em>")
       .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
       .replace(/(^|[^"'\\w])((?:https?:\\/\\/)[^\\s<>)\\]]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  const isTableSep = (s) => {
+  const t = s.trim();
+  if (t.indexOf("|") === -1 || t.indexOf("-") === -1) return false;
+  const cells = t.replace(/^[|]/, "").replace(/[|]$/, "").split("|");
+  return cells.every((c) => /^:?\\s*-+\\s*:?\\s*$/.test(c));
+  };
+  const splitTableRow = (s) => {
+  let t = s.trim();
+  if (t.charAt(0) === "|") t = t.slice(1);
+  if (t.charAt(t.length - 1) === "|") t = t.slice(0, -1);
+  return t.split("|").map((c) => c.trim());
+  };
   const md = (text) => {
     const F = "\u0060\u0060\u0060";
     const lines = esc(text).split("\\n");
@@ -89,6 +101,16 @@ export const OVERLAY_SCRIPT = `(() => {
         i++;
         while (i < lines.length && lines[i].indexOf(F) !== 0) { buf.push(lines[i]); i++; }
         out.push('<pre class="pi-md-code">' + buf.join("\\n") + "</pre>");
+        continue;
+      }
+      if (ln.indexOf("|") !== -1 && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+        flushAll();
+        const head = splitTableRow(ln);
+        i += 2;
+        const body = [];
+        while (i < lines.length && lines[i].indexOf("|") !== -1 && lines[i].trim() !== "") { body.push(splitTableRow(lines[i])); i++; }
+        i--;
+        out.push('<table class="pi-md-table"><thead><tr>' + head.map((c) => "<th>" + inlineMd(c) + "</th>").join("") + "</tr></thead><tbody>" + body.map((r) => "<tr>" + r.map((c) => "<td>" + inlineMd(c) + "</td>").join("") + "</tr>").join("") + "</tbody></table>");
         continue;
       }
       const ul = ln.match(/^\\s*[-*]\\s+(.*)/);
@@ -476,7 +498,7 @@ export const OVERLAY_SCRIPT = `(() => {
       ".pi-chat-hbtn.on { background: #1d4ed8; color: #fff; }" +
       "#__pi_chat_log { flex: 1; overflow-y: auto; padding: 8px; min-height: 0; }" +
       ".pi-chat-hint { color: #6b7280; font-size: 12px; margin-bottom: 8px; }" +
-      ".pi-chat-msg { margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto; }" +
+      ".pi-chat-msg { margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; }" +
       ".pi-chat-msg.user { background: #1d4ed8; margin-left: 18%; }" +
       ".pi-chat-msg.agent { background: #374151; margin-right: 18%; white-space: normal; }" +
       ".pi-chat-md p { margin: 2px 0 6px; }" +
@@ -488,6 +510,9 @@ export const OVERLAY_SCRIPT = `(() => {
       ".pi-chat-md pre.pi-md-code { background: #111827; border: 1px solid #374151; border-radius: 6px; padding: 5px 8px; margin: 3px 0 6px; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; color: #d1d5db; }" +
       ".pi-chat-md a { color: #60a5fa; }" +
       ".pi-chat-md blockquote { border-left: 2px solid #4b5563; margin: 3px 0 6px; padding-left: 8px; color: #9ca3af; }" +
+      ".pi-md-table { border-collapse: collapse; margin: 3px 0 6px; max-width: 100%; }" +
+      ".pi-md-table th, .pi-md-table td { border: 1px solid #4b5563; padding: 2px 8px; text-align: left; }" +
+      ".pi-md-table th { background: #111827; }" +
       ".pi-chat-thinking { margin: 0 0 6px; }" +
       ".pi-chat-thinking summary { cursor: pointer; color: #6b7280; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; user-select: none; }" +
       ".pi-chat-thinking[open] summary { margin-bottom: 3px; }" +
