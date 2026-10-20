@@ -30,7 +30,7 @@
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
 
-export const OVERLAY_V = 7;
+export const OVERLAY_V = 8;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -200,8 +200,8 @@ export const OVERLAY_SCRIPT = `(() => {
     const headTitle = document.createElement("span"); headTitle.textContent = "pi chat";
     const headSpacer = document.createElement("span"); headSpacer.style.flex = "1";
     lensBtn = document.createElement("button"); lensBtn.className = "pi-chat-hbtn"; lensBtn.id = "__pi_chat_lensbtn"; lensBtn.textContent = "\ud83d\udd0d"; lensBtn.title = "toggle pi-lens (drag boxes to point at things)";
-    const switchBtn = document.createElement("button"); switchBtn.className = "pi-chat-hbtn"; switchBtn.id = "__pi_chat_switch"; switchBtn.textContent = "\u21c4"; switchBtn.title = "connect the dock to the tab you bring to the front in Chrome (the active tab)";
-    const detachBtn = document.createElement("button"); detachBtn.className = "pi-chat-hbtn"; detachBtn.id = "__pi_chat_detach"; detachBtn.textContent = "\u2702"; detachBtn.title = "disconnect the dock from this tab (the browser tab stays open)";
+    const switchBtn = document.createElement("button"); switchBtn.className = "pi-chat-hbtn"; switchBtn.id = "__pi_chat_switch"; switchBtn.textContent = "\u21c4"; switchBtn.title = "Switch this dock to another tab: bring the Chrome tab you want to the front, then click here (same as /tab use <active>)";
+    const detachBtn = document.createElement("button"); detachBtn.className = "pi-chat-hbtn"; detachBtn.id = "__pi_chat_detach"; detachBtn.textContent = "\u2702"; detachBtn.title = "Detach the dock from this tab (the browser tab stays open)";
     const minBtn = document.createElement("button"); minBtn.className = "pi-chat-hbtn"; minBtn.textContent = "\u2013"; minBtn.title = "minimize (click \u201c\u2009pi\u201d to reopen)";
     const closeBtn = document.createElement("button"); closeBtn.className = "pi-chat-hbtn"; closeBtn.textContent = "\u2715"; closeBtn.title = "close";
     chatHead.appendChild(dot); chatHead.appendChild(headTitle); chatHead.appendChild(headSpacer);
