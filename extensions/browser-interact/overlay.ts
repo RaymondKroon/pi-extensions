@@ -21,6 +21,14 @@
 // NOTE: no backticks / `${` interpolation inside the script body — it is one
 // big TS template literal; the page code uses plain string concatenation.
 // (OVERLAY_V is the single controlled interpolation.)
+// Double-escape trap: TS template literals COOK escapes, so the page source
+// sees one fewer backslash than the file. Regex classes/escapes in page
+// code must be doubled in this file (`\\s`, `\\*`, `\\n` — a single `\\s`
+// cooks to a bare `s` and silently breaks the regex), and `\"` inside a page
+// string cooks to a raw quote that truncates it — use single-quoted page
+// strings when they contain double quotes. `\\u0060` is the safe way to put
+// a backtick in the page source (it cooks to the character). The
+// "parses as a standalone script" test in overlay.test.ts is the backstop.
 
 export const OVERLAY_V = 5;
 
