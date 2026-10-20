@@ -82,6 +82,33 @@ describe("OVERLAY_SCRIPT", () => {
     });
   });
 
+  describe("dock header tab controls (multi-dock switching)", () => {
+    test("trusted ⇄ click queues a dock-connect-active signal; ✂ queues dock-detach", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      const switchBtn = win.document.querySelector("#__pi_chat_switch");
+      const detachBtn = win.document.querySelector("#__pi_chat_detach");
+      expect(switchBtn).not.toBeNull();
+      expect(detachBtn).not.toBeNull();
+      trustedClick(win, switchBtn);
+      trustedClick(win, detachBtn);
+      expect(overlay.tick([])).toEqual([
+        { type: "dock-connect-active" },
+        { type: "dock-detach" },
+      ]);
+      // queue is empty now
+      expect(overlay.tick([])).toEqual([]);
+    });
+
+    test("untrusted (page-script) clicks do not queue switching signals", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      win.document.querySelector("#__pi_chat_switch").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+      win.document.querySelector("#__pi_chat_detach").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+      expect(overlay.tick([])).toEqual([]);
+    });
+  });
+
   describe("agent message rendering", () => {
     test("renders markdown: headings, bold, code, fence, lists, links — and escapes raw HTML", () => {
       const { win, overlay } = bootOverlay();

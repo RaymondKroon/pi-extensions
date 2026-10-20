@@ -267,12 +267,40 @@ export default function (pi: ExtensionAPI) {
   // Page → pi: the overlay queues signals (console events are dropped by the
   // Browser Bridge proxy, so the poller pops them). Chat text only ever comes
   // from trusted user events on the page (isTrusted guard in the overlay).
-  const handlePageSignal = (sig: Record<string, unknown>): void => {
+  // `origin` is the tab the signal was popped from — exact, per CDP session.
+  const handlePageSignal = (sig: Record<string, unknown>, origin: { key: string; targetId: string; url: string }): void => {
     if (sig.type === "chat") {
       const t = typeof sig.text === "string" ? sig.text.trim().slice(0, 4000) : "";
       if (!t) return;
       // While a run is active, queue it as a follow-up; otherwise start one.
       pi.sendUserMessage(`[browser chat] ${t}`, agentBusy ? { deliverAs: "followUp" } : {});
+      return;
+    }
+    if (sig.type === "dock-detach") {
+      // The dock's ✂ button: let go of THIS tab without closing it. No y/N —
+      // the user clicked an explicit control on that tab.
+      void (async () => {
+        const r = mgr.detach(origin.targetId);
+        if (!r) return;
+        channel.broadcastUpdates([
+          { kind: "msg", role: "agent", text: `Dock disconnected from ${r.url} (the browser tab stays open).` },
+        ]);
+      })().catch(() => {});
+      return;
+    }
+    if (sig.type === "dock-connect-active") {
+      // The dock's ⇄ button: dock the tab the user has in front of them now
+      // and make it the default target. Other connected tabs stay docked.
+      void (async () => {
+        const t = await mgr.foregroundTarget();
+        if (mgr.hasTarget(t.id)) return; // this tab is already docked
+        const { session, rekeyed } = await mgr.pointDefault(t);
+        if (rekeyed) channel.rekey(rekeyed.from, rekeyed.to);
+        await ensureOverlay(session);
+        channel.broadcastUpdates([
+          { kind: "msg", role: "agent", text: `Dock now also connected to ${t.title || t.url} — it is the default target for the tab_* tools.` },
+        ]);
+      })().catch(() => {});
       return;
     }
     if (sig.type !== "note-saved") return;
@@ -970,11 +998,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("tab", {
     description:
-      "browser-interact: show tab status, open the in-page dock (chat + lens) with /tab interact [on|off], check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
+      "browser-interact: show tab status, open the in-page dock (chat + lens) with /tab interact [on|off], connect the dock to a specific tab with /tab use <url-substring|target-id|active>, let go of a tab with /tab detach [url-substring|target-id], check a URL against the CDT allowlist with /tab check <url>, or detach everything with /tab shutdown",
     getArgumentCompletions: (prefix) => {
       if (/\s/.test(prefix)) return null; // only complete the subcommand itself
       const subs = [
         { value: "interact ", label: "interact [on|off]", description: "open/close the in-page dock (chat + lens; click 🔍 to arm box selection)" },
+        { value: "use ", label: "use <url-substring|target-id|active>", description: "connect the dock to a specific tab (confirms if other tabs are already connected); becomes the default target for the tab_* tools" },
+        { value: "detach", label: "detach [url-substring|target-id]", description: "release a tab's CDP session without closing the browser tab (default: the default target)" },
         { value: "check ", label: "check <url>", description: "check a URL against the CDT allowlist" },
         { value: "shutdown", label: "shutdown", description: "close all CDP sessions" },
       ];
@@ -986,6 +1016,53 @@ export default function (pi: ExtensionAPI) {
       if (args?.trim() === "shutdown") {
         mgr.closeAll();
         ctx.ui.notify("browser-interact: all CDP sessions closed", "info");
+        return;
+      }
+      const use = args?.trim().match(/^use\s+(\S+)$/);
+      if (use) {
+        try {
+          const t = await mgr.resolveTarget(use[1]);
+          if (mgr.hasTarget(t.id)) {
+            ctx.ui.notify(`already connected to "${t.title || t.url}" (${t.url}) — nothing to do`, "info");
+            return;
+          }
+          const others = mgr.attached();
+          if (others.length) {
+            const ok = await ctx.ui.confirm(
+              "Connect another tab?",
+              `Connect to "${t.title || t.url}" (${t.url}) while already connected to:\n${others.map((o) => `  ${o.url}`).join("\n")}\n\nOther tabs stay docked; the new tab becomes the default target for the tab_* tools.`,
+            );
+            if (!ok) {
+              ctx.ui.notify("cancelled — still connected to the previous tab(s)", "info");
+              return;
+            }
+          }
+          const { session, rekeyed } = await mgr.pointDefault(t);
+          if (rekeyed) channel.rekey(rekeyed.from, rekeyed.to);
+          await ensureOverlay(session);
+          channel.startPoll();
+          ctx.ui.notify(
+            `dock connected to "${t.title || t.url}" (${t.url}) — now the default target for the tab_* tools${others.length ? `; ${others.length} other tab(s) stay docked` : ""}`,
+            "info",
+          );
+        } catch (e: any) {
+          ctx.ui.notify(String(e?.message ?? e), "error");
+        }
+        return;
+      }
+      const detach = args?.trim().match(/^detach(?:\s+(\S+))?$/);
+      if (detach) {
+        try {
+          const r = mgr.detach(detach[1]);
+          ctx.ui.notify(
+            r
+              ? `released "${r.url}" — browser tab left open`
+              : "not connected to that tab (or no default target yet) — run /tab to see what is connected",
+            r ? "info" : "error",
+          );
+        } catch (e: any) {
+          ctx.ui.notify(String(e?.message ?? e), "error");
+        }
         return;
       }
       const interact = args?.trim().match(/^interact(?:\s+(on|off))?$/);
@@ -1029,7 +1106,7 @@ export default function (pi: ExtensionAPI) {
       const arg = args?.trim();
       if (arg) {
         ctx.ui.notify(
-          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab interact [on|off], /tab check <url>, or /tab shutdown`,
+          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab interact [on|off], /tab use <url-substring|target-id|active>, /tab detach [url-substring|target-id], /tab check <url>, or /tab shutdown`,
           "error",
         );
         return;

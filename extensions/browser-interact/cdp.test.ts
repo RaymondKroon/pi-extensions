@@ -1,0 +1,223 @@
+// browser-interact — CdpManager tab-switching/detach logic (task 8), tested
+// against a fake CDP endpoint: a stubbed /json fetch and a FakeWebSocket that
+// auto-answers every command (and Runtime.evaluate with a per-test value).
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { CdpManager, type CdpTarget } from "./cdp";
+
+/** What each Runtime.evaluate returns in the fake browser. */
+let evalHandler = (_ws: FakeWS, _expr: string): unknown => ({});
+
+class FakeWS {
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  readonly sent: Array<Record<string, any>> = [];
+  closed = false;
+  constructor(readonly url: string) {
+    queueMicrotask(() => this.onopen?.());
+  }
+  send(data: string) {
+    const msg = JSON.parse(data);
+    this.sent.push(msg);
+    if (typeof msg.id === "number") {
+      const value = msg.method === "Runtime.evaluate" ? evalHandler(this, String(msg.params?.expression)) : {};
+      queueMicrotask(() => {
+        if (!this.closed) this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { result: { value } } }) });
+      });
+    }
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.onclose?.();
+  }
+}
+
+const T = (id: string, url: string): CdpTarget => ({
+  id,
+  type: "page",
+  url,
+  title: `tab ${id}`,
+  webSocketDebuggerUrl: `ws://127.0.0.1:9222/devtools/page/${id}`,
+});
+
+const A = T("A", "https://a.test/app");
+const B = T("B", "https://b.test/");
+const C = T("C", "https://b.test/longer-path");
+
+let restoreFetch: (() => void) | null = null;
+let restoreWS: (() => void) | null = null;
+
+beforeEach(() => {
+  const realWS = globalThis.WebSocket;
+  restoreWS = () => {
+    globalThis.WebSocket = realWS;
+  };
+  // Route CDP websockets to the fake (never to a real Chrome on :9222).
+  (globalThis as any).WebSocket = FakeWS;
+});
+
+afterEach(() => {
+  restoreFetch?.();
+  restoreFetch = null;
+  restoreWS?.();
+  restoreWS = null;
+  evalHandler = () => ({});
+});
+/** Stub the debug-port HTTP endpoint (only /json is served; anything else
+ * throws so an accidental /json/new or /json/close fails loudly). */
+function stubTargets(targets: CdpTarget[]): void {
+  const real = globalThis.fetch;
+  restoreFetch = () => {
+    globalThis.fetch = real;
+  };
+  globalThis.fetch = (async (url: any) => {
+    const u = String(url);
+    if (u.endsWith("/json")) {
+      return { ok: true, status: 200, json: async () => targets, text: async () => "" };
+    }
+    throw new Error(`unexpected HTTP call: ${u} (browser tab must stay open!)`);
+  }) as typeof fetch;
+}
+
+function mgr(): CdpManager {
+  const m = new CdpManager();
+  m.port = 9222; // stubbed fetch ignores the host anyway
+  return m;
+}
+
+describe("CdpManager.resolveTarget", () => {
+  test("exact target id wins", async () => {
+    stubTargets([A, B]);
+    const t = await mgr().resolveTarget("B");
+    expect(t.id).toBe("B");
+  });
+
+  test("URL substring: several matches → shortest URL", async () => {
+    stubTargets([A, B, C]);
+    const t = await mgr().resolveTarget("b.test");
+    expect(t.id).toBe("B");
+  });
+
+  test("no match → clear error", async () => {
+    stubTargets([A]);
+    await expect(mgr().resolveTarget("zzz.test")).rejects.toThrow(/no tab matching "zzz.test"/);
+  });
+
+  test("\"active\" probes for the focused tab", async () => {
+    stubTargets([A, B]);
+    evalHandler = (ws) => ({ visible: true, focused: ws.url.includes("/B") });
+    const t = await mgr().foregroundTarget();
+    expect(t.id).toBe("B");
+  });
+
+  test("foreground probe cleans up its probe sessions", async () => {
+    stubTargets([A, B]);
+    evalHandler = (ws) => ({ visible: true, focused: ws.url.includes("/B") });
+    const m = mgr();
+    await m.foregroundTarget();
+    // probe sessions are transient — nothing should be left attached
+    expect(m.attached()).toEqual([]);
+  });
+});
+
+describe("CdpManager.pointDefault", () => {
+  test("connects the default (\"*\") key when nothing is attached", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    const { session, rekeyed } = await m.pointDefault(B);
+    expect(rekeyed).toBeUndefined();
+    expect(session.targetId).toBe("B");
+    expect(m.sessionFor()?.targetId).toBe("B");
+  });
+
+  test("switching re-keys the previous default session to its own target id (multi-dock)", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    const first = await m.pointDefault(A);
+    const { session, rekeyed } = await m.pointDefault(B);
+    expect(rekeyed).toEqual({ from: "*", to: "A" });
+    expect(session.targetId).toBe("B");
+    // the old default tab is still connected (under its target id) and live
+    const attached = m.attached().map((a) => `${a.key}:${a.url}`);
+    expect(attached.sort()).toEqual(["*:https://b.test/", "A:https://a.test/app"]);
+    expect(m.hasTarget("A")).toBe(true);
+    expect(first.session.targetId).toBe("A"); // same session object, re-keyed
+    expect(first.session.closed).toBe(false);
+  });
+
+  test("pointing the default at the already-default target is a no-op", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    const first = await m.pointDefault(A);
+    const second = await m.pointDefault(A);
+    expect(second.rekeyed).toBeUndefined();
+    expect(second.session).toBe(first.session);
+  });
+
+  test("re-attaches when the remembered default target was closed", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A);
+    m.forgetTarget("A"); // tab closed out-of-band
+    const { session, rekeyed } = await m.pointDefault(B);
+    expect(rekeyed).toBeUndefined();
+    expect(session.targetId).toBe("B");
+  });
+});
+
+describe("CdpManager.detach", () => {
+  test("detaching the default releases the session WITHOUT closing the browser tab", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A);
+    const r = m.detach();
+    expect(r).toEqual({ key: "*", targetId: "A", url: "https://a.test/app" });
+    expect(m.attached()).toEqual([]);
+    expect(m.hasTarget("A")).toBe(false);
+    // the tab is still listed by /json (the stub serves the same list) — the
+    // stub itself throws on any /json/close, so reaching this line proves the
+    // browser tab was never closed
+    const pages = await m.pageTargets();
+    expect(pages.map((p) => p.id)).toEqual(["A", "B"]);
+  });
+
+  test("detaches by exact target id", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A);
+    await m.pointDefault(B); // A is now re-keyed to "A"
+    const r = m.detach("A");
+    expect(r?.url).toBe("https://a.test/app");
+    expect(m.hasTarget("A")).toBe(false);
+    expect(m.hasTarget("B")).toBe(true);
+  });
+
+  test("detaches by a URL substring matching exactly one tab", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A);
+    await m.pointDefault(B);
+    expect(m.detach("b.test")?.targetId).toBe("B");
+    expect(m.hasTarget("A")).toBe(true);
+  });
+
+  test("ambiguous URL substring throws and lists candidates", async () => {
+    stubTargets([A, B, C]);
+    const m = mgr();
+    await m.pointDefault(B);
+    await m.pointDefault(C); // both b.test tabs connected
+    expect(() => m.detach("b.test")).toThrow(/matches 2 connected tabs/);
+    // nothing was released
+    expect(m.attached()).toHaveLength(2);
+  });
+
+  test("no match → null (no throw)", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A);
+    expect(m.detach("zzz.test")).toBeNull();
+    expect(m.attached()).toHaveLength(1);
+  });
+});

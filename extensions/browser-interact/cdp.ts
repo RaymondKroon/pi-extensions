@@ -281,6 +281,11 @@ export class CdpManager {
     }
   }
 
+  /** Is a live session attached to this target id (under any key)? */
+  hasTarget(id: string): boolean {
+    return [...this.sessions.values()].some((s) => !s.closed && s.targetId === id);
+  }
+
   /** All currently attached sessions (for status reporting). */
   attached(): Array<{ key: string; url: string }> {
     return [...this.sessions.entries()]
@@ -361,6 +366,119 @@ export class CdpManager {
     }
   }
 
+  /** Release the CDP session for a target WITHOUT closing the browser tab
+   * (the escape hatch for "let go of this tab"). `match` is an exact target
+   * id, a session key, or a URL substring that matches exactly one connected
+   * tab (multiple matches throw, listing the candidates); undefined = the
+   * default target. Returns the released tab, or null when nothing matches. */
+  detach(match?: string): { key: string; targetId: string; url: string } | null {
+    const live = [...this.sessions.entries()].filter(([, s]) => !s.closed);
+    let hit: [string, CdpSession] | undefined;
+    if (match === undefined) {
+      hit = live.find(([key]) => key === this.keyFor(undefined));
+    } else {
+      hit = live.find(([, s]) => s.targetId === match) ?? live.find(([key]) => key === match);
+      if (!hit) {
+        const urlHits = live.filter(([, s]) => s.url.includes(match));
+        if (urlHits.length === 1) hit = urlHits[0];
+        else if (urlHits.length > 1) {
+          throw new Error(
+            `"${match}" matches ${urlHits.length} connected tabs (${urlHits.map(([, s]) => s.url).join(", ")}) — use the exact target id`,
+          );
+        }
+      }
+    }
+    if (!hit) return null;
+    const [key, s] = hit;
+    this.sessions.delete(key);
+    s.close();
+    for (const [k, tid] of [...this.lastTargetId]) {
+      if (tid === s.targetId || k === key) this.lastTargetId.delete(k);
+    }
+    return { key, targetId: s.targetId, url: s.url };
+  }
+
+  /** Probe each page target's visibility state and return the foreground tab
+   * (a focused tab beats merely visible ones). Undefined when nothing is
+   * visible (e.g. Chrome is backgrounded). */
+  private async probeForeground(pages: CdpTarget[]): Promise<CdpTarget | undefined> {
+    let visibleTarget: CdpTarget | undefined;
+    for (const candidate of pages) {
+      const probeKey = `__active_probe:${candidate.id}`;
+      try {
+        const probe = await this.connect(candidate, probeKey);
+        const state = await evaluate(
+          probe,
+          "({ visible: document.visibilityState === 'visible', focused: document.hasFocus() })",
+          { timeoutMs: 2_000 },
+        );
+        this.sessions.delete(probeKey);
+        this.lastTargetId.delete(probeKey);
+        probe.close();
+        if (state?.focused) return candidate;
+        if (state?.visible && !visibleTarget) visibleTarget = candidate;
+      } catch {
+        const probe = this.sessions.get(probeKey);
+        if (probe) probe.close();
+        this.sessions.delete(probeKey);
+        this.lastTargetId.delete(probeKey);
+      }
+    }
+    return visibleTarget;
+  }
+
+  /** Chrome's foreground page tab (focused tab; a visible one if the browser
+   * window itself is unfocused). */
+  async foregroundTarget(): Promise<CdpTarget> {
+    const t = await this.probeForeground(await this.pageTargets());
+    if (!t) throw new Error("no visible page tab found in Chrome — bring a tab to the front and retry");
+    return t;
+  }
+
+  /** Resolve a user-supplied tab reference: an exact CDP target id, "active"
+   * (the foreground tab), or a URL substring (several matches → shortest
+   * URL, like attach()). */
+  async resolveTarget(ref: string): Promise<CdpTarget> {
+    const pages = await this.pageTargets();
+    const byId = pages.find((t) => t.id === ref);
+    if (byId) return byId;
+    if (ref === "active") return this.foregroundTarget();
+    const matches = pages.filter((t) => t.url.includes(ref));
+    if (!matches.length) {
+      throw new Error(
+        `no tab matching "${ref}" found in Chrome on port ${this.port} — open it in the browser first`,
+      );
+    }
+    return [...matches].sort((a, b) => a.url.length - b.url.length)[0];
+  }
+
+  /** Point the DEFAULT target (the key the tab_* tools use without a `tab`
+   * param) at `t`. Other connected tabs stay connected (multi-dock): the
+   * previous default session is re-keyed to its own target id so its dock
+   * keeps updating. Returns the new default session plus what was re-keyed. */
+  async pointDefault(
+    t: CdpTarget,
+  ): Promise<{ session: CdpSession; rekeyed?: { from: string; to: string } }> {
+    const key = this.keyFor(undefined);
+    const cur = this.sessions.get(key);
+    if (cur && !cur.closed) {
+      if (cur.targetId === t.id) return { session: cur };
+      if (this.sessions.has(cur.targetId)) {
+        this.sessions.delete(key); // default slot is a duplicate of a live tab — drop the dup
+      } else {
+        const newKey = cur.targetId;
+        this.sessions.delete(key);
+        this.sessions.set(newKey, cur);
+        this.lastTargetId.set(newKey, cur.targetId);
+        return { session: await this.connect(t, key), rekeyed: { from: key, to: newKey } };
+      }
+    } else if (cur) {
+      this.sessions.delete(key);
+      cur.close();
+    }
+    return { session: await this.connect(t, key) };
+  }
+
   /** Open a NEW page tab. The URL is the RAW query string (/json/new?<url>).
    * Chrome >= 111 requires PUT; older builds only accept GET, so fall back. */
   async openTarget(url = "about:blank"): Promise<CdpTarget> {
@@ -437,28 +555,7 @@ export class CdpManager {
     // state. If Chrome is backgrounded or probing fails, retain the historic
     // shortest-URL fallback.
     if (!pattern && matches.length > 1) {
-      let visibleTarget: CdpTarget | undefined;
-      for (const candidate of matches) {
-        const probeKey = `__active_probe:${candidate.id}`;
-        try {
-          const probe = await this.connect(candidate, probeKey);
-          const state = await evaluate(
-            probe,
-            "({ visible: document.visibilityState === 'visible', focused: document.hasFocus() })",
-            { timeoutMs: 2_000 },
-          );
-          this.sessions.delete(probeKey);
-          this.lastTargetId.delete(probeKey);
-          probe.close();
-          if (state?.focused) return this.connect(candidate, this.keyFor(pattern));
-          if (state?.visible && !visibleTarget) visibleTarget = candidate;
-        } catch {
-          const probe = this.sessions.get(probeKey);
-          if (probe) probe.close();
-          this.sessions.delete(probeKey);
-          this.lastTargetId.delete(probeKey);
-        }
-      }
+      const visibleTarget = await this.probeForeground(matches);
       if (visibleTarget) return this.connect(visibleTarget, this.keyFor(pattern));
     }
     // Prefer the shortest matching URL as a stable fallback: the app's base

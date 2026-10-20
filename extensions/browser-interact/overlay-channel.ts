@@ -14,6 +14,15 @@
 
 import { evaluate, type CdpSession } from "./cdp";
 
+/** Identity of the tab a page signal was popped from. Attribution is exact:
+ * each tab has its own CDP session, and the poller pops each session's
+ * signal queue individually. */
+export interface SignalOrigin {
+  key: string;
+  targetId: string;
+  url: string;
+}
+
 export interface OverlayChannelDeps {
   /** All attached sessions (key + url), as reported by the CdpManager. */
   attached: () => Array<{ key: string; url: string }>;
@@ -21,8 +30,8 @@ export interface OverlayChannelDeps {
   sessionFor: (pattern?: string) => CdpSession | undefined;
   /** (Re)install the overlay on a session: new-document script + runtime inject. */
   ensureOverlay: (s: CdpSession) => Promise<void>;
-  /** Page → pi signals popped from an overlay's queue. */
-  onSignal: (sig: Record<string, unknown>) => void;
+  /** Page → pi signals popped from an overlay's queue, with the tab they came from. */
+  onSignal: (sig: Record<string, unknown>, origin: SignalOrigin) => void;
 }
 
 export interface OverlayChannel {
@@ -35,6 +44,8 @@ export interface OverlayChannel {
   /** Drain all queues without the poller (session shutdown). */
   flush: () => Promise<void>;
   clearQueue: () => void;
+  /** Move a pending queue from one key to another (its session was re-keyed). */
+  rekey: (from: string, to: string) => void;
   /** Pending (not yet delivered) updates for one key — read-only. */
   pendingFor: (key: string) => unknown[];
 }
@@ -56,7 +67,9 @@ export const createOverlayChannel = (deps: OverlayChannelDeps): OverlayChannel =
       `window.__piOverlay ? window.__piOverlay.tick(${JSON.stringify(updates)}) : null`,
       { timeoutMs: 3_000 },
     ).catch(() => null);
-    if (Array.isArray(sigs)) for (const sig of sigs) if (sig && typeof sig === "object") deps.onSignal(sig);
+    if (Array.isArray(sigs))
+      for (const sig of sigs) if (sig && typeof sig === "object")
+        deps.onSignal(sig, { key, targetId: s.targetId, url: s.url });
   };
 
   const broadcastUpdates = (updates: unknown[]): void => {
@@ -120,6 +133,13 @@ export const createOverlayChannel = (deps: OverlayChannelDeps): OverlayChannel =
       }
     },
     clearQueue: () => chatQueue.clear(),
+    rekey: (from, to) => {
+      if (from === to) return;
+      const q = chatQueue.get(from);
+      if (!q) return;
+      chatQueue.delete(from);
+      chatQueue.set(to, [...(chatQueue.get(to) ?? []), ...q]);
+    },
     pendingFor: (key: string) => chatQueue.get(key) ?? [],
   };
 };

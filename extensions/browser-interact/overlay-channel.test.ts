@@ -111,6 +111,38 @@ describe("createOverlayChannel", () => {
     expect(signals).toEqual([{ type: "chat", text: "hello" }]);
   });
 
+  test("stamps page signals with the sending tab's identity (key, targetId, url)", async () => {
+    const s = fakeSession([{ type: "dock-detach" }, { type: "chat", text: "hi" }]);
+    s.overlayScriptId = "script-1";
+    s.targetId = "target-9";
+    const origins: Array<{ key: string; targetId: string; url: string }> = [];
+    const channel = createOverlayChannel({
+      attached: () => [{ key: "*", url: s.url }],
+      sessionFor: () => s,
+      ensureOverlay: async () => {},
+      onSignal: (_sig, origin) => origins.push(origin),
+    });
+    await channel.pollOverlays();
+    expect(origins).toEqual([
+      { key: "*", targetId: "target-9", url: "https://example.test/" },
+      { key: "*", targetId: "target-9", url: "https://example.test/" },
+    ]);
+  });
+
+  test("rekey moves the pending queue from the old key to the new one", () => {
+    const s = fakeSession();
+    s.overlayScriptId = "script-1";
+    const { channel } = makeHarness({ "*": s });
+    channel.broadcastUpdates([{ kind: "msg", role: "agent", text: "hi" }]);
+    expect(channel.pendingFor("*")).toHaveLength(1);
+    channel.rekey("*", "target-9");
+    expect(channel.pendingFor("*")).toEqual([]);
+    expect(channel.pendingFor("target-9")).toEqual([{ kind: "msg", role: "agent", text: "hi" }]);
+    // re-keying to an empty key is a no-op
+    channel.rekey("*", "nowhere");
+    expect(channel.pendingFor("target-9")).toHaveLength(1);
+  });
+
   test("keeps the poller running while a session is healing, stops when none attached", async () => {
     const s = fakeSession();
     const { channel, attachedList } = makeHarness({ "*": s });

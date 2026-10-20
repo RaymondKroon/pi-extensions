@@ -48,6 +48,28 @@ re-attaches automatically. Re-attach first looks for the previously attached
 target by id (the tab may have navigated to a URL that no longer matches
 the pattern), then falls back to the URL pattern.
 
+**Switching the dock's target tab** — the remembered target is *sticky*, so
+switching to a different tab in Chrome alone does NOT move the tools or the
+dock. To re-point or let go:
+
+- `/tab use <url-substring|target-id|active>` — connect the dock to a
+  specific tab and make it the **default target** for the `tab_*` tools
+  (`active` = the tab currently in front in Chrome). If other tabs are
+  already connected, you are asked to confirm first.
+- **Multi-dock:** connected tabs are not removed when you point the default
+  elsewhere — every connected tab keeps its live dock (the previous default
+  is re-keyed to its own target id). The `tab_*` tools without a `tab` param
+  always target the default; pass `tab` to talk to another connected tab.
+- `/tab detach [url-substring|target-id]` — release the CDP session for a
+  tab **without closing the browser tab** (no argument = the default
+target). The overlay stays in the page but goes inert until the next
+  connect.
+- From the dock itself: the header's **⇄** connects the tab you bring to
+  the front in Chrome; **✂** disconnects the dock from the tab it is in.
+  Both act on the tab that clicked them (each tab has its own CDP session,
+  so the session always knows which tab sent a signal — chat text from a
+dock is the one thing that stays undifferentiated).
+
 ## Tools
 
 | tool | effect |
@@ -85,6 +107,8 @@ the id so the model has it in context when needed.
 
 - `/tab` — show attached tabs and their current page
 - `/tab interact [on|off]` — open (default) / minimize the in-page interaction dock in the browser (chat + the **🔍** looking glass that arms the lens; see `tab_lens`)
+- `/tab use <url-substring|target-id|active>` — connect the dock to a specific tab (confirms if other tabs are already connected); the new tab becomes the default target for the `tab_*` tools, other tabs stay docked
+- `/tab detach [url-substring|target-id]` — release a tab's CDP session without closing the browser tab (default: the default target)
 - `/tab check <url>` — open + attach a URL to verify the CDT allowlist (the tab is left open)
 - `/tab shutdown` — detach all CDP sessions
 
@@ -110,7 +134,12 @@ to (the first `tab_lens` call or `/tab interact`).
   *error* section; the args/result are paired per `toolCallId` between the
   assistant message and its result. The floating **💬 pi** button opens the
   panel; drag the header to move, the bottom-right corner to resize, `–` to
-  minimize, `✕` to close, and the header's **🔍** toggles the lens.
+  minimize, `✕` to close, and the header's **🔍** toggles the lens. The
+  header's **⇄** connects the dock to the tab you bring to the front in
+  Chrome (making it the default target), and **✂** disconnects the dock from
+  the tab it is in (the browser tab stays open) — see *Target tab* above.
+  Several tabs can be docked at once (multi-dock); a chat message sent from
+  a dock does not say which one it came from.
 - **State:** the transcript tail (last 50 messages), open state, and
   position/size live in `sessionStorage`, so everything survives a reload in
   the same tab — the overlay re-installs on every document via
@@ -178,6 +207,10 @@ to (the first `tab_lens` call or `/tab interact`).
    read the cropped screenshots.
 6. If a click is "not found" or "covered": screenshot, inspect the page, fix the
    selector — don't retry the same call blindly.
+7. The dock (and the default target) is sticky: if the user works in another
+   tab, re-point with `/tab use <url-substring|target-id|active>` (the user
+   can also do it from the dock's **⇄** button). To stop driving a tab
+   without closing it: `/tab detach` (or the dock's **✂** button).
 
 ## Files
 
@@ -188,4 +221,4 @@ to (the first `tab_lens` call or `/tab interact`).
 | `tool-update.ts` | `ToolCallTracker`: pairs assistant `toolCall` blocks with `toolResult` messages (truncated args + result) for the dock's expandable tool rows |
 | `cdp.ts` | Minimal CDP client: session manager, attach/re-attach, console + Network-domain capture (250-entry cap), evaluate, screenshot |
 | `overlay.ts` | The in-page overlay (one main-world script, single template literal): user-facing lens + chat dock — DOM/UI, `sessionStorage` state, isTrusted input guards, the `tick()` bridge polled by the extension |
-| `tool-update.test.ts`, `overlay.test.ts`, `overlay-channel.test.ts` | Focused tests: tracker pairing/truncation, the overlay booted in a happy-dom window (expandable rows, isTrusted click guard, persistence), and the update channel (queue/flush, self-heal, signal routing, poller lifecycle). `bun test .`; `bunx tsc --noEmit` typechecks |
+| `tool-update.test.ts`, `overlay.test.ts`, `overlay-channel.test.ts`, `cdp.test.ts` | Focused tests: tracker pairing/truncation, the overlay booted in a happy-dom window (expandable rows, isTrusted click guard, persistence, dock-header tab controls), the update channel (queue/flush, self-heal, signal routing + origin stamping, poller lifecycle), and the CdpManager's tab switching/detach logic against a fake CDP endpoint (resolveTarget, pointDefault re-keying, detach never closes the browser tab). `bun test .`; `bunx tsc --noEmit` typechecks |
