@@ -22,6 +22,7 @@ import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import { Type } from "typebox";
 import { CdpManager, evaluate, screenshot, type CdpSession, type CdpTarget } from "./cdp";
 import { OVERLAY_SCRIPT, OVERLAY_V } from "./overlay";
+import { createOverlayChannel, type OverlayChannel } from "./overlay-channel";
 import { ToolCallTracker } from "./tool-update";
 
 const DEFAULT_PORT = 9222;
@@ -215,23 +216,11 @@ export default function (pi: ExtensionAPI) {
   // docked tab. The dock renders agent replies in the page DOM, so the page
   // itself can read them — the secrets never leave this process.
   let agentBusy = false;
-  /** Per-session update queue drained by the overlay poller (keyed like mgr.attached()). */
-  const chatQueue = new Map<string, unknown[]>();
   /** toolCallId → serialized arguments, paired with the result for the dock's expandable tool rows. */
   const toolTracker = new ToolCallTracker();
-
-  const broadcastUpdates = (updates: unknown[]): void => {
-    for (const a of mgr.attached()) {
-      const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
-      if (!s || !s.overlayScriptId) continue;
-      const q = chatQueue.get(a.key) ?? [];
-      for (const u of updates) {
-        q.push(u);
-        if (q.length > 200) q.splice(0, q.length - 200);
-      }
-      chatQueue.set(a.key, q);
-    }
-  };
+  // pi → page update channel for every docked tab (queue + 1s poller, with
+  // self-healing of a lost overlay registration after a CDP socket drop).
+  let channel: OverlayChannel;
 
   const assistantText = (m: any): string => {
     if (!m) return "";
@@ -244,20 +233,20 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentBusy = true;
-    broadcastUpdates([{ kind: "status", busy: true }]);
+    channel.broadcastUpdates([{ kind: "status", busy: true }]);
   });
   pi.on("agent_end", () => {
     agentBusy = false;
-    broadcastUpdates([{ kind: "status", busy: false }]);
+    channel.broadcastUpdates([{ kind: "status", busy: false }]);
   });
   pi.on("message_end", (ev) => {
     const m = (ev as any).message;
     if (m?.role === "assistant") {
       const text = assistantText(m).trim();
-      if (text) broadcastUpdates([{ kind: "msg", role: "agent", text: text.slice(0, 8000) }]);
+      if (text) channel.broadcastUpdates([{ kind: "msg", role: "agent", text: text.slice(0, 8000) }]);
       toolTracker.trackAssistant(m);
     } else if (m?.role === "toolResult") {
-      broadcastUpdates([toolTracker.toolResult(m)]);
+      channel.broadcastUpdates([toolTracker.toolResult(m)]);
     }
   });
 
@@ -339,46 +328,22 @@ export default function (pi: ExtensionAPI) {
       () => false,
     );
     if (!has) await evaluate(s, OVERLAY_SCRIPT, { timeoutMs: 10_000 });
-    startOverlayPoll();
+    channel.startPoll();
   };
 
-  // Overlay poller: one tick per attached overlay per second — applies queued
-  // agent updates (assistant text, tool lines, busy state) AND pops the page's
-  // signal queue (chat text, lens notes) in the same call. Console events
-  // cannot be used (dropped by the Browser Bridge proxy), so polling is the
-  // only reliable channel in both directions.
-  let overlayPoll: ReturnType<typeof setInterval> | null = null;
-  let overlayPollBusy = false;
-  const pollOverlays = async () => {
-    if (overlayPollBusy) return;
-    overlayPollBusy = true;
-    try {
-      let anyOverlay = false;
-      for (const a of mgr.attached()) {
-        const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
-        if (!s || !s.overlayScriptId) continue;
-        anyOverlay = true;
-        const updates = chatQueue.get(a.key) ?? [];
-        if (updates.length) chatQueue.delete(a.key);
-        const sigs = await evaluate(
-          s,
-          `window.__piOverlay ? window.__piOverlay.tick(${JSON.stringify(updates)}) : null`,
-          { timeoutMs: 3_000 },
-        ).catch(() => null);
-        if (Array.isArray(sigs)) for (const sig of sigs) if (sig && typeof sig === "object") handlePageSignal(sig);
-      }
-      if (!anyOverlay && overlayPoll) {
-        clearInterval(overlayPoll);
-        overlayPoll = null;
-      }
-    } finally {
-      overlayPollBusy = false;
-    }
-  };
-  const startOverlayPoll = () => {
-    if (overlayPoll) return;
-    overlayPoll = setInterval(pollOverlays, 1_000);
-  };
+  // Overlay channel: per-tab update queue + one poller tick per second that
+  // drains it into the overlay AND pops the page's signal queue in the same
+  // call (console events cannot be used — dropped by the Browser Bridge
+  // proxy). Self-heals an attached session that lost its overlay registration
+  // (CDP socket drop → fresh session on re-attach): without this the dock
+  // silently goes stale, because broadcasts and the poller both require
+  // overlayScriptId.
+  channel = createOverlayChannel({
+    attached: () => mgr.attached(),
+    sessionFor: (p?: string) => mgr.sessionFor(p),
+    ensureOverlay,
+    onSignal: handlePageSignal,
+  });
 
   const LENS_ACTIONS = ["on", "off", "list", "clear"] as const;
   type LensAction = (typeof LENS_ACTIONS)[number];
@@ -982,26 +947,10 @@ export default function (pi: ExtensionAPI) {
   // Drain any queued dock updates before tearing down: in one-shot modes the
   // session ends right after the final assistant message, and a poller that
   // never ticks would swallow the last reply (the dock would stay silent).
-  const flushChatQueue = async (): Promise<void> => {
-    if (overlayPoll) clearInterval(overlayPoll);
-    overlayPoll = null;
-    for (const a of mgr.attached()) {
-      const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
-      if (!s || !s.overlayScriptId) continue;
-      const updates = chatQueue.get(a.key) ?? [];
-      if (!updates.length) continue;
-      chatQueue.delete(a.key);
-      await evaluate(
-        s,
-        `window.__piOverlay ? window.__piOverlay.tick(${JSON.stringify(updates)}) : null`,
-        { timeoutMs: 3_000 },
-      ).catch(() => {});
-    }
-  };
-
   pi.on("session_shutdown", async () => {
-    await flushChatQueue();
-    chatQueue.clear();
+    channel.stopPoll();
+    await channel.flush();
+    channel.clearQueue();
     mgr.closeAll();
   });
 

@@ -110,7 +110,10 @@ to (the first `tab_lens` call or `/tab interact`).
   position/size live in `sessionStorage`, so everything survives a reload in
   the same tab — the overlay re-installs on every document via
   `Page.addScriptToEvaluateOnNewDocument` (plus a runtime re-injection when a
-  re-attach lost the registration).
+  re-attach lost the registration). The update channel self-heals the same
+  way: a CDP socket drop re-attaches with a fresh session whose overlay
+  registration is gone, and the next broadcast or poller tick reinstalls it
+  instead of letting the dock go silently stale.
 - **Trust model:** the dock renders agent text in the page's DOM, so **the
   page can read the replies** — secrets never leave the process, but don't
   treat the dock as confidential to the site. The reverse direction is
@@ -129,7 +132,16 @@ to (the first `tab_lens` call or `/tab interact`).
 > a tab can show the latest overlay while a session still streams pre-edit
 > behaviour from its in-memory extension. Judge by live behaviour (e.g. after
 > the expandable-rows commit, new tool rows must carry args/result), then
-> reload the extension if it is stale.
+> reload the extension if it is stale. Beware the normalisation trap when
+> judging: the overlay stores tool rows with `args`/`result` keys even when
+> the in-memory code predates them (old `{kind,name,ok}` broadcasts become
+> rows with empty detail), so *empty* detail proves nothing — check that
+> entries are actually new since the reload. A second quirk: a CDP socket
+> drop (Chrome restart, proxy churn) used to leave the dock silently stale —
+> the re-attach's fresh session had no overlay registration, so broadcasts
+> and the poller both skipped it until `tab_lens` or `/tab interact` ran;
+> the channel now self-heals on the next broadcast/poll (see
+> `overlay-channel.ts`).
 
 ## Workflow
 
@@ -152,8 +164,9 @@ to (the first `tab_lens` call or `/tab interact`).
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command; chat-dock/lens event broadcasting, page-signal polling, network formatting |
+| `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command; session-event → dock wiring (tracker, page signals, `ensureOverlay`) |
+| `overlay-channel.ts` | The dock's update channel: per-tab queue + 1-second poller (drains into the overlay `tick()`, pops page signals), self-heals a lost overlay registration after a CDP re-attach |
 | `tool-update.ts` | `ToolCallTracker`: pairs assistant `toolCall` blocks with `toolResult` messages (truncated args + result) for the dock's expandable tool rows |
 | `cdp.ts` | Minimal CDP client: session manager, attach/re-attach, console + Network-domain capture (250-entry cap), evaluate, screenshot |
 | `overlay.ts` | The in-page overlay (one main-world script, single template literal): user-facing lens + chat dock — DOM/UI, `sessionStorage` state, isTrusted input guards, the `tick()` bridge polled by the extension |
-| `tool-update.test.ts`, `overlay.test.ts` | Focused tests: tracker pairing/truncation, and the overlay booted in a happy-dom window (expandable rows, isTrusted click guard, persistence). `bun test .`; `bunx tsc --noEmit` typechecks |
+| `tool-update.test.ts`, `overlay.test.ts`, `overlay-channel.test.ts` | Focused tests: tracker pairing/truncation, the overlay booted in a happy-dom window (expandable rows, isTrusted click guard, persistence), and the update channel (queue/flush, self-heal, signal routing, poller lifecycle). `bun test .`; `bunx tsc --noEmit` typechecks |
