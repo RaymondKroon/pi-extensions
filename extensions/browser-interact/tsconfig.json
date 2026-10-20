@@ -1,0 +1,15 @@
+{
+	"compilerOptions": {
+		"target": "es2022",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"lib": ["es2022", "dom"],
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"noUnusedLocals": false,
+		"types": ["node", "bun"]
+	},
+	"include": ["*.ts"],
+	"exclude": ["node_modules"]
+}

@@ -100,9 +100,12 @@ to (the first `tab_lens` call or `/tab interact`).
 - **Output:** agent replies and one line per tool call render in the dock via a
   live ~1 s poller (busy state shown as a dot); a shutdown flush delivers
   updates queued at session end, so one-shot sessions don't lose the final
-  reply. The floating **💬 pi** button opens the panel; drag the header to
-  move, the bottom-right corner to resize, `–` to minimize, `✕` to close,
-  and the header's **🔍** toggles the lens.
+  reply. Tool rows are **expandable**: click one to reveal the call's
+  arguments and (truncated) result output — failed calls show an
+  *error* section; the args/result are paired per `toolCallId` between the
+  assistant message and its result. The floating **💬 pi** button opens the
+  panel; drag the header to move, the bottom-right corner to resize, `–` to
+  minimize, `✕` to close, and the header's **🔍** toggles the lens.
 - **State:** the transcript tail (last 50 messages), open state, and
   position/size live in `sessionStorage`, so everything survives a reload in
   the same tab — the overlay re-installs on every document via
@@ -144,5 +147,7 @@ to (the first `tab_lens` call or `/tab interact`).
 | File | Purpose |
 |------|---------|
 | `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command; chat-dock/lens event broadcasting, page-signal polling, network formatting |
+| `tool-update.ts` | `ToolCallTracker`: pairs assistant `toolCall` blocks with `toolResult` messages (truncated args + result) for the dock's expandable tool rows |
 | `cdp.ts` | Minimal CDP client: session manager, attach/re-attach, console + Network-domain capture (250-entry cap), evaluate, screenshot |
 | `overlay.ts` | The in-page overlay (one main-world script, single template literal): user-facing lens + chat dock — DOM/UI, `sessionStorage` state, isTrusted input guards, the `tick()` bridge polled by the extension |
+| `tool-update.test.ts`, `overlay.test.ts` | Focused tests: tracker pairing/truncation, and the overlay booted in a happy-dom window (expandable rows, isTrusted click guard, persistence). `bun test .`; `bunx tsc --noEmit` typechecks |

@@ -22,6 +22,7 @@ import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import { Type } from "typebox";
 import { CdpManager, evaluate, screenshot, type CdpSession, type CdpTarget } from "./cdp";
 import { OVERLAY_SCRIPT, OVERLAY_V } from "./overlay";
+import { ToolCallTracker } from "./tool-update";
 
 const DEFAULT_PORT = 9222;
 
@@ -216,6 +217,8 @@ export default function (pi: ExtensionAPI) {
   let agentBusy = false;
   /** Per-session update queue drained by the overlay poller (keyed like mgr.attached()). */
   const chatQueue = new Map<string, unknown[]>();
+  /** toolCallId → serialized arguments, paired with the result for the dock's expandable tool rows. */
+  const toolTracker = new ToolCallTracker();
 
   const broadcastUpdates = (updates: unknown[]): void => {
     for (const a of mgr.attached()) {
@@ -252,8 +255,9 @@ export default function (pi: ExtensionAPI) {
     if (m?.role === "assistant") {
       const text = assistantText(m).trim();
       if (text) broadcastUpdates([{ kind: "msg", role: "agent", text: text.slice(0, 8000) }]);
+      toolTracker.trackAssistant(m);
     } else if (m?.role === "toolResult") {
-      broadcastUpdates([{ kind: "tool", name: String(m.toolName ?? "tool"), ok: !m.isError }]);
+      broadcastUpdates([toolTracker.toolResult(m)]);
     }
   });
 
@@ -297,6 +301,9 @@ export default function (pi: ExtensionAPI) {
 
   const text = (v: unknown): string =>
     v === undefined ? "undefined" : typeof v === "string" ? v : JSON.stringify(v, null, 2);
+
+  /** Text-only tool result; `details` is unused but required by current pi types. */
+  const toolResult = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
 
   const defaultShot = (url: string): string => {
     let host = "page";
@@ -463,7 +470,7 @@ export default function (pi: ExtensionAPI) {
         });
         return { attached: true, targetId: s.targetId, url: href, title };
       });
-      return { content: [{ type: "text", text: text(status) }] };
+      return toolResult(text(status));
     },
   });
 
@@ -479,7 +486,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const result = await run(params.tab, ctx.cwd, (s) => evaluate(s, params.expression));
-      return { content: [{ type: "text", text: text(result) }] };
+      return toolResult(text(result));
     },
   });
 
@@ -523,7 +530,7 @@ export default function (pi: ExtensionAPI) {
           await new Promise((r) => setTimeout(r, 500));
         }
       });
-      return { content: [{ type: "text", text: text(result ?? { done: true, result: null }) }] };
+      return toolResult(text(result ?? { done: true, result: null }));
     },
   });
 
@@ -539,7 +546,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const out = await run(params.tab, ctx.cwd, (s) => screenshot(s, params.path ?? defaultShot(s.url)));
-      return { content: [{ type: "text", text: out }] };
+      return toolResult(out);
     },
   });
 
@@ -568,7 +575,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const out = await lensAction(params.action ?? "list", ctx.cwd, params.tab);
-      return { content: [{ type: "text", text: out }] };
+      return toolResult(out);
     },
   });
 
@@ -618,7 +625,7 @@ export default function (pi: ExtensionAPI) {
           await new Promise((r) => setTimeout(r, 500));
         }
       });
-      return { content: [{ type: "text", text: text(result) }] };
+      return toolResult(text(result));
     },
   });
 
@@ -701,7 +708,7 @@ export default function (pi: ExtensionAPI) {
         }
         return { ok: true, trusted: true, hovered: st.tag ? { tag: st.tag, text: st.text } : { x: st.x, y: st.y }, elementAt, ...(wait ? { wait } : {}) };
       });
-      return { content: [{ type: "text", text: text(result) }] };
+      return toolResult(text(result));
     },
   });
 
@@ -717,7 +724,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       await run(params.tab, ctx.cwd, (s) => s.send("Input.insertText", { text: params.text }, 30_000));
-      return { content: [{ type: "text", text: "ok" }] };
+      return toolResult("ok");
     },
   });
 
@@ -740,7 +747,7 @@ export default function (pi: ExtensionAPI) {
         await s.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, ...(k.text ? { text: k.text } : {}) }, 10_000);
         await s.send("Input.dispatchKeyEvent", { type: "keyUp", ...base }, 10_000);
       });
-      return { content: [{ type: "text", text: "ok" }] };
+      return toolResult("ok");
     },
   });
 
@@ -762,7 +769,7 @@ export default function (pi: ExtensionAPI) {
           ? evaluate(s, `document.querySelector(${JSON.stringify(params.selector)})?.scrollIntoView({ block: 'center' })`)
           : evaluate(s, `window.scrollBy(${Number(params.x) || 0}, ${Number(params.y) || 0})`),
       );
-      return { content: [{ type: "text", text: "ok" }] };
+      return toolResult("ok");
     },
   });
 
@@ -777,12 +784,12 @@ export default function (pi: ExtensionAPI) {
       tab: TAB,
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const messages = await run(params.tab, ctx.cwd, (s) => {
+      const messages = await run(params.tab, ctx.cwd, async (s) => {
         const out = [...s.consoleBuffer];
         if (params.clear) s.consoleBuffer.length = 0;
         return out;
       });
-      return { content: [{ type: "text", text: messages.length ? messages.join("\n") : "(no console errors/warnings)" }] };
+      return toolResult(messages.length ? messages.join("\n") : "(no console errors/warnings)");
     },
   });
 
@@ -806,8 +813,8 @@ export default function (pi: ExtensionAPI) {
       tab: TAB,
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const all = await run(params.tab, ctx.cwd, (s) => {
-        const rows = s.networkSnapshot().map((e) => ({
+      const all = await run(params.tab, ctx.cwd, async (s) => {
+        const rows = s.networkSnapshot().map((e: any) => ({
           n: e.seq,
           method: e.method,
           status: e.status ?? (e.error ? `failed${e.canceled ? " (canceled)" : ": " + e.error}` : "pending"),
@@ -829,20 +836,15 @@ export default function (pi: ExtensionAPI) {
       }
       const limit = Math.min(Math.max(Number(params.limit) || 30, 1), 200);
       const shown = rows.slice(-limit);
-      return {
-        content: [
-          {
-            type: "text",
-            text: text({
-              capturing: true,
-              scope: "since attach of this tab (survives reloads; buffer capped at 250)",
-              matched: rows.length,
-              shown: shown.length,
-              requests: shown,
-            }),
-          },
-        ],
-      };
+      return toolResult(
+        text({
+          capturing: true,
+          scope: "since attach of this tab (survives reloads; buffer capped at 250)",
+          matched: rows.length,
+          shown: shown.length,
+          requests: shown,
+        }),
+      );
     },
   });
 
@@ -858,7 +860,7 @@ export default function (pi: ExtensionAPI) {
       const result = await run(params.tab, ctx.cwd, (s) =>
         evaluate(s, dismissExpression(cfg.dismiss), { timeoutMs: 15_000 }),
       );
-      return { content: [{ type: "text", text: text(result ?? { dismissed: 0, items: [] }) }] };
+      return toolResult(text(result ?? { dismissed: 0, items: [] }));
     },
   });
 
@@ -883,7 +885,7 @@ export default function (pi: ExtensionAPI) {
           await new Promise((r) => setTimeout(r, 500));
         }
       });
-      return { content: [{ type: "text", text: `navigated to ${params.url}` }] };
+      return toolResult(`navigated to ${params.url}`);
     },
   });
 
@@ -898,14 +900,14 @@ export default function (pi: ExtensionAPI) {
       resolveConfig(ctx.cwd);
       const attached = mgr.attached();
       if (!attached.length) {
-        return { content: [{ type: "text", text: "(no attached tabs — the next tab_* tool attaches)" }] };
+        return toolResult("(no attached tabs — the next tab_* tool attaches)");
       }
       const rows = [];
       for (const a of attached) {
         const st = await mgr.status(a.key === "*" ? undefined : a.key);
         rows.push({ key: a.key === "*" ? "(default)" : a.key, ...st });
       }
-      return { content: [{ type: "text", text: text(rows) }] };
+      return toolResult(text(rows));
     },
   });
 
@@ -923,7 +925,7 @@ export default function (pi: ExtensionAPI) {
       const t = await mgr.openTarget(params.url);
       // Attach so the new tab shows up in tab_list immediately.
       await mgr.attachTarget(t);
-      return { content: [{ type: "text", text: `opened tab ${t.id} at ${t.url}` }] };
+      return toolResult(`opened tab ${t.id} at ${t.url}`);
     },
   });
 
@@ -973,7 +975,7 @@ export default function (pi: ExtensionAPI) {
       }
       await mgr.closeTarget(target.id);
       mgr.forgetTarget(target.id);
-      return { content: [{ type: "text", text: `closed tab ${target.id} (${target.url})` }] };
+      return toolResult(`closed tab ${target.id} (${target.url})`);
     },
   });
 

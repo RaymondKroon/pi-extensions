@@ -22,7 +22,7 @@
 // big TS template literal; the page code uses plain string concatenation.
 // (OVERLAY_V is the single controlled interpolation.)
 
-export const OVERLAY_V = 3;
+export const OVERLAY_V = 4;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -134,7 +134,26 @@ export const OVERLAY_SCRIPT = `(() => {
     const renderMsg = (m) => {
       if (m.kind === "tool") {
         const d = document.createElement("div"); d.className = "pi-chat-tool";
-        d.textContent = "\u2699 " + m.name + (m.ok ? " \u2713" : " \u2717 failed");
+        const head = document.createElement("span"); head.className = "pi-chat-tool-head";
+        head.textContent = "\u2699 " + m.name + (m.ok ? " \u2713" : " \u2717 failed");
+        d.appendChild(head);
+        const hasDetail = !!(m.args || m.result);
+        if (hasDetail) {
+          d.classList.add("has-detail");
+          const det = document.createElement("div"); det.className = "pi-chat-tool-detail";
+          if (m.args) {
+            const ah = document.createElement("div"); ah.className = "pi-chat-tool-sec"; ah.textContent = "arguments";
+            const ap = document.createElement("pre"); ap.textContent = m.args;
+            det.appendChild(ah); det.appendChild(ap);
+          }
+          if (m.result) {
+            const rh = document.createElement("div"); rh.className = "pi-chat-tool-sec" + (m.ok ? "" : " err"); rh.textContent = m.ok ? "result" : "error";
+            const rp = document.createElement("pre"); rp.textContent = m.result;
+            det.appendChild(rh); det.appendChild(rp);
+          }
+          d.appendChild(det);
+          d.addEventListener("click", (ev) => { if (ev.isTrusted) d.classList.toggle("open"); });
+        }
         log.appendChild(d);
       } else {
         const d = document.createElement("div");
@@ -371,6 +390,17 @@ export const OVERLAY_SCRIPT = `(() => {
       ".pi-chat-msg.user { background: #1d4ed8; margin-left: 18%; }" +
       ".pi-chat-msg.agent { background: #374151; margin-right: 18%; }" +
       ".pi-chat-tool { color: #6b7280; font-size: 11px; margin: 2px 0 6px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }" +
+      ".pi-chat-tool.has-detail { display: flex; flex-direction: column; white-space: normal; cursor: pointer; }" +
+      ".pi-chat-tool.has-detail .pi-chat-tool-head { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }" +
+      ".pi-chat-tool.has-detail:hover .pi-chat-tool-head { color: #d1d5db; }" +
+      ".pi-chat-tool-head::before { content: none; }" +
+      ".pi-chat-tool.has-detail .pi-chat-tool-head::before { content: '\\u25b8  '; color: #4b5563; }" +
+      ".pi-chat-tool.open .pi-chat-tool-head::before { content: '\\u25be  '; color: #4b5563; }" +
+      ".pi-chat-tool-detail { display: none; margin-top: 3px; padding: 4px 8px; background: #111827; border: 1px solid #374151; border-radius: 6px; max-height: 160px; overflow-y: auto; }" +
+      ".pi-chat-tool.open .pi-chat-tool-detail { display: block; }" +
+      ".pi-chat-tool-sec { color: #6b7280; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; margin-top: 3px; }" +
+      ".pi-chat-tool-sec.err { color: #f87171; }" +
+      ".pi-chat-tool-detail pre { margin: 2px 0 6px; font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; color: #d1d5db; }" +
       "#__pi_chat_inrow { display: flex; align-items: flex-end; gap: 6px; padding: 0 8px 8px; }" +
       "#__pi_chat_input { flex: 1; resize: none; height: 54px; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 8px; padding: 6px 8px; font: inherit; }" +
       "#__pi_chat_input:focus { outline: none; border-color: #3b82f6; }" +
@@ -426,8 +456,8 @@ export const OVERLAY_SCRIPT = `(() => {
     msgs.push(m); saveMsgs();
     if (window.__piOverlayRender) window.__piOverlayRender(m, true);
   };
-  const addTool = (name, ok) => {
-    const m = { kind: "tool", name: String(name || "tool"), ok: !!ok };
+  const addTool = (name, ok, args, result) => {
+    const m = { kind: "tool", name: String(name || "tool"), ok: !!ok, args: String(args ?? "").slice(0, 2000), result: String(result ?? "").slice(0, 4000) };
     msgs.push(m); saveMsgs();
     if (window.__piOverlayRender) window.__piOverlayRender(m, false);
   };
@@ -443,7 +473,7 @@ export const OVERLAY_SCRIPT = `(() => {
         if (!u || typeof u !== "object") continue;
         if (u.kind === "status") setBusy(!!u.busy);
         else if (u.kind === "msg") addAgent(u.text);
-        else if (u.kind === "tool") addTool(u.name, u.ok);
+        else if (u.kind === "tool") addTool(u.name, u.ok, u.args, u.result);
       }
     }
     const out = signals;
