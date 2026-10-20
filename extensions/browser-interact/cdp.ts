@@ -28,6 +28,31 @@ export interface CdpTarget {
   webSocketDebuggerUrl: string;
 }
 
+/** One captured network request (CDP Network domain), as reported by tab_network. */
+export interface NetEntry {
+  reqId: string;
+  seq: number;
+  url: string;
+  method: string;
+  /** CDP resourceType: document, xhr, fetch, script, stylesheet, image, font, media, other, ... */
+  type: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  /** Response body bytes (encodedDataLength from loadingFinished). */
+  size?: number;
+  /** Start → finish duration in ms. */
+  ms?: number;
+  error?: string;
+  canceled?: boolean;
+  /** A 3xx hop of a redirect chain (never finalized) — hidden from tool output. */
+  redirectHop?: boolean;
+  /** CDP timestamp (seconds) the request was sent. */
+  ts: number;
+}
+
+const NET_CAP = 250;
+
 interface Pending {
   method: string;
   resolve: (v: any) => void;
@@ -41,12 +66,17 @@ export class CdpSession {
   closed = false;
   /** console.error / console.warn / uncaught exceptions, oldest first, capped. */
   consoleBuffer: string[] = [];
-  /** id from Page.addScriptToEvaluateOnNewDocument, set once the lens overlay
-   * is armed on this target (so it re-installs automatically on every reload). */
-  lensScriptId?: string;
+  /** Recent network activity of this target (CDP Network domain), oldest first,
+   * capped at NET_CAP. Survives reloads (bound to the target). */
+  private netByReq = new Map<string, NetEntry>();
+  private netSeq = 0;
+  /** id from Page.addScriptToEvaluateOnNewDocument, set once the page overlay
+   * (lens + chat dock) is armed on this target (so it re-installs automatically
+   * on every reload). */
+  overlayScriptId?: string;
   /** source of the installed new-document script (re-register when it changes,
    * e.g. after an extension update). */
-  lensScriptSource?: string;  private ws: WebSocket;
+  overlayScriptSource?: string;  private ws: WebSocket;
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private listeners = new Map<string, Set<(params: any) => void>>();
@@ -92,6 +122,57 @@ export class CdpSession {
     // not take the whole process down with an unhandled rejection.
     p.catch(() => {});
     return p;
+  }
+
+  /** Record a CDP Network.requestWillBeSent (one entry per requestId). */
+  netStart(p: { requestId?: string; timestamp?: number; type?: string; request?: { url?: string; method?: string } }): void {
+    if (!p?.requestId || this.netByReq.has(p.requestId)) return;
+    this.netByReq.set(p.requestId, {
+      reqId: p.requestId,
+      seq: ++this.netSeq,
+      url: p.request?.url ?? "",
+      method: p.request?.method ?? "GET",
+      type: p.type ?? "other",
+      ts: p.timestamp ?? Date.now() / 1000,
+    });
+    while (this.netByReq.size > NET_CAP) {
+      const oldest = this.netByReq.keys().next().value;
+      if (oldest === undefined) break;
+      this.netByReq.delete(oldest);
+    }
+  }
+
+  netResponse(p: { requestId?: string; response?: { status?: number; statusText?: string; mimeType?: string } }): void {
+    const e = p?.requestId ? this.netByReq.get(p.requestId) : undefined;
+    if (!e) return;
+    e.status = p.response?.status;
+    e.statusText = p.response?.statusText;
+    e.mimeType = p.response?.mimeType;
+    if (e.status !== undefined && e.status >= 300 && e.status < 400) e.redirectHop = true;
+  }
+
+  netFinished(p: { requestId?: string; timestamp?: number; encodedDataLength?: number }): void {
+    const e = p?.requestId ? this.netByReq.get(p.requestId) : undefined;
+    if (!e) return;
+    e.size = p.encodedDataLength;
+    if (p.timestamp) e.ms = Math.max(0, Math.round((p.timestamp - e.ts) * 1000));
+  }
+
+  netFailed(p: { requestId?: string; timestamp?: number; errorText?: string; canceled?: boolean }): void {
+    const e = p?.requestId ? this.netByReq.get(p.requestId) : undefined;
+    if (!e) return;
+    e.error = p.errorText;
+    e.canceled = !!p.canceled;
+    if (p.timestamp) e.ms = Math.max(0, Math.round((p.timestamp - e.ts) * 1000));
+  }
+
+  /** All captured entries, oldest first. Redirect hops are excluded. */
+  networkSnapshot(): NetEntry[] {
+    return [...this.netByReq.values()].filter((e) => !e.redirectHop);
+  }
+
+  clearNetwork(): void {
+    this.netByReq.clear();
   }
 
   close(): void {
@@ -176,11 +257,6 @@ export async function evaluate(
 export class CdpManager {
   port = 9222;
   defaultTab?: string;
-  /** Fired when the lens overlay delivers a queued note signal (polled from
-   * the page — see the lens poller in index.ts; console events are dropped by
-   * the Browser Bridge proxy, so the page queues signals and the extension
-   * pops them). */
-  onPageSignal?: (signal: Record<string, unknown>) => void;
   private sessions = new Map<string, CdpSession>();
   /** Last attached target id per key — lets us re-attach even after the tab
    * navigated to a URL that no longer matches the pattern. */
@@ -425,8 +501,15 @@ export class CdpManager {
       const d = p.exceptionDetails ?? {};
       pushConsole(s, `[exception] ${d.text ?? "uncaught"} ${d.exception?.description ?? ""}`.trim());
     });
+    // Network capture for tab_network: metadata only (no bodies), so the
+    // overhead is small and the buffer survives reloads with the session.
+    s.on("Network.requestWillBeSent", (p) => s.netStart(p));
+    s.on("Network.responseReceived", (p) => s.netResponse(p));
+    s.on("Network.loadingFinished", (p) => s.netFinished(p));
+    s.on("Network.loadingFailed", (p) => s.netFailed(p));
     await s.send("Runtime.enable");
     await s.send("Page.enable");
+    await s.send("Network.enable");
     this.sessions.set(key, s);
     this.lastTargetId.set(key, t.id);
     return s;

@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CdpManager, evaluate, screenshot, type CdpSession, type CdpTarget } from "./cdp";
+import { OVERLAY_SCRIPT, OVERLAY_V } from "./overlay";
 
 const DEFAULT_PORT = 9222;
 
@@ -166,208 +167,6 @@ function dismissExpression(dismiss?: DismissConfig): string {
 })()`;
 }
 
-// --------------------------------------------------------------------- lens
-
-// In-page "lens" overlay, injected with Page.addScriptToEvaluateOnNewDocument
-// (CSP-exempt like Runtime.evaluate, and it re-installs automatically on every
-// reload/navigation of the attached target). The USER draws bounding boxes on
-// the live page, types a note for each, and the agent reads them back with
-// tab_lens (which also saves a cropped screenshot per box).
-//
-// State lives in window.__piLens (idempotent install: the guard returns the
-// existing API) plus sessionStorage, so notes and the on/off state survive a
-// reload in the same tab. Boxes are stored in DOCUMENT coordinates so they
-// stay anchored while scrolling; markers re-render on scroll.
-// NOTE: no backticks / template interpolation inside — this is one big TS
-// template literal and the page code uses plain string concatenation.
-// (LENS_V is the one controlled interpolation.)
-const LENS_V = 5;
-const LENS_SCRIPT = `(() => {
-  const LENS_V = ${LENS_V};
-  if (window.__piLens && window.__piLens.__v !== LENS_V) {
-    // Upgrade: drop a stale overlay version before installing the new one.
-    // Remove its WINDOW listeners too — otherwise every old version keeps
-    // re-rendering duplicate markers on scroll/click.
-    try {
-      const L = window.__piLensListeners;
-      if (L) {
-        window.removeEventListener("mousedown", L.mousedown, true);
-        window.removeEventListener("mousemove", L.mousemove, true);
-        window.removeEventListener("mouseup", L.mouseup, true);
-        window.removeEventListener("keydown", L.keydown, true);
-        window.removeEventListener("scroll", L.scroll);
-      }
-      document.querySelectorAll("[data-pi-lens], #__pi_lens_btn, #__pi_lens_box, #__pi_lens_panel, .pi-lens-marker, .pi-lens-chip").forEach((n) => n.remove());
-    } catch (e) {}
-    window.__piLensListeners = null;
-    window.__piLens = undefined;
-  }
-  if (window.__piLens) return window.__piLens;
-  const NKEY = "__pi_lens_notes";
-  const EKEY = "__pi_lens_enabled";
-  let notes = [];
-  try { notes = JSON.parse(sessionStorage.getItem(NKEY) || "[]"); } catch (e) { notes = []; }
-  let enabled = false;
-  try { enabled = sessionStorage.getItem(EKEY) === "1"; } catch (e) {}
-  const Z = 2147483647;
-  const style = document.createElement("style");
-  style.setAttribute("data-pi-lens", "style");
-  style.textContent =
-    "html.__pi_lens_on, html.__pi_lens_on body { cursor: crosshair !important; }" +
-    "#__pi_lens_btn { position: fixed; right: 16px; bottom: 16px; z-index: " + Z + "; pointer-events: auto; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 999px; padding: 6px 12px; font: 12px/1.4 ui-sans-serif, system-ui, sans-serif; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.4); }" +
-    "#__pi_lens_btn.on { background: #1d4ed8; border-color: #3b82f6; color: #fff; }" +
-    "#__pi_lens_box { position: fixed; z-index: " + (Z - 1) + "; pointer-events: none; display: none; border: 2px solid #2563eb; background: rgba(37,99,235,.10); }" +
-    ".pi-lens-marker { position: fixed; z-index: " + (Z - 2) + "; pointer-events: none; border: 1px solid rgba(37,99,235,.8); background: rgba(37,99,235,.06); }" +
-    ".pi-lens-chip { position: fixed; z-index: " + (Z - 1) + "; pointer-events: auto; cursor: pointer; background: #2563eb; color: #fff; border-radius: 4px 4px 4px 0; padding: 1px 6px; font: 11px/1.5 ui-sans-serif, system-ui, sans-serif; white-space: nowrap; }" +
-    ".pi-lens-chip:hover { background: #dc2626; }" +
-    "#__pi_lens_panel { position: fixed; z-index: " + Z + "; pointer-events: auto; display: none; background: #fff; color: #111827; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.25); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }" +
-    "#__pi_lens_input { width: 320px; max-width: 60vw; padding: 6px 8px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; }" +
-    "#__pi_lens_hint { margin-top: 4px; color: #6b7280; font-size: 11px; }";
-  document.documentElement.appendChild(style);
-  const box = document.createElement("div"); box.id = "__pi_lens_box";
-  const panel = document.createElement("div"); panel.id = "__pi_lens_panel";
-  const input = document.createElement("input"); input.id = "__pi_lens_input"; input.maxLength = 500; input.placeholder = "note for the agent...";
-  const hint = document.createElement("div"); hint.id = "__pi_lens_hint"; hint.textContent = "enter = save · esc = cancel";
-  panel.appendChild(input); panel.appendChild(hint);
-  const btn = document.createElement("button"); btn.id = "__pi_lens_btn";
-  document.documentElement.appendChild(box);
-  document.documentElement.appendChild(panel);
-  document.documentElement.appendChild(btn);
-  const markers = [];
-  const place = (el, x, y, w, h) => { el.style.left = x + "px"; el.style.top = y + "px"; el.style.width = w + "px"; el.style.height = h + "px"; };
-  const save = () => { try { sessionStorage.setItem(NKEY, JSON.stringify(notes)); } catch (e) {} };
-  // Signal queue for the extension (polled; console events are dropped by
-  // the Browser Bridge proxy, so the page cannot push directly).
-  let signals = [];
-  const push = (sig) => { signals.push(sig); };
-  const removeNote = (i) => {
-    if (i < 1 || i > notes.length) return;
-    notes.splice(i - 1, 1); save(); render();
-    push({ type: "note-removed", index: i });
-  };
-  const render = () => {
-    for (const m of markers) m.remove(); markers.length = 0;
-    if (!enabled) return;
-    notes.forEach((n, i) => {
-      const x = n.docX - window.scrollX, y = n.docY - window.scrollY;
-      if (x > window.innerWidth || y > window.innerHeight || x + n.w < 0 || y + n.h < 0) return;
-      const d = document.createElement("div"); d.className = "pi-lens-marker"; place(d, Math.max(0, x), Math.max(0, y), n.w, n.h);
-      document.documentElement.appendChild(d); markers.push(d);
-      const c = document.createElement("div"); c.className = "pi-lens-chip";
-      c.textContent = (i + 1) + (n.text ? " " + n.text : "") + " \u2715";
-      c.title = "click to remove this note";
-      c.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); removeNote(i + 1); }, true);
-      c.style.left = Math.max(0, x) + "px";
-      c.style.top = Math.max(0, y - 18) + "px";
-      document.documentElement.appendChild(c); markers.push(c);
-    });
-  };
-  let drag = null, pending = null;
-  const overLens = (t) => !!(t && t.closest && (t.closest("#__pi_lens_panel") || t.closest("#__pi_lens_btn") || t.closest(".pi-lens-chip")));
-  const setEnabled = (on) => {
-    enabled = !!on;
-    try { sessionStorage.setItem(EKEY, enabled ? "1" : "0"); } catch (e) {}
-    document.documentElement.classList.toggle("__pi_lens_on", enabled);
-    btn.classList.toggle("on", enabled);
-    btn.textContent = enabled ? "🔍 pi-lens ON (esc to turn off)" : "🔍 pi-lens";
-    if (!enabled) {
-      box.style.display = "none"; panel.style.display = "none";
-      drag = null; pending = null;
-      for (const m of markers) m.remove(); markers.length = 0;
-    } else {
-      render();
-    }
-  };
-  btn.addEventListener("click", () => setEnabled(!enabled));
-  const onMousedown = (e) => {
-    if (!enabled || e.button !== 0 || overLens(e.target)) return;
-    e.preventDefault();
-    drag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY };
-    box.style.display = "block";
-  };
-  const onMousemove = (e) => {
-    if (!drag) return;
-    drag.x1 = e.clientX; drag.y1 = e.clientY;
-    place(box, Math.min(drag.x0, drag.x1), Math.min(drag.y0, drag.y1), Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0));
-  };
-  const onMouseup = (e) => {
-    if (!drag) return;
-    const x = Math.min(drag.x0, drag.x1), y = Math.min(drag.y0, drag.y1);
-    const w = Math.abs(drag.x1 - drag.x0), h = Math.abs(drag.y1 - drag.y0);
-    drag = null;
-    if (w < 8 || h < 8) { box.style.display = "none"; return; } // accidental click, ignore
-    pending = { x, y, w, h };
-    input.value = "";
-    panel.style.display = "block";
-    const pw = 340;
-    panel.style.left = Math.max(8, Math.min(x + w / 2, window.innerWidth - pw)) + "px";
-    const above = y - 90 > 8 ? y - 90 : y + h + 10; // prefer above the box
-    panel.style.top = Math.max(8, Math.min(above, window.innerHeight - 90)) + "px";
-    input.focus();
-  };
-  window.addEventListener("mousedown", onMousedown, true);
-  window.addEventListener("mousemove", onMousemove, true);
-  window.addEventListener("mouseup", onMouseup, true);
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      if (!pending) return;
-      notes.push({
-        docX: Math.round(pending.x + window.scrollX),
-        docY: Math.round(pending.y + window.scrollY),
-        w: Math.round(pending.w),
-        h: Math.round(pending.h),
-        text: input.value.trim(),
-        t: new Date().toISOString(),
-      });
-      save();
-      pending = null;
-      panel.style.display = "none";
-      box.style.display = "none";
-      render();
-      push({ type: "note-saved", index: notes.length, text: notes[notes.length - 1].text });
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      pending = null;
-      panel.style.display = "none";
-      box.style.display = "none";
-    }
-  });
-  const onKeydown = (e) => {
-    if (e.key !== "Escape" || !enabled || e.target === input) return; // input handler owns its own esc
-    if (pending) { pending = null; panel.style.display = "none"; box.style.display = "none"; return; }
-    setEnabled(false);
-  };
-  const onScroll = () => { if (enabled) render(); };
-  window.addEventListener("keydown", onKeydown, true);
-  window.addEventListener("scroll", onScroll, { passive: true });
-  // Track window listeners so a newer overlay version can remove them.
-  window.__piLensListeners = { mousedown: onMousedown, mousemove: onMousemove, mouseup: onMouseup, keydown: onKeydown, scroll: onScroll };
-  const snapshot = () => ({
-    enabled: enabled,
-    url: location.href,
-    title: document.title,
-    notes: notes.map((n, i) => ({
-      index: i + 1,
-      x: Math.round(n.docX - window.scrollX), // viewport coords at snapshot time
-      y: Math.round(n.docY - window.scrollY),
-      docX: n.docX, docY: n.docY, w: n.w, h: n.h,
-      text: n.text,
-      time: n.t,
-    })),
-  });
-  window.__piLens = {
-    __v: LENS_V,
-    setEnabled: setEnabled,
-    snapshot: snapshot,
-    clear: () => { notes = []; save(); render(); },
-    remove: removeNote,
-    popSignals: () => { const out = signals; signals = []; return out; },
-  };
-  setEnabled(enabled);
-  return window.__piLens;
-})();`;
-
 const KEYS: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
   Enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
   Tab: { key: "Tab", code: "Tab", keyCode: 9 },
@@ -409,10 +208,66 @@ function keySpec(key: string): { key: string; code: string; keyCode: number; tex
 export default function (pi: ExtensionAPI) {
   const mgr = new CdpManager();
 
-  // Auto-push: when the user saves a lens note in the browser, the overlay
-  // pings us via a [pi-lens] console signal; surface it as a user message so
-  // the agent checks the lens without being told.
-  mgr.onPageSignal = (sig) => {
+  // ----------------------------------------------------------------- chat --
+  // The in-page chat dock is a UI surface over THIS pi session: chat text
+  // arrives as user messages, and session events are broadcast back to every
+  // docked tab. The dock renders agent replies in the page DOM, so the page
+  // itself can read them — the secrets never leave this process.
+  let agentBusy = false;
+  /** Per-session update queue drained by the overlay poller (keyed like mgr.attached()). */
+  const chatQueue = new Map<string, unknown[]>();
+
+  const broadcastUpdates = (updates: unknown[]): void => {
+    for (const a of mgr.attached()) {
+      const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
+      if (!s || !s.overlayScriptId) continue;
+      const q = chatQueue.get(a.key) ?? [];
+      for (const u of updates) {
+        q.push(u);
+        if (q.length > 200) q.splice(0, q.length - 200);
+      }
+      chatQueue.set(a.key, q);
+    }
+  };
+
+  const assistantText = (m: any): string => {
+    if (!m) return "";
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("\n");
+    }
+    return "";
+  };
+
+  pi.on("agent_start", () => {
+    agentBusy = true;
+    broadcastUpdates([{ kind: "status", busy: true }]);
+  });
+  pi.on("agent_end", () => {
+    agentBusy = false;
+    broadcastUpdates([{ kind: "status", busy: false }]);
+  });
+  pi.on("message_end", (ev) => {
+    const m = (ev as any).message;
+    if (m?.role === "assistant") {
+      const text = assistantText(m).trim();
+      if (text) broadcastUpdates([{ kind: "msg", role: "agent", text: text.slice(0, 8000) }]);
+    } else if (m?.role === "toolResult") {
+      broadcastUpdates([{ kind: "tool", name: String(m.toolName ?? "tool"), ok: !m.isError }]);
+    }
+  });
+
+  // Page → pi: the overlay queues signals (console events are dropped by the
+  // Browser Bridge proxy, so the poller pops them). Chat text only ever comes
+  // from trusted user events on the page (isTrusted guard in the overlay).
+  const handlePageSignal = (sig: Record<string, unknown>): void => {
+    if (sig.type === "chat") {
+      const t = typeof sig.text === "string" ? sig.text.trim().slice(0, 4000) : "";
+      if (!t) return;
+      // While a run is active, queue it as a follow-up; otherwise start one.
+      pi.sendUserMessage(`[browser chat] ${t}`, agentBusy ? { deliverAs: "followUp" } : {});
+      return;
+    }
     if (sig.type !== "note-saved") return;
     const index = String(sig.index ?? "?");
     const text = typeof sig.text === "string" && sig.text ? `: "${sig.text}"` : "";
@@ -451,65 +306,71 @@ export default function (pi: ExtensionAPI) {
     return `/tmp/tab-${host.replace(/[^a-z0-9.-]/gi, "_")}-shot.png`;
   };
 
-  // ------------------------------------------------------------------ lens --
+  // ---------------------------------------------------------- overlay ------
 
-  /** Install the lens overlay on the target: best-effort per-document install
-   * script (auto re-install on reload) plus a runtime check — if the current
-   * document lacks the overlay (registration lost to a re-attach or proxy
-   * quirk), inject it directly. Notes survive all of this via sessionStorage. */
-  const ensureLens = async (s: CdpSession): Promise<void> => {
+  /** Install the page overlay (lens + chat dock) on the target: best-effort
+   * per-document install script (auto re-install on reload) plus a runtime
+   * check — if the current document lacks the overlay (registration lost to a
+   * re-attach or proxy quirk), inject it directly. User state survives all of
+   * this via sessionStorage. */
+  const ensureOverlay = async (s: CdpSession): Promise<void> => {
     // Re-register the new-document script when the source changed (extension
     // update) — a stale registration would keep installing the old overlay.
-    if (!s.lensScriptId || s.lensScriptSource !== LENS_SCRIPT) {
-      if (s.lensScriptId) {
-        await s.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: s.lensScriptId }, 5_000).catch(() => {});
+    if (!s.overlayScriptId || s.overlayScriptSource !== OVERLAY_SCRIPT) {
+      if (s.overlayScriptId) {
+        await s.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: s.overlayScriptId }, 5_000).catch(() => {});
       }
       const { identifier } = await s.send(
         "Page.addScriptToEvaluateOnNewDocument",
-        { source: LENS_SCRIPT },
+        { source: OVERLAY_SCRIPT },
         10_000,
       );
-      s.lensScriptId = identifier;
-      s.lensScriptSource = LENS_SCRIPT;
+      s.overlayScriptId = identifier;
+      s.overlayScriptSource = OVERLAY_SCRIPT;
     }
-    const has = await evaluate(s, `!!(window.__piLens && window.__piLens.__v === ${LENS_V})`, { timeoutMs: 10_000 }).catch(
+    const has = await evaluate(s, `!!(window.__piOverlay && window.__piOverlay.__v === ${OVERLAY_V})`, { timeoutMs: 10_000 }).catch(
       () => false,
     );
-    if (!has) await evaluate(s, LENS_SCRIPT, { timeoutMs: 10_000 });
-    startLensPoll();
+    if (!has) await evaluate(s, OVERLAY_SCRIPT, { timeoutMs: 10_000 });
+    startOverlayPoll();
   };
 
-  // Signal poller: the Browser Bridge proxy drops Runtime.consoleAPICalled
-  // events, so the overlay cannot push note events from the page. While any
-  // attached session has the lens installed, pop its signal queue and
-  // deliver them via mgr.onPageSignal (which pushes into the pi session).
-  let lensPoll: ReturnType<typeof setInterval> | null = null;
-  let lensPollBusy = false;
-  const pollLensSignals = async () => {
-    if (lensPollBusy) return;
-    lensPollBusy = true;
+  // Overlay poller: one tick per attached overlay per second — applies queued
+  // agent updates (assistant text, tool lines, busy state) AND pops the page's
+  // signal queue (chat text, lens notes) in the same call. Console events
+  // cannot be used (dropped by the Browser Bridge proxy), so polling is the
+  // only reliable channel in both directions.
+  let overlayPoll: ReturnType<typeof setInterval> | null = null;
+  let overlayPollBusy = false;
+  const pollOverlays = async () => {
+    if (overlayPollBusy) return;
+    overlayPollBusy = true;
     try {
-      let anyLens = false;
+      let anyOverlay = false;
       for (const a of mgr.attached()) {
         const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
-        if (!s || !s.lensScriptId) continue;
-        anyLens = true;
-        const sigs = await evaluate(s, "window.__piLens ? window.__piLens.popSignals() : []", {
-          timeoutMs: 3_000,
-        }).catch(() => []);
-        if (Array.isArray(sigs)) for (const sig of sigs) if (sig && typeof sig === "object") mgr.onPageSignal?.(sig);
+        if (!s || !s.overlayScriptId) continue;
+        anyOverlay = true;
+        const updates = chatQueue.get(a.key) ?? [];
+        if (updates.length) chatQueue.delete(a.key);
+        const sigs = await evaluate(
+          s,
+          `window.__piOverlay ? window.__piOverlay.tick(${JSON.stringify(updates)}) : null`,
+          { timeoutMs: 3_000 },
+        ).catch(() => null);
+        if (Array.isArray(sigs)) for (const sig of sigs) if (sig && typeof sig === "object") handlePageSignal(sig);
       }
-      if (!anyLens && lensPoll) {
-        clearInterval(lensPoll);
-        lensPoll = null;
+      if (!anyOverlay && overlayPoll) {
+        clearInterval(overlayPoll);
+        overlayPoll = null;
       }
     } finally {
-      lensPollBusy = false;
+      overlayPollBusy = false;
     }
   };
-  const startLensPoll = () => {
-    if (lensPoll) return;
-    lensPoll = setInterval(pollLensSignals, 1_500);
+  const startOverlayPoll = () => {
+    if (overlayPoll) return;
+    overlayPoll = setInterval(pollOverlays, 1_000);
   };
 
   const LENS_ACTIONS = ["on", "off", "list", "clear"] as const;
@@ -519,8 +380,8 @@ export default function (pi: ExtensionAPI) {
   const lensAction = async (action: LensAction, cwd: string, tab?: string): Promise<string> => {
     if (action === "on" || action === "off") {
       await run(tab, cwd, async (s) => {
-        await ensureLens(s);
-        await evaluate(s, `window.__piLens && window.__piLens.setEnabled(${action === "on"})`, {
+        await ensureOverlay(s);
+        await evaluate(s, `window.__piOverlay && window.__piOverlay.lens.setEnabled(${action === "on"})`, {
           timeoutMs: 10_000,
         });
       });
@@ -530,16 +391,16 @@ export default function (pi: ExtensionAPI) {
     }
     if (action === "clear") {
       await run(tab, cwd, async (s) => {
-        await ensureLens(s);
-        await evaluate(s, "window.__piLens && window.__piLens.clear()", { timeoutMs: 10_000 });
+        await ensureOverlay(s);
+        await evaluate(s, "window.__piOverlay && window.__piOverlay.lens.clear()", { timeoutMs: 10_000 });
       });
       return "ok — lens annotations cleared";
     }
     // list: read the annotations, then save a cropped screenshot per box.
     const snap: any = await run(tab, cwd, async (s) => {
-      await ensureLens(s);
-      const r = await evaluate(s, "window.__piLens ? window.__piLens.snapshot() : null", { timeoutMs: 10_000 });
-      if (!r) throw new Error("lens is not installed on this page — arm it with action:'on' (or /tab lens on)");
+      await ensureOverlay(s);
+      const r = await evaluate(s, "window.__piOverlay ? window.__piOverlay.lens.snapshot() : null", { timeoutMs: 10_000 });
+      if (!r) throw new Error("overlay is not installed on this page — arm it with action:'on' (or /tab lens on)");
       return r;
     });
     let host = "page";
@@ -926,6 +787,66 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "tab_network",
+    label: "Tab Network",
+    description:
+      "List HTTP requests made by the target tab since attach (CDP Network domain: documents, fetch, XHR, assets — survives reloads, includes failures and pending requests). Each row: method, status (or pending/failed), resource type, response size, duration, url. filter matches a URL substring; types filters by resource type (default: document, xhr, fetch — pass e.g. [\"script\",\"image\"] for assets); failedOnly shows failures/pending/4xx/5xx only; limit caps the rows (newest last); clear empties the buffer after reading.",
+    promptSnippet: "List network requests captured by CDP for the target tab",
+    parameters: Type.Object({
+      filter: Type.Optional(Type.String({ description: "URL substring to match" })),
+      types: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            "Resource types to include (default: document, xhr, fetch). Values: document, xhr, fetch, script, stylesheet, image, font, media, other", 
+        }),
+      ),
+      failedOnly: Type.Optional(Type.Boolean({ description: "Only show failed, pending, and HTTP 4xx/5xx requests" })),
+      limit: Type.Optional(Type.Number({ description: "Max rows to return, newest last (default 30, max 200)" })),
+      clear: Type.Optional(Type.Boolean({ description: "Clear the buffer after reading" })),
+      tab: TAB,
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const all = await run(params.tab, ctx.cwd, (s) => {
+        const rows = s.networkSnapshot().map((e) => ({
+          n: e.seq,
+          method: e.method,
+          status: e.status ?? (e.error ? `failed${e.canceled ? " (canceled)" : ": " + e.error}` : "pending"),
+          // Chrome reports e.g. "Fetch"/"XHR" — normalize for filtering.
+          type: (e.type ?? "other").toLowerCase(),
+          sizeB: e.size ?? null,
+          ms: e.ms ?? null,
+          url: e.url,
+        }));
+        if (params.clear) s.clearNetwork();
+        return rows;
+      });
+      let rows = params.filter ? all.filter((r: any) => r.url.includes(params.filter)) : all;
+      if (params.failedOnly) {
+        rows = rows.filter((r: any) => typeof r.status !== "number" || r.status >= 400);
+      } else {
+        const types = ((params.types as string[] | undefined) ?? ["document", "xhr", "fetch"]).map((t) => t.toLowerCase());
+        rows = rows.filter((r: any) => types.includes(r.type));
+      }
+      const limit = Math.min(Math.max(Number(params.limit) || 30, 1), 200);
+      const shown = rows.slice(-limit);
+      return {
+        content: [
+          {
+            type: "text",
+            text: text({
+              capturing: true,
+              scope: "since attach of this tab (survives reloads; buffer capped at 250)",
+              matched: rows.length,
+              shown: shown.length,
+              requests: shown,
+            }),
+          },
+        ],
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "tab_dismiss",
     label: "Tab Dismiss",
     description:
@@ -1056,19 +977,40 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_shutdown", () => {
-    if (lensPoll) clearInterval(lensPoll);
-    lensPoll = null;
+  // Drain any queued dock updates before tearing down: in one-shot modes the
+  // session ends right after the final assistant message, and a poller that
+  // never ticks would swallow the last reply (the dock would stay silent).
+  const flushChatQueue = async (): Promise<void> => {
+    if (overlayPoll) clearInterval(overlayPoll);
+    overlayPoll = null;
+    for (const a of mgr.attached()) {
+      const s = mgr.sessionFor(a.key === "*" ? undefined : a.key);
+      if (!s || !s.overlayScriptId) continue;
+      const updates = chatQueue.get(a.key) ?? [];
+      if (!updates.length) continue;
+      chatQueue.delete(a.key);
+      await evaluate(
+        s,
+        `window.__piOverlay ? window.__piOverlay.tick(${JSON.stringify(updates)}) : null`,
+        { timeoutMs: 3_000 },
+      ).catch(() => {});
+    }
+  };
+
+  pi.on("session_shutdown", async () => {
+    await flushChatQueue();
+    chatQueue.clear();
     mgr.closeAll();
   });
 
   pi.registerCommand("tab", {
     description:
-      "browser-interact: show tab status, arm the page lens with /tab lens [on|off|list|clear], check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
+      "browser-interact: show tab status, arm the page lens with /tab lens [on|off|list|clear], open the in-page chat dock with /tab chat [on|off], check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
     getArgumentCompletions: (prefix) => {
       if (/\s/.test(prefix)) return null; // only complete the subcommand itself
       const subs = [
         { value: "lens ", label: "lens [on|off|list|clear]", description: "arm/read the page lens (user draws boxes + notes in the browser)" },
+        { value: "chat ", label: "chat [on|off]", description: "open/close the in-page chat dock in the browser" },
         { value: "check ", label: "check <url>", description: "check a URL against the CDT allowlist" },
         { value: "shutdown", label: "shutdown", description: "close all CDP sessions" },
       ];
@@ -1087,6 +1029,20 @@ export default function (pi: ExtensionAPI) {
         try {
           const out = await lensAction((lens[1] ?? "list") as LensAction, ctx.cwd);
           ctx.ui.notify(out, "info");
+        } catch (e: any) {
+          ctx.ui.notify(String(e?.message ?? e), "error");
+        }
+        return;
+      }
+      const chat = args?.trim().match(/^chat(?:\s+(on|off))?$/);
+      if (chat) {
+        try {
+          const open = chat[1] !== "off";
+          await run(undefined, ctx.cwd, async (s) => {
+            await ensureOverlay(s);
+            await evaluate(s, `window.__piOverlay && window.__piOverlay.chat.setOpen(${open})`, { timeoutMs: 10_000 });
+          });
+          ctx.ui.notify(open ? "chat dock opened in the browser — the user can type tasks into it" : "chat dock minimized in the browser", "info");
         } catch (e: any) {
           ctx.ui.notify(String(e?.message ?? e), "error");
         }
@@ -1114,7 +1070,7 @@ export default function (pi: ExtensionAPI) {
       const arg = args?.trim();
       if (arg) {
         ctx.ui.notify(
-          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab lens [on|off|list|clear], /tab check <url>, or /tab shutdown`,
+          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab lens [on|off|list|clear], /tab chat [on|off], /tab check <url>, or /tab shutdown`,
           "error",
         );
         return;
