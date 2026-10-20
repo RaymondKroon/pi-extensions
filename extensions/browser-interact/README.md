@@ -123,7 +123,13 @@ to (the first `tab_lens` call or `/tab interact`).
 > `DOMContentLoaded`), and the Browser Bridge proxy drops
 > `Runtime.consoleAPICalled` but passes `Network.*` events — which is why the
 > page↔pi channels are polled rather than event-driven, and why `tab_network`
-> works in the first place.
+> works in the first place. An on-page overlay version is **not** proof that a
+> given session is running the new extension code: the overlay is injected per
+> tab and may have been installed by a different (or earlier) pi process, so
+> a tab can show the latest overlay while a session still streams pre-edit
+> behaviour from its in-memory extension. Judge by live behaviour (e.g. after
+> the expandable-rows commit, new tool rows must carry args/result), then
+> reload the extension if it is stale.
 
 ## Workflow
 
