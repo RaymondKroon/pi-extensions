@@ -22,7 +22,7 @@
 // big TS template literal; the page code uses plain string concatenation.
 // (OVERLAY_V is the single controlled interpolation.)
 
-export const OVERLAY_V = 4;
+export const OVERLAY_V = 5;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -52,6 +52,64 @@ export const OVERLAY_SCRIPT = `(() => {
   // dropped by the Browser Bridge proxy, so the page cannot push directly) --
   let signals = [];
   const push = (sig) => { signals.push(sig); };
+
+  // ---- minimal markdown for agent messages (escape-first; raw HTML in the
+  // source can never reach the DOM as markup; no external libs, no backticks
+  // in this template) ----
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const inlineMd = (s) =>
+    s
+      .replace(/\u0060([^\u0060]+)\u0060/g, "<code>$1</code>")
+      .replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*\\w])\\*([^*\\n]+)\\*(?!\\*)/g, "$1<em>$2</em>")
+      .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+      .replace(/(^|[^"'\\w])((?:https?:\\/\\/)[^\\s<>)\\]]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  const md = (text) => {
+    const F = "\u0060\u0060\u0060";
+    const lines = esc(text).split("\\n");
+    const out = [];
+    let para = [], listTag = null, listItems = [], quote = [];
+    const flushPara = () => { if (para.length) { out.push("<p>" + para.map(inlineMd).join("<br>") + "</p>"); para = []; } };
+    const flushList = () => { if (listTag) { out.push("<" + listTag + ">" + listItems.map((li) => "<li>" + inlineMd(li) + "</li>").join("") + "</" + listTag + ">"); listTag = null; listItems = []; } };
+    const flushQuote = () => { if (quote.length) { out.push("<blockquote>" + quote.map(inlineMd).join("<br>") + "</blockquote>"); quote = []; } };
+    const flushAll = () => { flushPara(); flushList(); flushQuote(); };
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      if (ln.indexOf(F) === 0) {
+        flushAll();
+        const buf = [];
+        i++;
+        while (i < lines.length && lines[i].indexOf(F) !== 0) { buf.push(lines[i]); i++; }
+        out.push('<pre class="pi-md-code">' + buf.join("\\n") + "</pre>");
+        continue;
+      }
+      const ul = ln.match(/^\\s*[-*]\\s+(.*)/);
+      const ol = ln.match(/^\\s*\\d+[.)]\\s+(.*)/);
+      const hd = ln.match(/^(#{1,4})\\s+(.*)/);
+      const qt = ln.match(/^\\s*&gt;\\s?(.*)/);
+      if (ul || ol) {
+        flushPara(); flushQuote();
+        const tag = ul ? "ul" : "ol";
+        if (listTag && listTag !== tag) flushList();
+        listTag = tag;
+        listItems.push((ul || ol)[1]);
+      } else if (hd) {
+        flushAll();
+        const lvl = Math.min(hd[1].length + 3, 6);
+        out.push("<h" + lvl + ">" + inlineMd(hd[2]) + "</h" + lvl + ">");
+      } else if (qt) {
+        flushPara(); flushList();
+        quote.push(qt[1]);
+      } else if (ln.trim() === "") {
+        flushAll();
+      } else {
+        flushList(); flushQuote();
+        para.push(ln);
+      }
+    }
+    flushAll();
+    return out.join("");
+  };
 
   // ---------------- lens state --------------------------------------------
   const NKEY = "__pi_lens_notes";
@@ -158,7 +216,25 @@ export const OVERLAY_SCRIPT = `(() => {
       } else {
         const d = document.createElement("div");
         d.className = "pi-chat-msg " + (m.role === "user" ? "user" : "agent");
-        d.textContent = m.text || "";
+        if (m.role === "agent") {
+          if (m.thinking) {
+            const th = document.createElement("details");
+            th.className = "pi-chat-thinking";
+            const sum = document.createElement("summary");
+            sum.textContent = "thinking";
+            th.appendChild(sum);
+            const tp = document.createElement("pre");
+            tp.textContent = m.thinking;
+            th.appendChild(tp);
+            d.appendChild(th);
+          }
+          const b = document.createElement("div");
+          b.className = "pi-chat-md";
+          b.innerHTML = md(m.text || "");
+          d.appendChild(b);
+        } else {
+          d.textContent = m.text || "";
+        }
         log.appendChild(d);
       }
       trimDom();
@@ -388,7 +464,20 @@ export const OVERLAY_SCRIPT = `(() => {
       ".pi-chat-hint { color: #6b7280; font-size: 12px; margin-bottom: 8px; }" +
       ".pi-chat-msg { margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto; }" +
       ".pi-chat-msg.user { background: #1d4ed8; margin-left: 18%; }" +
-      ".pi-chat-msg.agent { background: #374151; margin-right: 18%; }" +
+      ".pi-chat-msg.agent { background: #374151; margin-right: 18%; white-space: normal; }" +
+      ".pi-chat-md p { margin: 2px 0 6px; }" +
+      ".pi-chat-md p:last-child { margin-bottom: 0; }" +
+      ".pi-chat-md h4, .pi-chat-md h5, .pi-chat-md h6 { margin: 6px 0 2px; font-size: 12px; }" +
+      ".pi-chat-md ul, .pi-chat-md ol { margin: 2px 0 6px; padding-left: 18px; }" +
+      ".pi-chat-md li { margin: 1px 0; }" +
+      ".pi-chat-md code { background: #111827; border: 1px solid #374151; border-radius: 3px; padding: 0 3px; font: 0.92em ui-monospace, SFMono-Regular, Menlo, monospace; }" +
+      ".pi-chat-md pre.pi-md-code { background: #111827; border: 1px solid #374151; border-radius: 6px; padding: 5px 8px; margin: 3px 0 6px; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; color: #d1d5db; }" +
+      ".pi-chat-md a { color: #60a5fa; }" +
+      ".pi-chat-md blockquote { border-left: 2px solid #4b5563; margin: 3px 0 6px; padding-left: 8px; color: #9ca3af; }" +
+      ".pi-chat-thinking { margin: 0 0 6px; }" +
+      ".pi-chat-thinking summary { cursor: pointer; color: #6b7280; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; user-select: none; }" +
+      ".pi-chat-thinking[open] summary { margin-bottom: 3px; }" +
+      ".pi-chat-thinking pre { margin: 0; padding: 5px 8px; background: #111827; border: 1px solid #374151; border-radius: 6px; max-height: 120px; overflow-y: auto; font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; color: #9ca3af; }" +
       ".pi-chat-tool { color: #6b7280; font-size: 11px; margin: 2px 0 6px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }" +
       ".pi-chat-tool.has-detail { display: flex; flex-direction: column; white-space: normal; cursor: pointer; }" +
       ".pi-chat-tool.has-detail .pi-chat-tool-head { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }" +
@@ -449,10 +538,12 @@ export const OVERLAY_SCRIPT = `(() => {
   });
 
   // Agent-side rendering hook set inside boot(); used by tick below.
-  const addAgent = (text) => {
-    const t = String(text || "");
-    if (!t.trim()) return;
+  const addAgent = (text, thinking) => {
+    const t = String(text ?? "");
+    const th = String(thinking ?? "").trim();
+    if (!t.trim() && !th) return;
     const m = { role: "agent", text: t.slice(0, 8000) };
+    if (th) m.thinking = th.slice(0, 4000);
     msgs.push(m); saveMsgs();
     if (window.__piOverlayRender) window.__piOverlayRender(m, true);
   };
@@ -472,7 +563,7 @@ export const OVERLAY_SCRIPT = `(() => {
       for (const u of updates) {
         if (!u || typeof u !== "object") continue;
         if (u.kind === "status") setBusy(!!u.busy);
-        else if (u.kind === "msg") addAgent(u.text);
+        else if (u.kind === "msg") addAgent(u.text, u.thinking);
         else if (u.kind === "tool") addTool(u.name, u.ok, u.args, u.result);
       }
     }

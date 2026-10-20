@@ -100,7 +100,12 @@ to (the first `tab_lens` call or `/tab interact`).
 - **Output:** agent replies and one line per tool call render in the dock via a
   live ~1 s poller (busy state shown as a dot); a shutdown flush delivers
   updates queued at session end, so one-shot sessions don't lose the final
-  reply. Tool rows are **expandable**: click one to reveal the call's
+  reply. Agent replies are rendered as **markdown** (headings, bold/italic,
+  inline + fenced code, lists, links incl. bare URLs, quotes) by a small
+  escape-first renderer in the overlay — raw HTML in a reply can never reach
+  the DOM as markup. Assistant **thinking** (when the model produces it)
+  appears above the reply in a collapsed **▸ thinking** block; user messages
+  stay plain text. Tool rows are **expandable**: click one to reveal the call's
   arguments and (truncated) result output — failed calls show an
   *error* section; the args/result are paired per `toolCallId` between the
   assistant message and its result. The floating **💬 pi** button opens the

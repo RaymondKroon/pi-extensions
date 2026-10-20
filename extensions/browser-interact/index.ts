@@ -231,6 +231,15 @@ export default function (pi: ExtensionAPI) {
     return "";
   };
 
+  /** Joined thinking blocks of an assistant message (redacted blocks are empty). */
+  const assistantThinking = (m: any): string => {
+    if (!m || !Array.isArray(m.content)) return "";
+    return m.content
+      .filter((c: any) => c?.type === "thinking" && c.thinking)
+      .map((c: any) => c.thinking)
+      .join("\n");
+  };
+
   pi.on("agent_start", () => {
     agentBusy = true;
     channel.broadcastUpdates([{ kind: "status", busy: true }]);
@@ -243,7 +252,12 @@ export default function (pi: ExtensionAPI) {
     const m = (ev as any).message;
     if (m?.role === "assistant") {
       const text = assistantText(m).trim();
-      if (text) channel.broadcastUpdates([{ kind: "msg", role: "agent", text: text.slice(0, 8000) }]);
+      const thinking = assistantThinking(m).trim();
+      if (text || thinking) {
+        channel.broadcastUpdates([
+          { kind: "msg", role: "agent", text: text.slice(0, 8000), thinking: thinking ? thinking.slice(0, 4000) : undefined },
+        ]);
+      }
       toolTracker.trackAssistant(m);
     } else if (m?.role === "toolResult") {
       channel.broadcastUpdates([toolTracker.toolResult(m)]);
