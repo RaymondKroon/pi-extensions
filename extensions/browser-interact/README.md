@@ -146,7 +146,21 @@ to (the first `tab_lens` call or `/tab interact`).
 > the re-attach's fresh session had no overlay registration, so broadcasts
 > and the poller both skipped it until `tab_lens` or `/tab interact` ran;
 > the channel now self-heals on the next broadcast/poll (see
-> `overlay-channel.ts`).
+> `overlay-channel.ts`). Two more gotchas for **live** verification, found
+> re-checking the dock in a running tab: (1) **several pi sessions can share
+> one debug port** and contend for the same tab's overlay — each re-injects its
+> own `OVERLAY_V` on its next broadcast/poll, so `window.__piOverlay.__v` can
+> flip between sessions' versions (e.g. 5→4) *while you work*. A lower version
+> appearing does **not** mean your reload failed: check your source
+> `OVERLAY_V` and which session is currently driving the tab. (2) The dock
+> **force-scrolls to the bottom on every agent message** (`addAgent` →
+> `scrollDown(force=true)`, and it runs even for thinking-only messages), so
+> **agent-driven** live click/expand checks are self-defeating: the dock
+> auto-scrolls between a click's coordinate computation and its landing, moving
+> the target row out from under the cursor (the trusted click *does* fire with
+> `isTrusted:true`, it just lands on whatever is now at that point). Verify the
+> click/expand path against the happy-dom tests, or from a moment when the dock
+> is idle (no pending agent message to poll).
 
 ## Workflow
 
