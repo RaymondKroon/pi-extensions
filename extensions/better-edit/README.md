@@ -68,11 +68,23 @@ bunx tsc --noEmit --strict --target es2022 --module esnext \
   --moduleResolution bundler --skipLibCheck index.ts
 ```
 
-`node_modules/@earendil-works/pi-coding-agent` is a symlink to the global
-install (bun resolves the real path), and
-`node_modules/@earendil-works/pi-tui` is a symlink to that package's own
-nested `pi-tui` (the TUI renderer imports it directly). If pi is upgraded,
-re-check both versions.
+`node_modules/@earendil-works/pi-coding-agent` and
+`node_modules/@earendil-works/pi-tui` are local symlinks into the global pi
+install (both under `~/.bun/install/global/node_modules/@earendil-works/`).
+`pi-tui` points at the hoisted top-level `pi-tui`, not a copy nested under
+`pi-coding-agent` (the bun global install does not nest it). These links rot
+when pi's install location moves — they originally pointed at an old
+`~/.npm-global` install and the root `bun test .` failed with ENOENT until
+they were re-pointed. If a link goes stale, check where pi actually lives
+(`bun pm ls -g` / `~/.bun/install/global/node_modules`) and re-link:
+
+```sh
+cd extensions/better-edit/node_modules/@earendil-works
+ln -sfn ~/.bun/install/global/node_modules/@earendil-works/pi-coding-agent pi-coding-agent
+ln -sfn ~/.bun/install/global/node_modules/@earendil-works/pi-tui pi-tui
+```
+
+If pi is upgraded, also re-check both versions.
 
 ## Installation
 
