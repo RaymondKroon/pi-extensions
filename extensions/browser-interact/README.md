@@ -64,10 +64,10 @@ dock. To re-point or let go:
   tab **without closing the browser tab** (no argument = the default
 target). The overlay stays in the page but goes inert until the next
   connect.
-- From the dock itself: the header's **⇄** connects the tab you bring to
-  the front in Chrome; **✂** disconnects the dock from the tab it is in.
-  Both act on the tab that clicked them (each tab has its own CDP session,
-  so the session always knows which tab sent a signal — chat text from a
+- From the dock itself: the header's **⏏** disconnects the dock from the tab
+  it is in (the browser tab stays open). It acts on the tab that clicked it
+  (each tab has its own CDP session, so the session always knows which tab
+  sent a signal — chat text from a
 dock is the one thing that stays undifferentiated).
 
 ## Tools
@@ -135,9 +135,9 @@ to (the first `tab_lens` call or `/tab interact`).
   assistant message and its result. The floating **💬 pi** button opens the
   panel; drag the header to move, the bottom-right corner to resize, `–` to
   minimize, `✕` to close, and the header's **🔍** toggles the lens. The
-  header's **⇄** connects the dock to the tab you bring to the front in
-  Chrome (making it the default target), and **✂** disconnects the dock from
-  the tab it is in (the browser tab stays open) — see *Target tab* above.
+  header's **⏏** disconnects the dock from the tab it is in (the browser tab
+  stays open); re-pointing the default to another tab is done from the pi
+  chat with `/tab use` — see *Target tab* above.
   Several tabs can be docked at once (multi-dock); a chat message sent from
   a dock does not say which one it came from.
 - **State:** the transcript tail (last 50 messages), open state, and
@@ -209,8 +209,9 @@ to (the first `tab_lens` call or `/tab interact`).
    selector — don't retry the same call blindly.
 7. The dock (and the default target) is sticky: if the user works in another
    tab, re-point with `/tab use <url-substring|target-id|active>` (the user
-   can also do it from the dock's **⇄** button). To stop driving a tab
-   without closing it: `/tab detach` (or the dock's **✂** button).
+   can also just say "connect the dock to <tab>" to the agent). To stop
+   driving a tab without closing it: `/tab detach` (or the dock's **⏏**
+   button).
 
 ## Files
 

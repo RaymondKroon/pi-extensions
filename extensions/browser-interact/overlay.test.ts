@@ -82,28 +82,23 @@ describe("OVERLAY_SCRIPT", () => {
     });
   });
 
-  describe("dock header tab controls (multi-dock switching)", () => {
-    test("trusted ⇄ click queues a dock-connect-active signal; ✂ queues dock-detach", () => {
+  describe("dock header detach control", () => {
+    test("trusted ⏏ click queues a dock-detach signal", () => {
       const { win, overlay } = bootOverlay();
       overlay.chat.setOpen(true);
-      const switchBtn = win.document.querySelector("#__pi_chat_switch");
       const detachBtn = win.document.querySelector("#__pi_chat_detach");
-      expect(switchBtn).not.toBeNull();
       expect(detachBtn).not.toBeNull();
-      trustedClick(win, switchBtn);
+      // the retired ⇄ switch button must be gone
+      expect(win.document.querySelector("#__pi_chat_switch")).toBeNull();
       trustedClick(win, detachBtn);
-      expect(overlay.tick([])).toEqual([
-        { type: "dock-connect-active" },
-        { type: "dock-detach" },
-      ]);
+      expect(overlay.tick([])).toEqual([{ type: "dock-detach" }]);
       // queue is empty now
       expect(overlay.tick([])).toEqual([]);
     });
 
-    test("untrusted (page-script) clicks do not queue switching signals", () => {
+    test("untrusted (page-script) clicks do not queue detach", () => {
       const { win, overlay } = bootOverlay();
       overlay.chat.setOpen(true);
-      win.document.querySelector("#__pi_chat_switch").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
       win.document.querySelector("#__pi_chat_detach").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
       expect(overlay.tick([])).toEqual([]);
     });

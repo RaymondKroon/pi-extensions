@@ -277,28 +277,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (sig.type === "dock-detach") {
-      // The dock's ✂ button: let go of THIS tab without closing it. No y/N —
+      // The dock's ⏏ button: let go of THIS tab without closing it. No y/N —
       // the user clicked an explicit control on that tab.
       void (async () => {
         const r = mgr.detach(origin.targetId);
         if (!r) return;
         channel.broadcastUpdates([
           { kind: "msg", role: "agent", text: `Dock disconnected from ${r.url} (the browser tab stays open).` },
-        ]);
-      })().catch(() => {});
-      return;
-    }
-    if (sig.type === "dock-connect-active") {
-      // The dock's ⇄ button: dock the tab the user has in front of them now
-      // and make it the default target. Other connected tabs stay docked.
-      void (async () => {
-        const t = await mgr.foregroundTarget();
-        if (mgr.hasTarget(t.id)) return; // this tab is already docked
-        const { session, rekeyed } = await mgr.pointDefault(t);
-        if (rekeyed) channel.rekey(rekeyed.from, rekeyed.to);
-        await ensureOverlay(session);
-        channel.broadcastUpdates([
-          { kind: "msg", role: "agent", text: `Dock now also connected to ${t.title || t.url} — it is the default target for the tab_* tools.` },
         ]);
       })().catch(() => {});
       return;

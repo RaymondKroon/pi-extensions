@@ -30,7 +30,7 @@
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
 
-export const OVERLAY_V = 8;
+export const OVERLAY_V = 9;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -200,12 +200,11 @@ export const OVERLAY_SCRIPT = `(() => {
     const headTitle = document.createElement("span"); headTitle.textContent = "pi chat";
     const headSpacer = document.createElement("span"); headSpacer.style.flex = "1";
     lensBtn = document.createElement("button"); lensBtn.className = "pi-chat-hbtn"; lensBtn.id = "__pi_chat_lensbtn"; lensBtn.textContent = "\ud83d\udd0d"; lensBtn.title = "toggle pi-lens (drag boxes to point at things)";
-    const switchBtn = document.createElement("button"); switchBtn.className = "pi-chat-hbtn"; switchBtn.id = "__pi_chat_switch"; switchBtn.textContent = "\u21c4"; switchBtn.title = "Switch this dock to another tab: bring the Chrome tab you want to the front, then click here (same as /tab use <active>)";
-    const detachBtn = document.createElement("button"); detachBtn.className = "pi-chat-hbtn"; detachBtn.id = "__pi_chat_detach"; detachBtn.textContent = "\u2702"; detachBtn.title = "Detach the dock from this tab (the browser tab stays open)";
+    const detachBtn = document.createElement("button"); detachBtn.className = "pi-chat-hbtn"; detachBtn.id = "__pi_chat_detach"; detachBtn.textContent = "\u23fb"; detachBtn.title = "Stop driving this tab: detach the dock (the browser tab stays open)";
     const minBtn = document.createElement("button"); minBtn.className = "pi-chat-hbtn"; minBtn.textContent = "\u2013"; minBtn.title = "minimize (click \u201c\u2009pi\u201d to reopen)";
     const closeBtn = document.createElement("button"); closeBtn.className = "pi-chat-hbtn"; closeBtn.textContent = "\u2715"; closeBtn.title = "close";
     chatHead.appendChild(dot); chatHead.appendChild(headTitle); chatHead.appendChild(headSpacer);
-    chatHead.appendChild(lensBtn); chatHead.appendChild(switchBtn); chatHead.appendChild(detachBtn); chatHead.appendChild(minBtn); chatHead.appendChild(closeBtn);
+    chatHead.appendChild(lensBtn); chatHead.appendChild(detachBtn); chatHead.appendChild(minBtn); chatHead.appendChild(closeBtn);
     log = document.createElement("div"); log.id = "__pi_chat_log";
     const inRow = document.createElement("div"); inRow.id = "__pi_chat_inrow";
     chatInput = document.createElement("textarea"); chatInput.id = "__pi_chat_input"; chatInput.maxLength = 4000; chatInput.rows = 2;
@@ -215,7 +214,7 @@ export const OVERLAY_SCRIPT = `(() => {
     const resize = document.createElement("div"); resize.className = "pi-chat-resize"; resize.id = "__pi_chat_resize";
     chatPanel.appendChild(chatHead); chatPanel.appendChild(log); chatPanel.appendChild(inRow); chatPanel.appendChild(resize);
     head = chatHead;
-    [chatBtn, chatPanel, chatHead, dot, headTitle, lensBtn, switchBtn, detachBtn, minBtn, closeBtn, log, inRow, chatInput, sendBtn, resize].forEach((n) => n.setAttribute("data-pi-chat", "1"));
+    [chatBtn, chatPanel, chatHead, dot, headTitle, lensBtn, detachBtn, minBtn, closeBtn, log, inRow, chatInput, sendBtn, resize].forEach((n) => n.setAttribute("data-pi-chat", "1"));
 
     // ---- transcript rendering
     const nearBottom = () => log.scrollTop + log.clientHeight >= log.scrollHeight - 80;
@@ -471,7 +470,6 @@ export const OVERLAY_SCRIPT = `(() => {
     closeBtn.addEventListener("click", (e) => { if (e.isTrusted) setChatOpen(false); });
     // Dock-switching controls: signals are popped by the poller WITH the
     // tab's identity, so the session knows exactly which tab asked.
-    switchBtn.addEventListener("click", (e) => { if (e.isTrusted) push({ type: "dock-connect-active" }); });
     detachBtn.addEventListener("click", (e) => { if (e.isTrusted) push({ type: "dock-detach" }); });
 
     // ---- styles
