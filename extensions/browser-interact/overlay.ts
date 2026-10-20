@@ -22,7 +22,7 @@
 // big TS template literal; the page code uses plain string concatenation.
 // (OVERLAY_V is the single controlled interpolation.)
 
-export const OVERLAY_V = 2;
+export const OVERLAY_V = 3;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -280,6 +280,9 @@ export const OVERLAY_SCRIPT = `(() => {
       if (!booted) return;
       document.documentElement.classList.toggle("__pi_lens_on", lensOn);
       lensBtn.classList.toggle("on", lensOn);
+      lensBtn.title = lensOn
+        ? "pi-lens ARMED — drag a box around something and type a note; click to turn off"
+        : "toggle pi-lens (drag boxes to point at things)";
       if (!lensOn) {
         box.style.display = "none"; panel.style.display = "none";
         lensDrag = null; lensPending = null;
@@ -361,7 +364,7 @@ export const OVERLAY_SCRIPT = `(() => {
       "#__pi_chat_dot.busy { background: #f59e0b; }" +
       ".pi-chat-hbtn { background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 13px; line-height: 1; padding: 3px 5px; border-radius: 4px; }" +
       ".pi-chat-hbtn:hover { color: #fff; background: #374151; }" +
-      ".pi-chat-hbtn.on { color: #60a5fa; }" +
+      ".pi-chat-hbtn.on { background: #1d4ed8; color: #fff; }" +
       "#__pi_chat_log { flex: 1; overflow-y: auto; padding: 8px; min-height: 0; }" +
       ".pi-chat-hint { color: #6b7280; font-size: 12px; margin-bottom: 8px; }" +
       ".pi-chat-msg { margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto; }" +

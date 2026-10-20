@@ -376,7 +376,7 @@ export default function (pi: ExtensionAPI) {
   const LENS_ACTIONS = ["on", "off", "list", "clear"] as const;
   type LensAction = (typeof LENS_ACTIONS)[number];
 
-  /** Shared by the tab_lens tool and the /tab lens command; returns text. */
+  /** Shared by the tab_lens tool; returns text. */
   const lensAction = async (action: LensAction, cwd: string, tab?: string): Promise<string> => {
     if (action === "on" || action === "off") {
       await run(tab, cwd, async (s) => {
@@ -400,7 +400,7 @@ export default function (pi: ExtensionAPI) {
     const snap: any = await run(tab, cwd, async (s) => {
       await ensureOverlay(s);
       const r = await evaluate(s, "window.__piOverlay ? window.__piOverlay.lens.snapshot() : null", { timeoutMs: 10_000 });
-      if (!r) throw new Error("overlay is not installed on this page — arm it with action:'on' (or /tab lens on)");
+      if (!r) throw new Error("overlay is not installed on this page — arm it with action:'on'");
       return r;
     });
     let host = "page";
@@ -547,7 +547,7 @@ export default function (pi: ExtensionAPI) {
     name: "tab_lens",
     label: "Tab Lens",
     description:
-      "A LENS the USER uses to show you things on the page. action 'on': arms bounding-box selection in the live browser tab (floating 'pi-lens' button, crosshair; the user drags a box around a region, types a note in the pop-up input and presses Enter; repeat for multiple boxes; Esc disarms). 'off': disarms (annotations kept). 'list' (default): returns the annotations (viewport + document coords, note text, timestamp) and saves a cropped PNG of each box to /tmp. 'clear': removes all annotations (removing a single box: the user clicks its numbered chip in the browser). Saving a note pushes a message into the session automatically. After the user has drawn boxes, call action:'list' and read the returned screenshot files with the read tool to see what they framed.",
+      "A LENS the USER uses to show you things on the page. action 'on': arms bounding-box selection in the live browser tab (the in-page dock's 🔍 looking-glass button lights up, crosshair cursor; the user drags a box around a region, types a note in the pop-up input and presses Enter; repeat for multiple boxes; Esc disarms). 'off': disarms (annotations kept). 'list' (default): returns the annotations (viewport + document coords, note text, timestamp) and saves a cropped PNG of each box to /tmp. 'clear': removes all annotations (removing a single box: the user clicks its numbered chip in the browser). Saving a note pushes a message into the session automatically. After the user has drawn boxes, call action:'list' and read the returned screenshot files with the read tool to see what they framed.",
     promptSnippet: "Lens: user-drawn bounding boxes + notes on the page, read back with cropped screenshots",
     parameters: Type.Object({
       action: Type.Optional(
@@ -1005,12 +1005,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("tab", {
     description:
-      "browser-interact: show tab status, arm the page lens with /tab lens [on|off|list|clear], open the in-page chat dock with /tab chat [on|off], check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
+      "browser-interact: show tab status, open the in-page dock (chat + lens) with /tab interact [on|off], check a URL against the CDT allowlist with /tab check <url>, or detach with /tab shutdown",
     getArgumentCompletions: (prefix) => {
       if (/\s/.test(prefix)) return null; // only complete the subcommand itself
       const subs = [
-        { value: "lens ", label: "lens [on|off|list|clear]", description: "arm/read the page lens (user draws boxes + notes in the browser)" },
-        { value: "chat ", label: "chat [on|off]", description: "open/close the in-page chat dock in the browser" },
+        { value: "interact ", label: "interact [on|off]", description: "open/close the in-page dock (chat + lens; click 🔍 to arm box selection)" },
         { value: "check ", label: "check <url>", description: "check a URL against the CDT allowlist" },
         { value: "shutdown", label: "shutdown", description: "close all CDP sessions" },
       ];
@@ -1024,25 +1023,20 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("browser-interact: all CDP sessions closed", "info");
         return;
       }
-      const lens = args?.trim().match(/^lens(?:\s+(on|off|list|clear))?$/);
-      if (lens) {
+      const interact = args?.trim().match(/^interact(?:\s+(on|off))?$/);
+      if (interact) {
         try {
-          const out = await lensAction((lens[1] ?? "list") as LensAction, ctx.cwd);
-          ctx.ui.notify(out, "info");
-        } catch (e: any) {
-          ctx.ui.notify(String(e?.message ?? e), "error");
-        }
-        return;
-      }
-      const chat = args?.trim().match(/^chat(?:\s+(on|off))?$/);
-      if (chat) {
-        try {
-          const open = chat[1] !== "off";
+          const open = interact[1] !== "off";
           await run(undefined, ctx.cwd, async (s) => {
             await ensureOverlay(s);
             await evaluate(s, `window.__piOverlay && window.__piOverlay.chat.setOpen(${open})`, { timeoutMs: 10_000 });
           });
-          ctx.ui.notify(open ? "chat dock opened in the browser — the user can type tasks into it" : "chat dock minimized in the browser", "info");
+          ctx.ui.notify(
+            open
+              ? "interaction dock opened in the browser — the user can type tasks into it, and click 🔍 to arm the lens (drag boxes + notes)"
+              : "interaction dock minimized in the browser",
+            "info",
+          );
         } catch (e: any) {
           ctx.ui.notify(String(e?.message ?? e), "error");
         }
@@ -1070,7 +1064,7 @@ export default function (pi: ExtensionAPI) {
       const arg = args?.trim();
       if (arg) {
         ctx.ui.notify(
-          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab lens [on|off|list|clear], /tab chat [on|off], /tab check <url>, or /tab shutdown`,
+          `unknown /tab subcommand: "${arg}" — use: /tab (status), /tab interact [on|off], /tab check <url>, or /tab shutdown`,
           "error",
         );
         return;

@@ -57,7 +57,7 @@ the pattern), then falls back to the URL pattern.
 | `tab_evaluate "<expr>"` | evaluate a JS expression (promises awaited, JSON result) |
 | `tab_wait "<expr>" [ms]` | wait until a **synchronous** expression is truthy (default 60 s, max 300 s). Polls every 500 ms from the extension side (plain `Runtime.evaluate` per poll — CSP-safe; an in-page `eval()` loop would be blocked by strict-CSP pages like Slack). Survives full reloads (retries on destroyed context). |
 | `tab_screenshot [path]` | PNG of the viewport (default `/tmp/tab-<host>-shot.png`); read the file with the `read` tool |
-| `tab_lens [action]` | **Lens**: the USER shows the agent things on the page. `on` arms bounding-box selection in the browser (floating **🔍 pi-lens** button bottom-right, crosshair); the user drags a box, types a note in the pop-up input, presses Enter (repeat for more boxes; Esc turns the lens off). `list` (default) returns the annotations (viewport + document coords, text, time) **and saves a cropped PNG of each box** to `/tmp/tab-<host>-lens-<n>.png` — read it with `read`. `off` disarms (notes kept). `clear` removes all annotations; removing ONE box: click its numbered chip on the page (✕). Saving a note **pushes a message into the session automatically** (the agent checks the lens without being told). Notes + on/off state survive page reloads (`sessionStorage`), and the overlay auto-upgrades across extension updates |
+| `tab_lens [action]` | **Lens**: the USER shows the agent things on the page. `on` arms bounding-box selection in the browser (the dock's **🔍** button lights up, crosshair cursor); the user drags a box, types a note in the pop-up input, presses Enter (repeat for more boxes; Esc turns the lens off). `list` (default) returns the annotations (viewport + document coords, text, time) **and saves a cropped PNG of each box** to `/tmp/tab-<host>-lens-<n>.png` — read it with `read`. `off` disarms (notes kept). `clear` removes all annotations; removing ONE box: click its numbered chip on the page (✕). Saving a note **pushes a message into the session automatically** (the agent checks the lens without being told). Notes + on/off state survive page reloads (`sessionStorage`), and the overlay auto-upgrades across extension updates |
 | `tab_click "<selector>" [ms]` | polls actionability (default 10 s), then a **trusted** CDP mouse sequence at the element's centre. Fails with a reason: `not-found`, `not-visible`, `disabled`, `covered-by-<el>` (fix the overlay/selector, don't retry blindly) |
 | `tab_hover "<selector>" [waitFor] [ms]` or `tab_hover {x, y}` | move the mouse over a CSS selector (trusted CDP `mouseMoved` to its centre — fires `:hover` / `mouseenter` / `mouseover`, full enter/leave chains on boundary crossings) or to exact **viewport coordinates** (`x`/`y`, negative = outside the page). The mouse **stays** where it is, so a follow-up `tab_click` can click what the hover revealed. Result reports **`elementAt`** — what is actually under the cursor: hover overlays (link previews, menus) can land there and the next jump may re-hover them. **Unhover reliably with `x:-500, y:-500`** (outside the page) — hovering `body` can land on a hover overlay and keep the hover alive. `waitFor` is a selector that should appear as a result of the hover (e.g. a tooltip); its tag/text is returned. Selector mode fails with `not-found`, `not-visible`, `covered-by-<el>` (no `disabled` gate — hover on disabled elements is valid) |
 | `tab_type "<text>"` | trusted `Input.insertText` into the **focused** element (click the field first); fires `input`, no `keydown` |
@@ -84,8 +84,7 @@ the id so the model has it in context when needed.
 ## Commands
 
 - `/tab` — show attached tabs and their current page
-- `/tab lens [on|off|list|clear]` — arm/read the page lens (see `tab_lens`); arming with `on` makes the floating **🔍 pi-lens** button appear and selection mode active
-- `/tab chat [on|off]` — open (default) / minimize the in-page chat dock in the browser
+- `/tab interact [on|off]` — open (default) / minimize the in-page interaction dock in the browser (chat + the **🔍** looking glass that arms the lens; see `tab_lens`)
 - `/tab check <url>` — open + attach a URL to verify the CDT allowlist (the tab is left open)
 - `/tab shutdown` — detach all CDP sessions
 
@@ -93,7 +92,7 @@ the id so the model has it in context when needed.
 
 A floating in-page chat panel over **this** pi session, injected into the page's
 main world. The dock appears on any tab the extension has attached an overlay
-to (the first `tab_lens` call or `/tab chat`).
+to (the first `tab_lens` call or `/tab interact`).
 
 - **Input:** the user types tasks into the dock (Enter = send, Shift+Enter =
   newline). Text arrives in the session as a user message prefixed
@@ -133,9 +132,10 @@ to (the first `tab_lens` call or `/tab chat`).
    that depends on layout or to verify an important visible change. Don't screenshot
    before and after every action when DOM state is sufficient. Check `tab_console`
    after actions when errors are relevant.
-   When the USER wants to show you something specific, they arm the lens
-   (`/tab lens on`) and draw boxes — you get interrupted automatically when a
-   note is saved, so just call `tab_lens` and read the cropped screenshots.
+   When the USER wants to show you something specific, they arm the lens —
+   `/tab interact on`, then click **🔍** in the dock — and draw boxes; you get
+   interrupted automatically when a note is saved, so just call `tab_lens` and
+   read the cropped screenshots.
 6. If a click is "not found" or "covered": screenshot, inspect the page, fix the
    selector — don't retry the same call blindly.
 
