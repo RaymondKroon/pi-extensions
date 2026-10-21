@@ -280,12 +280,15 @@ export default function (pi: ExtensionAPI) {
       // The dock's ⏏ button: let go of THIS tab without closing it. No y/N —
       // the user clicked an explicit control on that tab. Off is off: the
       // overlay (dock + lens + stored state) is removed from the page first.
+      // Then tell the SESSION — without this the agent keeps believing it
+      // drives the tab, and the next tab_* call would silently re-attach.
       void (async () => {
         const r = await mgr.detach(origin.targetId);
         if (!r) return;
-        channel.broadcastUpdates([
-          { kind: "msg", role: "agent", text: `Dock disconnected from ${r.url} — the dock and overlay were removed from the page (the browser tab stays open).` },
-        ]);
+        pi.sendUserMessage(
+          `[dock] the user detached the dock from ${r.url} via ⏏ — the overlay was removed from the page and this tab is no longer being driven; do not target it again unless the user asks.`,
+          agentBusy ? { deliverAs: "followUp" } : {},
+        );
       })().catch(() => {});
       return;
     }
@@ -1002,8 +1005,14 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       resolveConfig(ctx.cwd);
       if (args?.trim() === "shutdown") {
+        const n = mgr.attached().length;
         await mgr.closeAll();
-        ctx.ui.notify("browser-interact: all CDP sessions closed and overlays removed", "info");
+        ctx.ui.notify(`browser-interact: all CDP sessions closed and ${n} overlay(s) removed`, "info");
+        if (n > 0)
+          pi.sendUserMessage(
+            `[dock] the user shut down the browser dock — all ${n} connected tab(s) were detached and their overlays removed; no tab is being driven anymore.`,
+            agentBusy ? { deliverAs: "followUp" } : {},
+          );
         return;
       }
       const use = args?.trim().match(/^use\s+(\S+)$/);
@@ -1048,6 +1057,11 @@ export default function (pi: ExtensionAPI) {
               : "not connected to that tab (or no default target yet) — run /tab to see what is connected",
             r ? "info" : "error",
           );
+          if (r)
+            pi.sendUserMessage(
+              `[dock] the user detached the dock from ${r.url} via /tab detach — the overlay was removed from the page and this tab is no longer being driven; do not target it again unless the user asks.`,
+              agentBusy ? { deliverAs: "followUp" } : {},
+            );
         } catch (e: any) {
           ctx.ui.notify(String(e?.message ?? e), "error");
         }

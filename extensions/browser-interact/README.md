@@ -64,7 +64,9 @@ dock. To re-point or let go:
   dock/overlay from the page (DOM + stored state) and releases the CDP
   session, **without closing the browser tab** (no argument = the default
 target). The page is left exactly as found; reconnecting with `/tab use`
-  starts a fresh dock.
+  starts a fresh dock. The session is told via a `[dock]` user message, so
+  the agent knows the tab is no longer driven (same for ⏏ and `/tab
+  shutdown`).
 - From the dock itself: the header's **⏏** disconnects the dock from the tab
   it is in (the browser tab stays open). It acts on the tab that clicked it
   (each tab has its own CDP session, so the session always knows which tab
