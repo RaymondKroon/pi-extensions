@@ -10,7 +10,7 @@
 // the CDP WebSocket directly.
 //
 // Target tab resolution (first match wins):
-//   1. the tool's `tab` parameter (URL substring)
+//   1. the tool's `tab` parameter (URL substring or exact CDP target id)
 //   2. $BROWSER_INTERACT_TAB
 //   3. .pi/browser-interact.json  { "tab": "localhost:5173", "port": 9222 }
 //   4. the active page tab (shortest URL fallback if Chrome reports none)
@@ -272,16 +272,18 @@ export default function (pi: ExtensionAPI) {
     if (sig.type === "chat") {
       const t = typeof sig.text === "string" ? sig.text.trim().slice(0, 4000) : "";
       if (!t) return;
-      // Carry the origin tab — the user asked from a specific page, so the
-      // agent must interpret the request in the context of that site (it can
-      // act on that tab via the tab_* tools). Without this, a message like
-      // "summarize the news" was answered from the open web instead of the
-      // site in front of the user. Prefer the URL the overlay captured at
-      // send time (live); fall back to the session's attach-time URL.
-      const from = typeof sig.url === "string" && sig.url ? sig.url : origin.url;
-      const host = (() => { try { return new URL(from).host; } catch { return from; } })();
+      // Carry the origin tab EXACTLY — the user asked from a specific page,
+      // so the agent must interpret the request in the context of that site
+      // (it can act on that tab via the tab_* tools). Without this, a message
+      // like "summarize the news" was answered from the open web instead of
+      // the site in front of the user. The prefix carries the tab's current
+      // URL (usable directly as a `tab` substring) plus the exact CDP target
+      // id (unambiguous even when several tabs share a URL — every tab_*
+      // tool accepts it). Prefer the URL the overlay captured at send time
+      // (live); fall back to the session's attach-time URL.
+      const from = typeof sig.url === "string" && sig.url ? sig.url : origin.url || "unknown page";
       // While a run is active, queue it as a follow-up; otherwise start one.
-      pi.sendUserMessage(`[browser chat @ ${host}] ${t}`, agentBusy ? { deliverAs: "followUp" } : {});
+      pi.sendUserMessage(`[browser chat @ ${from} (tab ${origin.targetId})] ${t}`, agentBusy ? { deliverAs: "followUp" } : {});
       return;
     }
     if (sig.type === "dock-detach") {
@@ -323,7 +325,7 @@ export default function (pi: ExtensionAPI) {
   const TAB = Type.Optional(
     Type.String({
       description:
-        "URL substring identifying the target tab (default: configured tab via $BROWSER_INTERACT_TAB or .pi/browser-interact.json, else the active page tab)",
+        "URL substring or exact CDP target id (e.g. page:47974063) identifying the target tab (default: configured tab via $BROWSER_INTERACT_TAB or .pi/browser-interact.json, else the active page tab)",
     }),
   );
 
@@ -926,7 +928,7 @@ export default function (pi: ExtensionAPI) {
     name: "tab_open",
     label: "Tab Open",
     description:
-      "Open a NEW tab in the debugged Chrome (does not touch existing tabs). Returns the new tab's target id and url — pass the id to tab_close to close it precisely, or target the tab by URL substring like any other tab_* tool.",
+      "Open a NEW tab in the debugged Chrome (does not touch existing tabs). Returns the new tab's target id and url — pass the id to tab_close to close it precisely, or target the tab by URL substring or target id like any other tab_* tool.",
     promptSnippet: "Open a new tab in the debugged Chrome",
     parameters: Type.Object({
       url: Type.Optional(Type.String({ description: "URL to open (default about:blank)" })),

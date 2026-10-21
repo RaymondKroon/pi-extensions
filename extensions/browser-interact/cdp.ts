@@ -266,6 +266,22 @@ export class CdpManager {
     return pattern ?? this.defaultTab ?? "*";
   }
 
+  /**
+   * Session key for `pattern`, resolving an exact CDP target id to the key
+   * the live session actually holds. Chat messages and tool results carry
+   * target ids; a session can sit under any key (URL pattern, "*", or its
+   * own id after a default re-key), so id lookups must not assume the id is
+   * the key.
+   */
+  private keyForIdAware(pattern?: string): string {
+    let key = this.keyFor(pattern);
+    if (pattern) {
+      const byId = [...this.sessions.entries()].find(([k, s]) => !s.closed && s.targetId === pattern);
+      if (byId) key = byId[0];
+    }
+    return key;
+  }
+
   /** The live session for a pattern, if any (used by the lens signal poller). */
   sessionFor(pattern?: string): CdpSession | undefined {
     return this.sessions.get(this.keyFor(pattern));
@@ -294,7 +310,7 @@ export class CdpManager {
   }
 
   async status(pattern?: string): Promise<Record<string, unknown>> {
-    const key = this.keyFor(pattern);
+    const key = this.keyForIdAware(pattern);
     const s = this.sessions.get(key);
     if (!s || s.closed) {
       return { attached: false, note: "not attached yet — the next command attaches" };
@@ -320,7 +336,7 @@ export class CdpManager {
    */
   async run<T>(pattern: string | undefined, fn: (s: CdpSession) => Promise<T>): Promise<T> {
     pattern = pattern ?? this.defaultTab;
-    const key = this.keyFor(pattern);
+    const key = this.keyForIdAware(pattern);
     let session = this.sessions.get(key);
     if (session?.closed) {
       this.sessions.delete(key);
@@ -572,6 +588,13 @@ export class CdpManager {
 
   private async attach(pattern?: string): Promise<CdpSession> {
     const pages = await this.pageTargets();
+    // Exact CDP target id — the most precise reference (chat messages and
+    // tool results carry it); connect under the id as key, mirroring
+    // attachTarget/pointDefault re-keying.
+    if (pattern) {
+      const byId = pages.find((t) => t.id === pattern);
+      if (byId) return this.connect(byId, this.keyFor(pattern));
+    }
     // Prefer the previously attached target (it may have navigated away from
     // the pattern URL); fall back to the URL pattern.
     const remembered = this.lastTargetId.get(this.keyFor(pattern));

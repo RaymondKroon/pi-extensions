@@ -14,7 +14,7 @@ WebSocket).
 
 First match wins:
 
-1. the tool's `tab` parameter — a URL substring, e.g. `localhost:5173`
+1. the tool's `tab` parameter — a URL substring (e.g. `localhost:5173`) or an exact CDP target id
 2. `$BROWSER_INTERACT_TAB`
 3. `.pi/browser-interact.json` — `{ "tab": "localhost:5173", "port": 9222 }`
 4. the active page tab (detected via `document.hasFocus()` / visibility; falls back to the shortest URL)
@@ -100,13 +100,14 @@ dock is the one thing that stays undifferentiated).
 ### Tab handles: URL substring vs target id
 
 All tools take `tab` — a URL substring (first match, shortest URL wins, sticky
-per pattern). Without a configured or explicit pattern, tools target Chrome's
-focused tab (or a visible tab if the browser window itself is unfocused), then
-fall back to the shortest URL. That is cheap and readable, but ambiguous when
-several tabs share a host. For the destructive case, `tab_close` therefore also accepts the
-exact CDP **target id** (stable across navigations; dies with the tab), which
-takes precedence and never guesses. `tab_status` and `tab_open` both return
-the id so the model has it in context when needed.
+per pattern) or an exact CDP **target id** (stable across navigations; dies
+with the tab), which takes precedence and never guesses. Without a configured
+or explicit pattern, tools target Chrome's focused tab (or a visible tab if
+the browser window itself is unfocused), then fall back to the shortest URL.
+That is cheap and readable, but ambiguous when several tabs share a host —
+use the target id in that case. `tab_status` and `tab_open` both return the
+id so the model has it in context when needed; browser-chat messages carry
+it in their prefix too.
 
 ## Commands
 
@@ -127,9 +128,10 @@ explicitly asks for UI — `/tab interact [on]`, `/tab use`, or `tab_lens`
 
 - **Input:** the user types tasks into the dock (Enter = send, Shift+Enter =
   newline). Text arrives in the session as a user message prefixed
-  `[browser chat @ <host-of-the-tab>]` — the agent must interpret the request
-  in the context of the page the user is on (it can act on that tab via the
-  `tab_*` tools); while an agent run is active it is queued as a follow-up.
+  `[browser chat @ <tab's current URL> (tab <targetId>)]` — the agent must
+  interpret the request in the context of that exact tab (it can act on it
+  via the `tab_*` tools, by URL substring or the carried target id); while
+  an agent run is active it is queued as a follow-up.
 - **Output:** agent replies and one line per tool call render in the dock via a
   live ~1 s poller (busy state shown as a dot); a shutdown flush delivers
   updates queued at session end, so one-shot sessions don't lose the final

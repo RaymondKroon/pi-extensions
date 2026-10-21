@@ -251,6 +251,48 @@ describe("CdpManager.detach", () => {
   });
 });
 
+describe("CdpManager target-id tab addressing (run/status/attach)", () => {
+  test("run() with an exact target id reuses the session under whatever key it holds", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A); // A sits under the "*" key
+    const seen = await m.run("A", async (s) => s.targetId);
+    expect(seen).toBe("A");
+    // the default slot is still the A session — no duplicate was created
+    expect(m.sessionFor()?.targetId).toBe("A");
+    expect(m.attached()).toHaveLength(1);
+  });
+
+  test("run() with an exact target id attaches by id even when the URL is ambiguous", async () => {
+    stubTargets([B, C]); // both match "b.test"
+    const m = mgr();
+    await m.pointDefault(B); // B under "*"; C not attached
+    const seen = await m.run("C", async (s) => s.targetId);
+    expect(seen).toBe("C");
+    expect(m.attached()).toHaveLength(2);
+    // and the second call reuses the id-keyed session
+    expect(await m.run("C", async (s) => s.targetId)).toBe("C");
+    expect(m.attached()).toHaveLength(2);
+  });
+
+  test("run() with an unknown target id → clear error", async () => {
+    stubTargets([A]);
+    const m = mgr();
+    await expect(m.run("Z", async () => "x")).rejects.toThrow(/no tab matching "Z"/);
+  });
+
+  test("status() resolves an exact target id to the session under another key", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A); // under "*"
+    evalHandler = () => ({ href: "https://a.test/app", title: "tab A" });
+    const st: any = await m.status("A");
+    expect(st.attached).toBe(true);
+    expect(st.url).toBe("https://a.test/app");
+    expect(st.targetId).toBe("A");
+  });
+});
+
 describe("CdpManager docked targets (opt-in dock/lens UI)", () => {
   test("dock() marks a target; detach(), closeAll() and forgetTarget() unmark it", async () => {
     stubTargets([A, B]);
