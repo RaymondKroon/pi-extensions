@@ -30,7 +30,7 @@
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
 
-export const OVERLAY_V = 9;
+export const OVERLAY_V = 10;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -622,6 +622,32 @@ export const OVERLAY_SCRIPT = `(() => {
       isOpen: () => chatOpen,
     },
     tick: tick,
+    /** Off is off: remove every overlay node + window listener and clear the
+     * stored state (lens notes/on-off, chat transcript, open state, position).
+     * Called by the extension when the tab is detached. */
+    destroy: () => {
+      try {
+        const L = window.__piOverlayListeners;
+        if (L) {
+          if (L.mousedown) window.removeEventListener("mousedown", L.mousedown, true);
+          if (L.mousemove) window.removeEventListener("mousemove", L.mousemove, true);
+          if (L.mouseup) window.removeEventListener("mouseup", L.mouseup, true);
+          if (L.keydown) window.removeEventListener("keydown", L.keydown, true);
+          if (L.scroll) window.removeEventListener("scroll", L.scroll);
+        }
+        document.querySelectorAll("[data-pi-lens], [data-pi-chat], .pi-lens-marker, .pi-lens-chip").forEach((n) => n.remove());
+        document.documentElement.classList.remove("__pi_lens_on");
+        for (const k of [NKEY, EKEY, MKEY, OKEY, PKEY]) { try { sessionStorage.removeItem(k); } catch (e) {} }
+        window.__piOverlayListeners = null;
+        window.__piLensListeners = null;
+        window.__piOverlay = undefined;
+        window.__piLens = undefined;
+        window.__piOverlayLens = undefined;
+        window.__piOverlayChat = undefined;
+        window.__piOverlayBusy = undefined;
+        window.__piOverlayRender = undefined;
+      } catch (e) {}
+    },
   };
   return window.__piOverlay;
 })();`;

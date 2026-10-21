@@ -104,6 +104,30 @@ describe("OVERLAY_SCRIPT", () => {
     });
   });
 
+  describe("off is off (destroy)", () => {
+    test("destroy() removes all overlay DOM, listeners, and stored state", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "msg", role: "agent", text: "hi" }]);
+      expect(win.document.querySelector("#__pi_chat_panel")).not.toBeNull();
+      expect(win.document.querySelector("#__pi_chat_btn")).not.toBeNull();
+      expect(win.sessionStorage.getItem("__pi_chat_msgs")).not.toBeNull();
+      overlay.destroy();
+      // every overlay node is gone (panel, button, style tag)
+      expect(win.document.querySelector("[data-pi-chat]")).toBeNull();
+      expect(win.document.querySelector("[data-pi-lens]")).toBeNull();
+      // stored state is cleared, so a future re-attach starts fresh
+      expect(win.sessionStorage.getItem("__pi_chat_msgs")).toBeNull();
+      expect(win.sessionStorage.getItem("__pi_chat_open")).toBeNull();
+      expect(win.sessionStorage.getItem("__pi_chat_pos")).toBeNull();
+      expect(win.sessionStorage.getItem("__pi_lens_notes")).toBeNull();
+      expect(win.sessionStorage.getItem("__pi_lens_enabled")).toBeNull();
+      // globals are gone, so the next overlay script install re-boots fresh
+      expect(win.__piOverlay).toBeUndefined();
+      expect(win.__piOverlayListeners).toBeNull();
+    });
+  });
+
   describe("agent message rendering", () => {
     test("renders markdown: headings, bold, code, fence, lists, links — and escapes raw HTML", () => {
       const { win, overlay } = bootOverlay();

@@ -278,12 +278,13 @@ export default function (pi: ExtensionAPI) {
     }
     if (sig.type === "dock-detach") {
       // The dock's ⏏ button: let go of THIS tab without closing it. No y/N —
-      // the user clicked an explicit control on that tab.
+      // the user clicked an explicit control on that tab. Off is off: the
+      // overlay (dock + lens + stored state) is removed from the page first.
       void (async () => {
-        const r = mgr.detach(origin.targetId);
+        const r = await mgr.detach(origin.targetId);
         if (!r) return;
         channel.broadcastUpdates([
-          { kind: "msg", role: "agent", text: `Dock disconnected from ${r.url} (the browser tab stays open).` },
+          { kind: "msg", role: "agent", text: `Dock disconnected from ${r.url} — the dock and overlay were removed from the page (the browser tab stays open).` },
         ]);
       })().catch(() => {});
       return;
@@ -978,7 +979,9 @@ export default function (pi: ExtensionAPI) {
     channel.stopPoll();
     await channel.flush();
     channel.clearQueue();
-    mgr.closeAll();
+    // keepOverlays: the flush above just delivered the final reply — the dock
+    // should keep showing it (an explicit detach/shutdown is what removes UI).
+    await mgr.closeAll(true);
   });
 
   pi.registerCommand("tab", {
@@ -989,9 +992,9 @@ export default function (pi: ExtensionAPI) {
       const subs = [
         { value: "interact ", label: "interact [on|off]", description: "open/close the in-page dock (chat + lens; click 🔍 to arm box selection)" },
         { value: "use ", label: "use <url-substring|target-id|active>", description: "connect the dock to a specific tab (confirms if other tabs are already connected); becomes the default target for the tab_* tools" },
-        { value: "detach", label: "detach [url-substring|target-id]", description: "release a tab's CDP session without closing the browser tab (default: the default target)" },
+        { value: "detach", label: "detach [url-substring|target-id]", description: "remove the dock/overlay from a tab and release its CDP session, without closing the browser tab (default: the default target)" },
         { value: "check ", label: "check <url>", description: "check a URL against the CDT allowlist" },
-        { value: "shutdown", label: "shutdown", description: "close all CDP sessions" },
+        { value: "shutdown", label: "shutdown", description: "remove every dock/overlay and close all CDP sessions" },
       ];
       const filtered = subs.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -999,8 +1002,8 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       resolveConfig(ctx.cwd);
       if (args?.trim() === "shutdown") {
-        mgr.closeAll();
-        ctx.ui.notify("browser-interact: all CDP sessions closed", "info");
+        await mgr.closeAll();
+        ctx.ui.notify("browser-interact: all CDP sessions closed and overlays removed", "info");
         return;
       }
       const use = args?.trim().match(/^use\s+(\S+)$/);
@@ -1038,10 +1041,10 @@ export default function (pi: ExtensionAPI) {
       const detach = args?.trim().match(/^detach(?:\s+(\S+))?$/);
       if (detach) {
         try {
-          const r = mgr.detach(detach[1]);
+          const r = await mgr.detach(detach[1]);
           ctx.ui.notify(
             r
-              ? `released "${r.url}" — browser tab left open`
+              ? `released "${r.url}" — the dock and overlay were removed from the page, browser tab left open`
               : "not connected to that tab (or no default target yet) — run /tab to see what is connected",
             r ? "info" : "error",
           );

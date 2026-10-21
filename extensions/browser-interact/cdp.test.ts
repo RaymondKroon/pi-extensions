@@ -172,7 +172,7 @@ describe("CdpManager.detach", () => {
     stubTargets([A, B]);
     const m = mgr();
     await m.pointDefault(A);
-    const r = m.detach();
+    const r = await m.detach();
     expect(r).toEqual({ key: "*", targetId: "A", url: "https://a.test/app" });
     expect(m.attached()).toEqual([]);
     expect(m.hasTarget("A")).toBe(false);
@@ -183,12 +183,40 @@ describe("CdpManager.detach", () => {
     expect(pages.map((p) => p.id)).toEqual(["A", "B"]);
   });
 
+  test("detaching removes the in-page overlay first (off is off)", async () => {
+    stubTargets([A]);
+    const m = mgr();
+    await m.pointDefault(A);
+    const destroyed: string[] = [];
+    evalHandler = (_ws, expr) => {
+      if (expr.includes("__piOverlay.destroy")) destroyed.push("1");
+      return {};
+    };
+    await m.detach("A");
+    expect(destroyed).toEqual(["1"]);
+    expect(m.hasTarget("A")).toBe(false);
+  });
+
+  test("detaching tolerates a dead page (destroy evaluate failing)", async () => {
+    stubTargets([A]);
+    const m = mgr();
+    await m.pointDefault(A);
+    evalHandler = (_ws, expr) => {
+      if (expr.includes("__piOverlay.destroy")) throw new Error("page gone");
+      return {};
+    };
+    // must not throw — the session is still released
+    const r = await m.detach("A");
+    expect(r?.targetId).toBe("A");
+    expect(m.hasTarget("A")).toBe(false);
+  });
+
   test("detaches by exact target id", async () => {
     stubTargets([A, B]);
     const m = mgr();
     await m.pointDefault(A);
     await m.pointDefault(B); // A is now re-keyed to "A"
-    const r = m.detach("A");
+    const r = await m.detach("A");
     expect(r?.url).toBe("https://a.test/app");
     expect(m.hasTarget("A")).toBe(false);
     expect(m.hasTarget("B")).toBe(true);
@@ -199,7 +227,7 @@ describe("CdpManager.detach", () => {
     const m = mgr();
     await m.pointDefault(A);
     await m.pointDefault(B);
-    expect(m.detach("b.test")?.targetId).toBe("B");
+    expect((await m.detach("b.test"))?.targetId).toBe("B");
     expect(m.hasTarget("A")).toBe(true);
   });
 
@@ -208,7 +236,8 @@ describe("CdpManager.detach", () => {
     const m = mgr();
     await m.pointDefault(B);
     await m.pointDefault(C); // both b.test tabs connected
-    expect(() => m.detach("b.test")).toThrow(/matches 2 connected tabs/);
+    // ambiguous matches reject (detach is async now), before any session is released
+    await expect(m.detach("b.test")).rejects.toThrow(/matches 2 connected tabs/);
     // nothing was released
     expect(m.attached()).toHaveLength(2);
   });
@@ -217,7 +246,7 @@ describe("CdpManager.detach", () => {
     stubTargets([A, B]);
     const m = mgr();
     await m.pointDefault(A);
-    expect(m.detach("zzz.test")).toBeNull();
+    expect(await m.detach("zzz.test")).toBeNull();
     expect(m.attached()).toHaveLength(1);
   });
 });

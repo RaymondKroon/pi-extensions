@@ -60,10 +60,11 @@ dock. To re-point or let go:
   elsewhere — every connected tab keeps its live dock (the previous default
   is re-keyed to its own target id). The `tab_*` tools without a `tab` param
   always target the default; pass `tab` to talk to another connected tab.
-- `/tab detach [url-substring|target-id]` — release the CDP session for a
-  tab **without closing the browser tab** (no argument = the default
-target). The overlay stays in the page but goes inert until the next
-  connect.
+- `/tab detach [url-substring|target-id]` — **off is off**: removes the
+  dock/overlay from the page (DOM + stored state) and releases the CDP
+  session, **without closing the browser tab** (no argument = the default
+target). The page is left exactly as found; reconnecting with `/tab use`
+  starts a fresh dock.
 - From the dock itself: the header's **⏏** disconnects the dock from the tab
   it is in (the browser tab stays open). It acts on the tab that clicked it
   (each tab has its own CDP session, so the session always knows which tab
@@ -108,9 +109,9 @@ the id so the model has it in context when needed.
 - `/tab` — show attached tabs and their current page
 - `/tab interact [on|off]` — open (default) / minimize the in-page interaction dock in the browser (chat + the **🔍** looking glass that arms the lens; see `tab_lens`)
 - `/tab use <url-substring|target-id|active>` — connect the dock to a specific tab (confirms if other tabs are already connected); the new tab becomes the default target for the `tab_*` tools, other tabs stay docked
-- `/tab detach [url-substring|target-id]` — release a tab's CDP session without closing the browser tab (default: the default target)
+- `/tab detach [url-substring|target-id]` — remove the dock/overlay from a tab and release its CDP session without closing the browser tab (default: the default target)
 - `/tab check <url>` — open + attach a URL to verify the CDT allowlist (the tab is left open)
-- `/tab shutdown` — detach all CDP sessions
+- `/tab shutdown` — remove every dock/overlay and close all CDP sessions
 
 ## Chat dock
 

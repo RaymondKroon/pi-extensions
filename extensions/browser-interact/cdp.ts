@@ -346,8 +346,23 @@ export class CdpManager {
     }
   }
 
-  closeAll(): void {
-    for (const s of this.sessions.values()) s.close();
+  /** Remove the in-page overlay (DOM, window listeners, sessionStorage) from
+   * a session's tab. Swallows errors — a dead page just can't be cleaned. */
+  private async destroyOverlay(s: CdpSession): Promise<void> {
+    await evaluate(
+      s,
+      "try { window.__piOverlay && window.__piOverlay.destroy(); } catch (e) {}",
+      { timeoutMs: 3_000 },
+    ).catch(() => {});
+  }
+
+  /** Close all sessions (used by /tab shutdown and pi session end). Pass
+   * keepOverlays to leave the in-page UI as-is — the pi session shutdown does
+   * this so the shutdown flush's final reply stays visible in the dock. */
+  async closeAll(keepOverlays = false): Promise<void> {
+    const live = [...this.sessions.values()].filter((s) => !s.closed);
+    if (!keepOverlays) await Promise.allSettled(live.map((s) => this.destroyOverlay(s)));
+    for (const s of live) s.close();
     this.sessions.clear();
     this.lastTargetId.clear();
   }
@@ -367,11 +382,13 @@ export class CdpManager {
   }
 
   /** Release the CDP session for a target WITHOUT closing the browser tab
-   * (the escape hatch for "let go of this tab"). `match` is an exact target
-   * id, a session key, or a URL substring that matches exactly one connected
-   * tab (multiple matches throw, listing the candidates); undefined = the
-   * default target. Returns the released tab, or null when nothing matches. */
-  detach(match?: string): { key: string; targetId: string; url: string } | null {
+   * (the escape hatch for "let go of this tab"): removes the in-page overlay
+   * first — off is off — then closes the CDP session. The BROWSER TAB STAYS
+   * OPEN. `match` is an exact target id, a session key, or a URL substring
+   * that matches exactly one connected tab (multiple matches throw, listing
+   * the candidates); undefined = the default target. Returns the released
+   * tab, or null when nothing matches. */
+  async detach(match?: string): Promise<{ key: string; targetId: string; url: string } | null> {
     const live = [...this.sessions.entries()].filter(([, s]) => !s.closed);
     let hit: [string, CdpSession] | undefined;
     if (match === undefined) {
@@ -391,6 +408,7 @@ export class CdpManager {
     if (!hit) return null;
     const [key, s] = hit;
     this.sessions.delete(key);
+    await this.destroyOverlay(s); // off is off: the dock/overlay leaves the page
     s.close();
     for (const [k, tid] of [...this.lastTargetId]) {
       if (tid === s.targetId || k === key) this.lastTargetId.delete(k);
