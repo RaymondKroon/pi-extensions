@@ -104,6 +104,21 @@ describe("OVERLAY_SCRIPT", () => {
     });
   });
 
+  describe("dock chat origin", () => {
+    test("a sent chat signal carries the live page URL (context for the agent)", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      const input = win.document.querySelector("#__pi_chat_input");
+      input.value = "summarize the news";
+      const ev = new win.Event("input", { bubbles: true });
+      Object.defineProperty(ev, "isTrusted", { value: true });
+      input.dispatchEvent(ev);
+      trustedClick(win, win.document.querySelector("#__pi_chat_send"));
+      const sigs = overlay.tick([]);
+      expect(sigs).toEqual([{ type: "chat", text: "summarize the news", url: "http://localhost/" }]);
+    });
+  });
+
   describe("off is off (destroy)", () => {
     test("destroy() removes all overlay DOM, listeners, and stored state", () => {
       const { win, overlay } = bootOverlay();

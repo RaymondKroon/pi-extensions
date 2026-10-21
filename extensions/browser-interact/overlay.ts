@@ -30,7 +30,7 @@
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
 
-export const OVERLAY_V = 10;
+export const OVERLAY_V = 11;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -315,7 +315,7 @@ export const OVERLAY_SCRIPT = `(() => {
       msgs.push({ role: "user", text: t.slice(0, 4000) });
       saveMsgs();
       window.__piOverlayRender({ role: "user", text: t.slice(0, 4000) }, true);
-      push({ type: "chat", text: t.slice(0, 4000) });
+      push({ type: "chat", text: t.slice(0, 4000), url: location.href });
     };
     chatInput.addEventListener("input", (e) => { if (e.isTrusted) shadow = chatInput.value; });
     chatInput.addEventListener("keydown", (e) => {

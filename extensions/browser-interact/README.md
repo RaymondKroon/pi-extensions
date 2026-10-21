@@ -123,7 +123,9 @@ to (the first `tab_lens` call or `/tab interact`).
 
 - **Input:** the user types tasks into the dock (Enter = send, Shift+Enter =
   newline). Text arrives in the session as a user message prefixed
-  `[browser chat]`; while an agent run is active it is queued as a follow-up.
+  `[browser chat @ <host-of-the-tab>]` — the agent must interpret the request
+  in the context of the page the user is on (it can act on that tab via the
+  `tab_*` tools); while an agent run is active it is queued as a follow-up.
 - **Output:** agent replies and one line per tool call render in the dock via a
   live ~1 s poller (busy state shown as a dot); a shutdown flush delivers
   updates queued at session end, so one-shot sessions don't lose the final
@@ -141,8 +143,8 @@ to (the first `tab_lens` call or `/tab interact`).
   header's **⏏** disconnects the dock from the tab it is in (the browser tab
   stays open); re-pointing the default to another tab is done from the pi
   chat with `/tab use` — see *Target tab* above.
-  Several tabs can be docked at once (multi-dock); a chat message sent from
-  a dock does not say which one it came from.
+  Several tabs can be docked at once (multi-dock); the `@ <host>` part of the
+  prefix says which dock the message came from.
 - **State:** the transcript tail (last 50 messages), open state, and
   position/size live in `sessionStorage`, so everything survives a reload in
   the same tab — the overlay re-installs on every document via

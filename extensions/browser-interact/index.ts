@@ -272,8 +272,16 @@ export default function (pi: ExtensionAPI) {
     if (sig.type === "chat") {
       const t = typeof sig.text === "string" ? sig.text.trim().slice(0, 4000) : "";
       if (!t) return;
+      // Carry the origin tab — the user asked from a specific page, so the
+      // agent must interpret the request in the context of that site (it can
+      // act on that tab via the tab_* tools). Without this, a message like
+      // "summarize the news" was answered from the open web instead of the
+      // site in front of the user. Prefer the URL the overlay captured at
+      // send time (live); fall back to the session's attach-time URL.
+      const from = typeof sig.url === "string" && sig.url ? sig.url : origin.url;
+      const host = (() => { try { return new URL(from).host; } catch { return from; } })();
       // While a run is active, queue it as a follow-up; otherwise start one.
-      pi.sendUserMessage(`[browser chat] ${t}`, agentBusy ? { deliverAs: "followUp" } : {});
+      pi.sendUserMessage(`[browser chat @ ${host}] ${t}`, agentBusy ? { deliverAs: "followUp" } : {});
       return;
     }
     if (sig.type === "dock-detach") {
