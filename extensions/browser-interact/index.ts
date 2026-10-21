@@ -380,7 +380,11 @@ export default function (pi: ExtensionAPI) {
   channel = createOverlayChannel({
     attached: () => mgr.attached(),
     sessionFor: (p?: string) => mgr.sessionFor(p),
-    ensureOverlay,
+    // Headless attaches stay headless: only tabs the user explicitly docked
+    // (via /tab interact, /tab use, or tab_lens) get the overlay installed or
+    // re-installed by self-heal. A plain tab_* tool call must not drop the 💬
+    // button onto the page.
+    ensureOverlay: (s) => (mgr.isDocked(s.targetId) ? ensureOverlay(s) : Promise.resolve()),
     onSignal: handlePageSignal,
   });
 
@@ -391,6 +395,7 @@ export default function (pi: ExtensionAPI) {
   const lensAction = async (action: LensAction, cwd: string, tab?: string): Promise<string> => {
     if (action === "on" || action === "off") {
       await run(tab, cwd, async (s) => {
+        mgr.dock(s.targetId); // the lens is UI — it needs (and requests) the overlay
         await ensureOverlay(s);
         await evaluate(s, `window.__piOverlay && window.__piOverlay.lens.setEnabled(${action === "on"})`, {
           timeoutMs: 10_000,
@@ -402,6 +407,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (action === "clear") {
       await run(tab, cwd, async (s) => {
+        mgr.dock(s.targetId);
         await ensureOverlay(s);
         await evaluate(s, "window.__piOverlay && window.__piOverlay.lens.clear()", { timeoutMs: 10_000 });
       });
@@ -409,6 +415,7 @@ export default function (pi: ExtensionAPI) {
     }
     // list: read the annotations, then save a cropped screenshot per box.
     const snap: any = await run(tab, cwd, async (s) => {
+      mgr.dock(s.targetId);
       await ensureOverlay(s);
       const r = await evaluate(s, "window.__piOverlay ? window.__piOverlay.lens.snapshot() : null", { timeoutMs: 10_000 });
       if (!r) throw new Error("overlay is not installed on this page — arm it with action:'on'");
@@ -1044,6 +1051,7 @@ export default function (pi: ExtensionAPI) {
           }
           const { session, rekeyed } = await mgr.pointDefault(t);
           if (rekeyed) channel.rekey(rekeyed.from, rekeyed.to);
+          mgr.dock(session.targetId);
           await ensureOverlay(session);
           channel.startPoll();
           ctx.ui.notify(
@@ -1080,6 +1088,7 @@ export default function (pi: ExtensionAPI) {
         try {
           const open = interact[1] !== "off";
           await run(undefined, ctx.cwd, async (s) => {
+            if (open) mgr.dock(s.targetId); // on = explicit UI request; off just minimizes
             await ensureOverlay(s);
             await evaluate(s, `window.__piOverlay && window.__piOverlay.chat.setOpen(${open})`, { timeoutMs: 10_000 });
           });

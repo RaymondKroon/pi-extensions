@@ -250,3 +250,29 @@ describe("CdpManager.detach", () => {
     expect(m.attached()).toHaveLength(1);
   });
 });
+
+describe("CdpManager docked targets (opt-in dock/lens UI)", () => {
+  test("dock() marks a target; detach(), closeAll() and forgetTarget() unmark it", async () => {
+    stubTargets([A, B]);
+    const m = mgr();
+    await m.pointDefault(A);
+    expect(m.isDocked("A")).toBe(false);
+    m.dock("A");
+    expect(m.isDocked("A")).toBe(true);
+
+    // a tool re-attach after eject must stay headless: detach undocks
+    expect(await m.detach("A")).not.toBeNull();
+    expect(m.isDocked("A")).toBe(false);
+
+    m.dock("B");
+    await m.pointDefault(B);
+    expect(m.isDocked("B")).toBe(true);
+    await m.closeAll();
+    expect(m.isDocked("B")).toBe(false);
+
+    m.dock("B");
+    expect(m.isDocked("B")).toBe(true);
+    m.forgetTarget("B");
+    expect(m.isDocked("B")).toBe(false);
+  });
+});

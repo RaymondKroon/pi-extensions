@@ -63,9 +63,11 @@ dock. To re-point or let go:
 - `/tab detach [url-substring|target-id]` — **off is off**: removes the
   dock/overlay from the page (DOM + stored state) and releases the CDP
   session, **without closing the browser tab** (no argument = the default
-target). The page is left exactly as found; reconnecting with `/tab use`
-  starts a fresh dock. The session is told via a `[dock]` user message, so
-  the agent knows the tab is no longer driven (same for ⏏ and `/tab
+target). The page is left exactly as found; the tab is also **undocked**, so
+a later `tab_*` tool call re-attaches headless and does NOT bring the dock
+back — reconnect with `/tab use` or `/tab interact on` for a fresh dock. The
+session is told via a `[dock]` user message, so
+the agent knows the tab is no longer driven (same for ⏏ and `/tab
   shutdown`).
 - From the dock itself: the header's **⏏** disconnects the dock from the tab
   it is in (the browser tab stays open). It acts on the tab that clicked it
@@ -118,8 +120,10 @@ the id so the model has it in context when needed.
 ## Chat dock
 
 A floating in-page chat panel over **this** pi session, injected into the page's
-main world. The dock appears on any tab the extension has attached an overlay
-to (the first `tab_lens` call or `/tab interact`).
+main world. The overlay is **opt-in**: it is installed only when the user
+explicitly asks for UI — `/tab interact [on]`, `/tab use`, or `tab_lens`
+(which needs the lens UI). Plain `tab_*` tool calls (click, type, screenshot,
+…) are **headless** — no 💬 button, no lens, nothing injected into the page.
 
 - **Input:** the user types tasks into the dock (Enter = send, Shift+Enter =
   newline). Text arrives in the session as a user message prefixed
@@ -152,7 +156,10 @@ to (the first `tab_lens` call or `/tab interact`).
   re-attach lost the registration). The update channel self-heals the same
   way: a CDP socket drop re-attaches with a fresh session whose overlay
   registration is gone, and the next broadcast or poller tick reinstalls it
-  instead of letting the dock go silently stale.
+  instead of letting the dock go silently stale — but **only for docked
+  tabs** (those the user asked for UI on); a headless tool session is never
+  auto-injected, and an undocked tab (after ⏏/`/tab detach`) stays headless
+  even when a later tool call re-attaches.
 - **Trust model:** the dock renders agent text in the page's DOM, so **the
   page can read the replies** — secrets never leave the process, but don't
   treat the dock as confidential to the site. The reverse direction is

@@ -356,6 +356,22 @@ export class CdpManager {
     ).catch(() => {});
   }
 
+  /** Target ids where the user explicitly asked for the in-page UI (dock or
+   * lens). Plain tool-driven attaches stay headless — no 💬 button on pages
+   * the agent merely drives. The channel's self-heal only (re)installs
+   * overlays for these ids, and detach/shutdown clear them, so an ejected
+   * dock does not reappear when a later tool call re-attaches. */
+  private dockedTargets = new Set<string>();
+  dock(targetId: string): void {
+    this.dockedTargets.add(targetId);
+  }
+  undock(targetId: string): void {
+    this.dockedTargets.delete(targetId);
+  }
+  isDocked(targetId: string): boolean {
+    return this.dockedTargets.has(targetId);
+  }
+
   /** Close all sessions (used by /tab shutdown and pi session end). Pass
    * keepOverlays to leave the in-page UI as-is — the pi session shutdown does
    * this so the shutdown flush's final reply stays visible in the dock. */
@@ -365,6 +381,7 @@ export class CdpManager {
     for (const s of live) s.close();
     this.sessions.clear();
     this.lastTargetId.clear();
+    this.dockedTargets.clear();
   }
 
   /** Drop all cached state for a target that was closed (session + sticky id),
@@ -376,6 +393,7 @@ export class CdpManager {
         s.close();
       }
     }
+    this.undock(id);
     for (const [key, tid] of [...this.lastTargetId]) {
       if (tid === id) this.lastTargetId.delete(key);
     }
@@ -408,6 +426,7 @@ export class CdpManager {
     if (!hit) return null;
     const [key, s] = hit;
     this.sessions.delete(key);
+    this.undock(s.targetId); // off is off: a later tool re-attach stays headless
     await this.destroyOverlay(s); // off is off: the dock/overlay leaves the page
     s.close();
     for (const [k, tid] of [...this.lastTargetId]) {
