@@ -73,7 +73,11 @@ the agent knows the tab is no longer driven (same for ⏏ and `/tab
   it is in (the browser tab stays open). It acts on the tab that clicked it
   (each tab has its own CDP session, so the session always knows which tab
   sent a signal — chat text from a
-dock is the one thing that stays undifferentiated).
+dock is the one thing that stays undifferentiated). If the pi session has
+  already ended, the ⏏ signal has no one left to process it — the overlay
+  detects this (a live session's poller ticks at least once a second) and,
+  when no recent tick has arrived, removes **itself immediately**; with a
+  live session the signal is processed within a second instead.
 
 ## Tools
 
@@ -133,22 +137,33 @@ explicitly asks for UI — `/tab interact [on]`, `/tab use`, or `tab_lens`
   via the `tab_*` tools, by URL substring or the carried target id); while
   an agent run is active it is queued as a follow-up.
 - **Output:** agent replies and one line per tool call render in the dock via a
-  live ~1 s poller (busy state shown as a dot); a shutdown flush delivers
-  updates queued at session end, so one-shot sessions don't lose the final
-  reply. Agent replies are rendered as **markdown** (headings, bold/italic,
+  live ~1 s poller; a shutdown flush delivers updates queued at session end, so
+  one-shot sessions don't lose the final reply. While a run is active a fixed
+  **⠋ working** bar (pi's braille spinner) sits pinned above the input field —
+  it never scrolls out of view — and the **💬 pi** button / header dot pulse
+  amber, so silence never means idle. Assistant **thinking** and text stream in
+  **live**: throttled `message_update` snapshots render an in-place row whose
+  thinking block is **open** while streaming and **auto-follows** the latest
+  line (scrolling up pauses the follow; back to the bottom resumes it), then
+  the final message row replaces it — the only one persisted. Tool calls get a
+  **running row the moment they start**
+  (matched by `toolCallId` and replaced by the final row), so long tools are
+  not a silence gap. Agent replies are rendered as **markdown** (headings, bold/italic,
   inline + fenced code, lists, links incl. bare URLs, quotes, pipe tables) by a small
   escape-first renderer in the overlay — raw HTML in a reply can never reach
-  the DOM as markup. Assistant **thinking** (when the model produces it)
-  appears above the reply in a collapsed **▸ thinking** block; user messages
-  stay plain text. Tool rows are **expandable**: click one to reveal the call's
-  arguments and (truncated) result output — failed calls show an
-  *error* section; the args/result are paired per `toolCallId` between the
-  assistant message and its result. The floating **💬 pi** button opens the
-  panel; drag the header to move, the bottom-right corner to resize, `–` to
-  minimize, `✕` to close, and the header's **🔍** toggles the lens. The
-  header's **⏏** disconnects the dock from the tab it is in (the browser tab
-  stays open); re-pointing the default to another tab is done from the pi
-  chat with `/tab use` — see *Target tab* above.
+  the DOM as markup. Final **thinking** appears above the reply in a collapsed
+  **▸ thinking** block; user messages stay plain text. Tool rows are
+  **expandable**: click one to reveal the call's arguments and (truncated)
+  result output — failed calls show an *error* section; the args/result are
+  paired per `toolCallId` between the assistant message and its result. The
+  floating **💬 pi** button opens the panel (reopening it re-renders anything
+  that arrived while it was closed); drag the header to move, the
+  bottom-right corner to resize, `–` to minimize, and the header's **🔍**
+  toggles the lens. The header's **⏏** disconnects the dock from the tab it
+  is in (the browser tab stays open; if the pi session has already ended,
+  ⏏ removes the overlay immediately — see *Target tab*
+  above); re-pointing the default to another tab is done from the pi chat
+  with `/tab use`.
   Several tabs can be docked at once (multi-dock); the `@ <host>` part of the
   prefix says which dock the message came from.
 - **State:** the transcript tail (last 50 messages), open state, and
@@ -231,7 +246,7 @@ explicitly asks for UI — `/tab interact [on]`, `/tab use`, or `tab_lens`
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command; session-event → dock wiring (tracker, page signals, `ensureOverlay`) |
+| `index.ts` | Extension entry: registers `tab_*` tools + `/tab` command; session-event → dock wiring (tracker, throttled live `message_update` stream, `tool_execution_start` running rows, page signals, `ensureOverlay`) |
 | `overlay-channel.ts` | The dock's update channel: per-tab queue + 1-second poller (drains into the overlay `tick()`, pops page signals), self-heals a lost overlay registration after a CDP re-attach |
 | `tool-update.ts` | `ToolCallTracker`: pairs assistant `toolCall` blocks with `toolResult` messages (truncated args + result) for the dock's expandable tool rows |
 | `cdp.ts` | Minimal CDP client: session manager, attach/re-attach, console + Network-domain capture (250-entry cap), evaluate, screenshot |

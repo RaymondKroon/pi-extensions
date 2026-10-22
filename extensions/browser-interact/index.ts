@@ -23,7 +23,7 @@ import { Type } from "typebox";
 import { CdpManager, evaluate, screenshot, type CdpSession, type CdpTarget } from "./cdp";
 import { OVERLAY_SCRIPT, OVERLAY_V } from "./overlay";
 import { createOverlayChannel, type OverlayChannel } from "./overlay-channel";
-import { ToolCallTracker } from "./tool-update";
+import { MAX_TOOL_ARGS, ToolCallTracker } from "./tool-update";
 
 const DEFAULT_PORT = 9222;
 
@@ -240,17 +240,69 @@ export default function (pi: ExtensionAPI) {
       .join("\n");
   };
 
+  // Live stream: in-process `message_update` events carry the CUMULATIVE
+  // snapshot of the assistant message in progress (only the JSON/RPC wire
+  // form is delta-only). Broadcast it — throttled, with a trailing flush —
+  // as a `live` update so the dock shows thinking/text as it happens; the
+  // final `message_end` broadcast replaces the live row.
+  const MAX_LIVE_TEXT = 8000;
+  const MAX_LIVE_THINKING = 4000;
+  const LIVE_MIN_INTERVAL_MS = 400;
+  let liveState: { text: string; thinking: string } | null = null;
+  let lastLiveAt = 0;
+  let liveTrailing: ReturnType<typeof setTimeout> | null = null;
+  const broadcastLive = (): void => {
+    if (!liveState) return;
+    const s = liveState;
+    liveState = null;
+    lastLiveAt = Date.now();
+    const thinking = s.thinking.trim();
+    channel.broadcastUpdates([
+      {
+        kind: "msg",
+        live: true,
+        text: s.text.slice(0, MAX_LIVE_TEXT),
+        thinking: thinking ? thinking.slice(0, MAX_LIVE_THINKING) : undefined,
+      },
+    ]);
+  };
+  const clearLive = (): void => {
+    liveState = null;
+    if (liveTrailing) {
+      clearTimeout(liveTrailing);
+      liveTrailing = null;
+    }
+  };
+  pi.on("message_update", (ev) => {
+    const m = (ev as any).message;
+    if (!m || m.role !== "assistant") return;
+    const text = assistantText(m);
+    const thinking = assistantThinking(m);
+    if (!text.trim() && !thinking.trim()) return;
+    liveState = { text, thinking };
+    if (Date.now() - lastLiveAt >= LIVE_MIN_INTERVAL_MS) {
+      broadcastLive();
+    } else if (!liveTrailing) {
+      liveTrailing = setTimeout(() => {
+        liveTrailing = null;
+        broadcastLive();
+      }, LIVE_MIN_INTERVAL_MS + 50);
+    }
+  });
   pi.on("agent_start", () => {
     agentBusy = true;
     channel.broadcastUpdates([{ kind: "status", busy: true }]);
   });
   pi.on("agent_end", () => {
     agentBusy = false;
+    clearLive();
     channel.broadcastUpdates([{ kind: "status", busy: false }]);
   });
   pi.on("message_end", (ev) => {
     const m = (ev as any).message;
     if (m?.role === "assistant") {
+      // The authoritative final message replaces the live stream.
+      clearLive();
       const text = assistantText(m).trim();
       const thinking = assistantThinking(m).trim();
       if (text || thinking) {
@@ -260,8 +312,27 @@ export default function (pi: ExtensionAPI) {
       }
       toolTracker.trackAssistant(m);
     } else if (m?.role === "toolResult") {
-      channel.broadcastUpdates([toolTracker.toolResult(m)]);
+      // `id` lets the dock replace the running row (tool-start) in place.
+      const u = toolTracker.toolResult(m);
+      channel.broadcastUpdates([{ ...u, ...(typeof m.toolCallId === "string" ? { id: m.toolCallId } : {}) }]);
     }
+  });
+  // A running tool row the moment a call begins, so a long tool is not a
+  // silence gap in the dock. Nested (in-tool) calls never produce a
+  // transcript toolResult, so a start row for them could never resolve.
+  pi.on("tool_execution_start", (ev) => {
+    const e = ev as any;
+    if (e?.parentToolCallId) return;
+    let args = "";
+    try {
+      args = JSON.stringify(e.args ?? {});
+    } catch {
+      args = String(e.args ?? "");
+    }
+    if (args.length > MAX_TOOL_ARGS) args = args.slice(0, MAX_TOOL_ARGS) + "\u2026";
+    channel.broadcastUpdates([
+      { kind: "tool-start", id: String(e.toolCallId ?? ""), name: String(e.toolName ?? "tool"), args },
+    ]);
   });
 
   // Page → pi: the overlay queues signals (console events are dropped by the

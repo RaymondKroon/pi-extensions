@@ -30,7 +30,7 @@
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
 
-export const OVERLAY_V = 11;
+export const OVERLAY_V = 20;
 
 export const OVERLAY_SCRIPT = `(() => {
   const OVERLAY_V = ${OVERLAY_V};
@@ -48,6 +48,7 @@ export const OVERLAY_SCRIPT = `(() => {
       if (L.scroll) window.removeEventListener("scroll", L.scroll);
     }
     document.querySelectorAll("[data-pi-lens], [data-pi-chat], .pi-lens-marker, .pi-lens-chip").forEach((n) => n.remove());
+    if (window.__piOverlayWorkingTimer) { try { clearInterval(window.__piOverlayWorkingTimer); } catch (e) {} window.__piOverlayWorkingTimer = null; }
   } catch (e) {}
   window.__piOverlayListeners = null;
   window.__piLensListeners = null;
@@ -166,6 +167,11 @@ export const OVERLAY_SCRIPT = `(() => {
   let shadow = ""; // trusted-only copy of the input value (page scripts can
                    // set input.value or dispatch fake events; neither updates
                    // this, so only real user keystrokes can be sent)
+  let workingTimer = null; // spinner interval; mirrored on window so a newer
+                           // overlay version / destroy() can clear it
+  let liveNode = null;    // in-place streaming agent row (never persisted)
+  let liveFollowThinking = true; // follow the streaming thinking unless the user scrolled up
+  let lastTickAt = 0;      // last poller tick (proves the pi session is alive)
 
   const saveMsgs = () => { try { sessionStorage.setItem(MKEY, JSON.stringify(msgs.slice(-MAX_STORED))); } catch (e) {} };
   const saveChatOpen = () => { try { sessionStorage.setItem(OKEY, chatOpen ? "1" : "0"); } catch (e) {} };
@@ -200,11 +206,10 @@ export const OVERLAY_SCRIPT = `(() => {
     const headTitle = document.createElement("span"); headTitle.textContent = "pi chat";
     const headSpacer = document.createElement("span"); headSpacer.style.flex = "1";
     lensBtn = document.createElement("button"); lensBtn.className = "pi-chat-hbtn"; lensBtn.id = "__pi_chat_lensbtn"; lensBtn.textContent = "\ud83d\udd0d"; lensBtn.title = "toggle pi-lens (drag boxes to point at things)";
-    const detachBtn = document.createElement("button"); detachBtn.className = "pi-chat-hbtn"; detachBtn.id = "__pi_chat_detach"; detachBtn.textContent = "\u23fb"; detachBtn.title = "Stop driving this tab: detach the dock (the browser tab stays open)";
+    const detachBtn = document.createElement("button"); detachBtn.className = "pi-chat-hbtn"; detachBtn.id = "__pi_chat_detach"; detachBtn.textContent = "\u23fb"; detachBtn.title = "Stop driving this tab: detach the dock (works even after the pi session has ended; the browser tab stays open)";
     const minBtn = document.createElement("button"); minBtn.className = "pi-chat-hbtn"; minBtn.textContent = "\u2013"; minBtn.title = "minimize (click \u201c\u2009pi\u201d to reopen)";
-    const closeBtn = document.createElement("button"); closeBtn.className = "pi-chat-hbtn"; closeBtn.textContent = "\u2715"; closeBtn.title = "close";
     chatHead.appendChild(dot); chatHead.appendChild(headTitle); chatHead.appendChild(headSpacer);
-    chatHead.appendChild(lensBtn); chatHead.appendChild(detachBtn); chatHead.appendChild(minBtn); chatHead.appendChild(closeBtn);
+    chatHead.appendChild(lensBtn); chatHead.appendChild(detachBtn); chatHead.appendChild(minBtn);
     log = document.createElement("div"); log.id = "__pi_chat_log";
     const inRow = document.createElement("div"); inRow.id = "__pi_chat_inrow";
     chatInput = document.createElement("textarea"); chatInput.id = "__pi_chat_input"; chatInput.maxLength = 4000; chatInput.rows = 2;
@@ -214,7 +219,7 @@ export const OVERLAY_SCRIPT = `(() => {
     const resize = document.createElement("div"); resize.className = "pi-chat-resize"; resize.id = "__pi_chat_resize";
     chatPanel.appendChild(chatHead); chatPanel.appendChild(log); chatPanel.appendChild(inRow); chatPanel.appendChild(resize);
     head = chatHead;
-    [chatBtn, chatPanel, chatHead, dot, headTitle, lensBtn, detachBtn, minBtn, closeBtn, log, inRow, chatInput, sendBtn, resize].forEach((n) => n.setAttribute("data-pi-chat", "1"));
+    [chatBtn, chatPanel, chatHead, dot, headTitle, lensBtn, detachBtn, minBtn, log, inRow, chatInput, sendBtn, resize].forEach((n) => n.setAttribute("data-pi-chat", "1"));
 
     // ---- transcript rendering
     const nearBottom = () => log.scrollTop + log.clientHeight >= log.scrollHeight - 80;
@@ -270,14 +275,148 @@ export const OVERLAY_SCRIPT = `(() => {
       }
       trimDom();
     };
-    window.__piOverlayRender = (m, forceScroll) => { if (!booted) return; if (chatOpen) { const keep = nearBottom(); renderMsg(m); scrollDown(forceScroll || keep); } };
+        // ---- running tool rows: a tool-start update arrives the moment a call
+    // begins (so a long call is not a silence gap); the final tool row
+    // replaces it, matched by toolCallId ----
+    const runningTools = new Map();
+    const removeRunning = (id) => {
+      const k = String(id ?? "");
+      const el = runningTools.get(k);
+      runningTools.delete(k);
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    };
+    const renderToolStart = (id, name, args) => {
+      if (!chatOpen) return;
+      const k = String(id ?? "");
+      if (k && runningTools.has(k) && runningTools.get(k).parentNode) return; // already running
+      const d = document.createElement("div");
+      d.className = "pi-chat-tool running";
+      const head = document.createElement("span"); head.className = "pi-chat-tool-head";
+      head.textContent = "\u2699 " + (name || "tool") + " \u2026";
+      d.appendChild(head);
+      if (args) {
+        d.classList.add("has-detail");
+        const det = document.createElement("div"); det.className = "pi-chat-tool-detail";
+        const ah = document.createElement("div"); ah.className = "pi-chat-tool-sec"; ah.textContent = "arguments";
+        const ap = document.createElement("pre"); ap.textContent = args;
+        det.appendChild(ah); det.appendChild(ap);
+        d.appendChild(det);
+        d.addEventListener("click", (ev) => { if (ev.isTrusted) d.classList.toggle("open"); });
+      }
+      log.appendChild(d);
+      if (k) runningTools.set(k, d);
+      trimDom();
+      scrollDown(false);
+    };
 
-    for (const m of msgs) renderMsg(m);
-    if (!msgs.length) {
-      const h = document.createElement("div"); h.className = "pi-chat-hint";
-      h.textContent = "The agent drives this browser via trusted input. Ask it to inspect, click, or fix things on this page \u2014 or drag a box with the \ud83d\udd0d lens to point at something.";
-      log.appendChild(h);
-    }
+    // ---- live agent row: the streaming snapshot renders in place and is
+    // updated on every (throttled) live update; the final message row replaces
+    // it and is the only one persisted. The thinking block opens by default —
+    // the point is to see the agent think before it answers ----
+    const removeLive = () => {
+      if (liveNode && liveNode.parentNode) liveNode.parentNode.removeChild(liveNode);
+      liveNode = null;
+      liveFollowThinking = true;
+    };
+    const renderLive = (text, thinking) => {
+      const t = String(text ?? "");
+      const th = String(thinking ?? "").trim();
+      if (!t.trim() && !th) return;
+      if (!chatOpen) return; // no DOM while closed; the final row renders on open
+      if (!liveNode || !liveNode.parentNode) {
+        liveNode = document.createElement("div");
+        liveNode.className = "pi-chat-msg agent live";
+        log.appendChild(liveNode);
+        trimDom();
+      }
+      let thEl = liveNode.querySelector(".pi-chat-thinking");
+      if (th) {
+        if (!thEl) {
+          thEl = document.createElement("details");
+          thEl.className = "pi-chat-thinking";
+          thEl.open = true;
+          const sum = document.createElement("summary"); sum.textContent = "thinking";
+          const tp = document.createElement("pre");
+          // Auto-follow the streaming thinking; the user scrolling up to read
+          // earlier pauses it, scrolling back to the bottom resumes it.
+          tp.addEventListener("scroll", () => {
+            liveFollowThinking = tp.scrollTop + tp.clientHeight >= tp.scrollHeight - 24;
+          }, { passive: true });
+          thEl.appendChild(sum); thEl.appendChild(tp);
+          liveNode.appendChild(thEl);
+          liveFollowThinking = true;
+        }
+        const tp = thEl.querySelector("pre");
+        if (tp) {
+          tp.textContent = th;
+          if (liveFollowThinking) tp.scrollTop = tp.scrollHeight;
+        }
+      } else if (thEl) {
+        thEl.parentNode.removeChild(thEl);
+      }
+      let bEl = liveNode.querySelector(".pi-chat-md");
+      if (t.trim()) {
+        if (!bEl) { bEl = document.createElement("div"); bEl.className = "pi-chat-md"; liveNode.appendChild(bEl); }
+        bEl.innerHTML = md(t);
+      } else if (bEl) {
+        bEl.parentNode.removeChild(bEl);
+      }
+      scrollDown(false);
+    };
+
+    // ---- working indicator: pi's braille spinner + "working". A small
+    // floating, transparent, click-through element pinned above the input
+    // field — it never takes layout space (the input row doesn't jump) and
+    // never scrolls out of view. ----
+    const SPIN_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
+    let workingFrame = 0;
+    const workingEl = document.createElement("div");
+    workingEl.className = "pi-chat-working";
+    workingEl.setAttribute("data-pi-chat", "1");
+    const workingSp = document.createElement("span");
+    workingSp.className = "pi-chat-spinner";
+    workingSp.textContent = SPIN_FRAMES[0];
+    const workingMg = document.createElement("span");
+    workingMg.textContent = "working";
+    workingEl.appendChild(workingSp); workingEl.appendChild(workingMg);
+    chatPanel.insertBefore(workingEl, inRow);
+    const setWorking = (on) => {
+      if (!booted) return;
+      workingEl.classList.toggle("on", !!on);
+      if (on && !workingTimer) {
+        workingTimer = setInterval(() => {
+          workingFrame = (workingFrame + 1) % SPIN_FRAMES.length;
+          if (workingSp.parentNode) workingSp.textContent = SPIN_FRAMES[workingFrame];
+        }, 80);
+        window.__piOverlayWorkingTimer = workingTimer;
+      } else if (!on && workingTimer) {
+        clearInterval(workingTimer);
+        workingTimer = null;
+        window.__piOverlayWorkingTimer = null;
+        workingFrame = 0;
+        workingSp.textContent = SPIN_FRAMES[0];
+      }
+    };
+
+    window.__piOverlayRender = (m, forceScroll, id) => {
+      if (!booted) return;
+      if (m && m.role === "agent") removeLive(); // the final row replaces the live one
+      if (m && m.kind === "tool" && id) removeRunning(id);
+      if (chatOpen) { const keep = nearBottom(); renderMsg(m); scrollDown(forceScroll || keep); }
+    };
+    window.__piOverlayLive = renderLive;
+    window.__piOverlayToolStart = renderToolStart;
+
+    const renderStored = () => {
+      while (log.firstChild) log.removeChild(log.firstChild);
+      for (const m of msgs) renderMsg(m);
+      if (!msgs.length) {
+        const h = document.createElement("div"); h.className = "pi-chat-hint";
+        h.textContent = "The agent drives this browser via trusted input. Ask it to inspect, click, or fix things on this page \u2014 or drag a box with the \ud83d\udd0d lens to point at something.";
+        log.appendChild(h);
+      }
+    };
+    renderStored();
 
     // ---- shared mouse state (lens box drag + chat drag/resize)
     let drag = null, lensDrag = null, lensPending = null;
@@ -330,6 +469,13 @@ export const OVERLAY_SCRIPT = `(() => {
       if (!booted) return;
       dot.className = busy ? "busy" : "";
       chatBtn.classList.toggle("busy", busy);
+      setWorking(busy);
+      if (!busy) {
+        // Run over: any running row whose result never arrived (aborted run)
+        // would otherwise sit at "\u2026" forever.
+        runningTools.forEach((el) => { if (el.parentNode) el.parentNode.removeChild(el); });
+        runningTools.clear();
+      }
     };
 
     // ---- layout / drag / resize
@@ -463,16 +609,32 @@ export const OVERLAY_SCRIPT = `(() => {
       saveChatOpen();
       if (!booted) return;
       chatPanel.classList.toggle("open", chatOpen);
-      if (chatOpen) { layoutPanel(); scrollDown(true); try { chatInput.focus(); } catch (e) {} }
+      if (chatOpen) {
+        // Rebuild the transcript: updates that arrived while the dock was
+        // closed were stored but never rendered to the (hidden) log.
+        renderStored();
+        layoutPanel(); scrollDown(true); try { chatInput.focus(); } catch (e) {}
+      }
     };
     chatBtn.addEventListener("click", (e) => { if (e.isTrusted) setChatOpen(!chatOpen); });
     minBtn.addEventListener("click", (e) => { if (e.isTrusted) setChatOpen(false); });
-    closeBtn.addEventListener("click", (e) => { if (e.isTrusted) setChatOpen(false); });
-    // Dock-switching controls: signals are popped by the poller WITH the
-    // tab's identity, so the session knows exactly which tab asked.
-    detachBtn.addEventListener("click", (e) => { if (e.isTrusted) push({ type: "dock-detach" }); });
+    // Dock-detach control: signals are popped by the poller WITH the tab's
+    // identity, so the session knows exactly which tab asked.
+    detachBtn.addEventListener("click", (e) => {
+      if (!e.isTrusted) return;
+      push({ type: "dock-detach" });
+      // A live session's poller ticks at least once a second and processes
+      // the signal within a second (releases the CDP session, removes the
+      // overlay, tells the agent). If the poller has been SILENT for a while
+      // at click time, the session is gone (or its socket is cut) and the
+      // signal will not be processed soon — remove the UI immediately. (If
+      // the socket is merely cut, the session's self-heal may reinstall the
+      // overlay later; a second ⏏ then lands on the live path.)
+      if (Date.now() - lastTickAt > 3000) window.__piOverlay.destroy();
+    });
 
-    // ---- styles
+    // ---- styles (dedup first: repeated re-injects must not stack tags) ----
+    document.querySelectorAll("style[data-pi-chat]").forEach((n) => n.remove());
     const style = document.createElement("style");
     style.setAttribute("data-pi-chat", "style");
     style.textContent =
@@ -485,16 +647,20 @@ export const OVERLAY_SCRIPT = `(() => {
       "#__pi_lens_input { width: 320px; max-width: 60vw; padding: 6px 8px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; }" +
       "#__pi_lens_hint { margin-top: 4px; color: #6b7280; font-size: 11px; }" +
       "#__pi_chat_btn { position: fixed; right: 16px; bottom: 16px; z-index: " + Z + "; pointer-events: auto; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 999px; padding: 6px 12px; font: 12px/1.4 ui-sans-serif, system-ui, sans-serif; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.4); }" +
-      "#__pi_chat_btn.busy { background: #b45309; border-color: #f59e0b; color: #fff; }" +
       "#__pi_chat_panel { position: fixed; z-index: " + Z + "; pointer-events: auto; display: none; flex-direction: column; background: #1f2937; color: #e5e7eb; border: 1px solid #374151; border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.5); font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; overflow: hidden; }" +
       "#__pi_chat_panel.open { display: flex; }" +
       "#__pi_chat_head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: move; border-bottom: 1px solid #374151; background: #111827; user-select: none; }" +
       "#__pi_chat_dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex: none; }" +
-      "#__pi_chat_dot.busy { background: #f59e0b; }" +
+      "#__pi_chat_dot.busy { background: #f59e0b; animation: piChatBlink 1.2s infinite; }" +
+      "#__pi_chat_btn.busy { background: #b45309; border-color: #f59e0b; color: #fff; }" +
       ".pi-chat-hbtn { background: none; border: none; color: #9ca3af; cursor: pointer; font-size: 13px; line-height: 1; padding: 3px 5px; border-radius: 4px; }" +
       ".pi-chat-hbtn:hover { color: #fff; background: #374151; }" +
       ".pi-chat-hbtn.on { background: #1d4ed8; color: #fff; }" +
       "#__pi_chat_log { flex: 1; overflow-y: auto; padding: 8px; min-height: 0; }" +
+      "@keyframes piChatBlink { 50% { opacity: .35; } }" +
+      ".pi-chat-working { position: absolute; left: 10px; bottom: 64px; display: none; align-items: center; gap: 5px; color: #9ca3af; font-size: 11px; pointer-events: none; user-select: none; }" +
+      ".pi-chat-working.on { display: flex; }" +
+      ".pi-chat-working .pi-chat-spinner { color: #f59e0b; font-size: 12px; width: 10px; flex: none; }" +
       ".pi-chat-hint { color: #6b7280; font-size: 12px; margin-bottom: 8px; }" +
       ".pi-chat-msg { margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; }" +
       ".pi-chat-msg.user { background: #1d4ed8; margin-left: 18%; }" +
@@ -520,8 +686,9 @@ export const OVERLAY_SCRIPT = `(() => {
       ".pi-chat-tool.has-detail .pi-chat-tool-head { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }" +
       ".pi-chat-tool.has-detail:hover .pi-chat-tool-head { color: #d1d5db; }" +
       ".pi-chat-tool-head::before { content: none; }" +
-      ".pi-chat-tool.has-detail .pi-chat-tool-head::before { content: '\\u25b8  '; color: #4b5563; }" +
-      ".pi-chat-tool.open .pi-chat-tool-head::before { content: '\\u25be  '; color: #4b5563; }" +
+      ".pi-chat-tool.has-detail .pi-chat-tool-head::before { content: ''; display: inline-block; width: 0; height: 0; border-left: 4px solid #4b5563; border-top: 3px solid transparent; border-bottom: 3px solid transparent; margin-right: 4px; vertical-align: 1px; transition: transform .12s ease; }" +
+      ".pi-chat-tool.open .pi-chat-tool-head::before { transform: rotate(90deg); }" +
+      ".pi-chat-tool.running .pi-chat-tool-head { color: #fbbf24; }" +
       ".pi-chat-tool-detail { display: none; margin-top: 3px; padding: 4px 8px; background: #111827; border: 1px solid #374151; border-radius: 6px; max-height: 160px; overflow-y: auto; }" +
       ".pi-chat-tool.open .pi-chat-tool-detail { display: block; }" +
       ".pi-chat-tool-sec { color: #6b7280; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; margin-top: 3px; }" +
@@ -542,6 +709,7 @@ export const OVERLAY_SCRIPT = `(() => {
     // ---- initial visual state
     setLensOn(lensOn);
     layoutPanel();
+    setWorking(busy); // sync the bar if a run was already active pre-boot
     setChatOpen(chatOpen);
 
     // ---- hooks for the lazy API (assigned once the DOM exists)
@@ -584,10 +752,10 @@ export const OVERLAY_SCRIPT = `(() => {
     msgs.push(m); saveMsgs();
     if (window.__piOverlayRender) window.__piOverlayRender(m, true);
   };
-  const addTool = (name, ok, args, result) => {
+  const addTool = (name, ok, args, result, id) => {
     const m = { kind: "tool", name: String(name || "tool"), ok: !!ok, args: String(args ?? "").slice(0, 2000), result: String(result ?? "").slice(0, 4000) };
     msgs.push(m); saveMsgs();
-    if (window.__piOverlayRender) window.__piOverlayRender(m, false);
+    if (window.__piOverlayRender) window.__piOverlayRender(m, false, id);
   };
   const setBusy = (b) => {
     busy = !!b;
@@ -596,12 +764,17 @@ export const OVERLAY_SCRIPT = `(() => {
 
   /** Apply extension-side updates (polled) and return the popped signals. */
   const tick = (updates) => {
+    lastTickAt = Date.now();
     if (Array.isArray(updates)) {
       for (const u of updates) {
         if (!u || typeof u !== "object") continue;
         if (u.kind === "status") setBusy(!!u.busy);
-        else if (u.kind === "msg") addAgent(u.text, u.thinking);
-        else if (u.kind === "tool") addTool(u.name, u.ok, u.args, u.result);
+        else if (u.kind === "msg") {
+          if (u.live) { if (window.__piOverlayLive) window.__piOverlayLive(u.text, u.thinking); }
+          else addAgent(u.text, u.thinking);
+        }
+        else if (u.kind === "tool-start") { if (window.__piOverlayToolStart) window.__piOverlayToolStart(u.id, u.name, u.args); }
+        else if (u.kind === "tool") addTool(u.name, u.ok, u.args, u.result, u.id);
       }
     }
     const out = signals;
@@ -627,6 +800,8 @@ export const OVERLAY_SCRIPT = `(() => {
      * Called by the extension when the tab is detached. */
     destroy: () => {
       try {
+        if (workingTimer) { clearInterval(workingTimer); workingTimer = null; }
+        if (window.__piOverlayWorkingTimer) { try { clearInterval(window.__piOverlayWorkingTimer); } catch (e) {} }
         const L = window.__piOverlayListeners;
         if (L) {
           if (L.mousedown) window.removeEventListener("mousedown", L.mousedown, true);
@@ -646,6 +821,10 @@ export const OVERLAY_SCRIPT = `(() => {
         window.__piOverlayChat = undefined;
         window.__piOverlayBusy = undefined;
         window.__piOverlayRender = undefined;
+        window.__piOverlayLive = undefined;
+        window.__piOverlayToolStart = undefined;
+        window.__piOverlayWorkingTimer = null;
+        workingTimer = null; liveNode = null; liveFollowThinking = true;
       } catch (e) {}
     },
   };

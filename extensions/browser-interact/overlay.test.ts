@@ -82,15 +82,150 @@ describe("OVERLAY_SCRIPT", () => {
     });
   });
 
+  describe("live activity (working spinner, streaming, running tools)", () => {
+    test("status busy shows the small floating working indicator; idle hides it", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      const bar = win.document.querySelector(".pi-chat-working");
+      expect(bar).not.toBeNull();
+      expect(bar.querySelector(".pi-chat-spinner")).not.toBeNull();
+      expect(bar.textContent).toContain("working");
+      // a small floating element, not a full row: absolutely positioned
+      // (no layout space for the input row) and click-through
+      const css = win.document.querySelector("style")?.textContent || "";
+      const rule = css.match(/\.pi-chat-working \{[^}]*\}/)?.[0] || "";
+      expect(rule).toContain("position: absolute");
+      expect(rule).toContain("pointer-events: none");
+      expect(rule).not.toContain("background");
+      expect(bar.parentNode).toBe(win.document.querySelector("#__pi_chat_panel"));
+      expect(bar.classList.contains("on")).toBe(false);
+      overlay.tick([{ kind: "status", busy: true }]);
+      expect(bar.classList.contains("on")).toBe(true);
+      overlay.tick([{ kind: "status", busy: false }]);
+      expect(bar.classList.contains("on")).toBe(false);
+    });
+
+    test("live updates render in place with an OPEN thinking block, replaced by the final message (only the final one is persisted)", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "msg", live: true, thinking: "let me" }]);
+      let live = win.document.querySelector(".pi-chat-msg.agent.live");
+      expect(live).not.toBeNull();
+      // the thinking block is visible (open) while streaming
+      expect(live.querySelector("details.pi-chat-thinking").open).toBe(true);
+      expect(live.querySelector("details pre")?.textContent).toBe("let me");
+      expect(live.querySelector(".pi-chat-md")).toBeNull();
+      overlay.tick([{ kind: "msg", live: true, thinking: "let me think", text: "part" }]);
+      // same node, updated in place — not a new row
+      expect(win.document.querySelectorAll(".pi-chat-msg.agent.live").length).toBe(1);
+      expect(live.querySelector("details pre")?.textContent).toBe("let me think");
+      expect(live.querySelector(".pi-chat-md")?.textContent).toContain("part");
+      // live rows are never persisted
+      expect(win.sessionStorage.getItem("__pi_chat_msgs")).toBeNull();
+      overlay.tick([{ kind: "msg", role: "agent", text: "part answer", thinking: "let me think" }]);
+      expect(win.document.querySelector(".pi-chat-msg.agent.live")).toBeNull();
+      const final = win.document.querySelector(".pi-chat-msg.agent");
+      expect(final.textContent).toContain("part answer");
+      const stored = JSON.parse(win.sessionStorage.getItem("__pi_chat_msgs"));
+      expect(stored.length).toBe(1);
+      expect(stored[0].text).toBe("part answer");
+    });
+
+    test("tool-start shows a running row; the final tool row replaces it by id", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "tool-start", id: "c1", name: "bash", args: '{"command":"sleep 5"}' }]);
+      let rows = win.document.querySelectorAll(".pi-chat-tool");
+      expect(rows.length).toBe(1);
+      expect(rows[0].classList.contains("running")).toBe(true);
+      expect(rows[0].textContent).toContain("⚙ bash");
+      // a duplicate start for the same id does not double the row
+      overlay.tick([{ kind: "tool-start", id: "c1", name: "bash", args: '{"command":"sleep 5"}' }]);
+      expect(win.document.querySelectorAll(".pi-chat-tool").length).toBe(1);
+      // the final result replaces the running row (no append)
+      overlay.tick([{ kind: "tool", name: "bash", ok: true, args: '{"command":"sleep 5"}', result: "done", id: "c1" }]);
+      rows = win.document.querySelectorAll(".pi-chat-tool");
+      expect(rows.length).toBe(1);
+      expect(rows[0].classList.contains("running")).toBe(false);
+      expect(rows[0].textContent).toContain("✓");
+      expect(rows[0].textContent).toContain("done");
+    });
+
+    test("a final tool row without a matching running row is appended as usual", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "tool", name: "read", ok: true, args: "{}", result: "x", id: "nope" }]);
+      const rows = win.document.querySelectorAll(".pi-chat-tool");
+      expect(rows.length).toBe(1);
+      expect(rows[0].textContent).toContain("✓");
+    });
+
+    test("an orphaned running row (result never arrived) clears when the run ends", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "status", busy: true }]);
+      overlay.tick([{ kind: "tool-start", id: "c1", name: "bash", args: "{}" }]);
+      expect(win.document.querySelectorAll(".pi-chat-tool.running").length).toBe(1);
+      overlay.tick([{ kind: "status", busy: false }]);
+      expect(win.document.querySelector(".pi-chat-tool.running")).toBeNull();
+    });
+
+    test("streaming thinking auto-follows; scrolling up pauses the follow, reaching the bottom resumes it", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "msg", live: true, thinking: "a".repeat(50) + "\n" }]);
+      const tp = win.document.querySelector(".pi-chat-msg.agent.live details pre");
+      expect(tp).not.toBeNull();
+      // happy-dom has no layout — fake a 120px window over 1000px of content
+      Object.defineProperty(tp, "clientHeight", { value: 120, configurable: true });
+      Object.defineProperty(tp, "scrollHeight", { value: 1000, configurable: true });
+      // the user scrolls up to read earlier thinking
+      tp.scrollTop = 0;
+      tp.dispatchEvent(new win.Event("scroll"));
+      overlay.tick([{ kind: "msg", live: true, thinking: "a".repeat(60) + "\nb" }]);
+      expect(tp.scrollTop).toBe(0); // not yanked back to the bottom
+      expect(tp.textContent).toBe("a".repeat(60) + "\nb"); // content still updates
+      // scrolling back to the bottom resumes following
+      tp.scrollTop = 880;
+      tp.dispatchEvent(new win.Event("scroll"));
+      overlay.tick([{ kind: "msg", live: true, thinking: "a".repeat(60) + "\nb\nmore" }]);
+      expect(tp.scrollTop).toBe(tp.scrollHeight);
+    });
+
+    test("reopening the dock re-renders the stored transcript and restores the working row", () => {
+      const { win, overlay } = bootOverlay();
+      overlay.chat.setOpen(true);
+      overlay.tick([{ kind: "msg", role: "agent", text: "hello" }]);
+      expect(win.document.querySelectorAll(".pi-chat-msg.agent").length).toBe(1);
+      overlay.chat.setOpen(false);
+      overlay.tick([{ kind: "msg", role: "agent", text: "arrived while closed" }]);
+      // stored, but not yet rendered to the (hidden) log
+      expect(win.document.querySelectorAll(".pi-chat-msg.agent").length).toBe(1);
+      overlay.tick([{ kind: "status", busy: true }]);
+      overlay.chat.setOpen(true);
+      const rows = win.document.querySelectorAll(".pi-chat-msg.agent");
+      expect(rows.length).toBe(2);
+      expect(rows[rows.length - 1].textContent).toContain("arrived while closed");
+      expect(win.document.querySelector(".pi-chat-working").classList.contains("on")).toBe(true);
+      overlay.tick([{ kind: "status", busy: false }]);
+    });
+  });
+
   describe("dock header detach control", () => {
-    test("trusted ⏏ click queues a dock-detach signal", () => {
+    test("trusted ⏏ click (live session) queues the signal; the session removes the overlay", () => {
       const { win, overlay } = bootOverlay();
       overlay.chat.setOpen(true);
       const detachBtn = win.document.querySelector("#__pi_chat_detach");
       expect(detachBtn).not.toBeNull();
       // the retired ⇄ switch button must be gone
       expect(win.document.querySelector("#__pi_chat_switch")).toBeNull();
+      // a recent poller tick proves the session is alive
+      overlay.tick([]);
       trustedClick(win, detachBtn);
+      // live path: the overlay stays up — the session processes the signal
+      // on its next tick and removes it properly
+      expect(win.__piOverlay).toBeDefined();
+      expect(win.document.querySelector("#__pi_chat_panel")).not.toBeNull();
       expect(overlay.tick([])).toEqual([{ type: "dock-detach" }]);
       // queue is empty now
       expect(overlay.tick([])).toEqual([]);
@@ -101,6 +236,18 @@ describe("OVERLAY_SCRIPT", () => {
       overlay.chat.setOpen(true);
       win.document.querySelector("#__pi_chat_detach").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
       expect(overlay.tick([])).toEqual([]);
+    });
+
+    test("⏏ with a DEAD session (poller silent) removes the overlay immediately", () => {
+      const win = new Window({ url: "http://localhost/" }) as any;
+      win.sessionStorage.setItem("__pi_chat_msgs", JSON.stringify([{ role: "agent", text: "hello" }]));
+      win.eval(OVERLAY_SCRIPT);
+      win.__piOverlay.chat.setOpen(true);
+      // never ticked: no live session behind the dock
+      trustedClick(win, win.document.querySelector("#__pi_chat_detach"));
+      expect(win.__piOverlay).toBeUndefined();
+      expect(win.document.querySelector("[data-pi-chat]")).toBeNull();
+      expect(win.sessionStorage.getItem("__pi_chat_msgs")).toBeNull();
     });
   });
 
