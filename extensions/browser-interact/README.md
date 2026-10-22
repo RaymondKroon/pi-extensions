@@ -195,7 +195,15 @@ explicitly asks for UI — `/tab interact [on]`, `/tab use`, or `tab_lens`
 > a tab can show the latest overlay while a session still streams pre-edit
 > behaviour from its in-memory extension. Judge by live behaviour (e.g. after
 > the expandable-rows commit, new tool rows must carry args/result), then
-> reload the extension if it is stale. Beware the normalisation trap when
+> reload the extension if it is stale. The mirror-image drift: after an
+> extension **reload**, a docked tab keeps the **old** overlay until the
+> session re-attaches it — the version check lives only in `ensureOverlay`,
+> which runs for a docked tab on explicit UI paths or when the session has no
+> `overlayScriptId` (i.e. after a re-attach); so right after a reload the
+> page can still run the pre-reload script while the in-memory code is new
+> (next `tab_*` call re-attaches, next broadcast re-injects). Compare
+> `window.__piOverlay.__v` against the source `OVERLAY_V` before attributing
+> page behaviour to the current code. Beware the normalisation trap when
 > judging: the overlay stores tool rows with `args`/`result` keys even when
 > the in-memory code predates them (old `{kind,name,ok}` broadcasts become
 > rows with empty detail), so *empty* detail proves nothing — check that

@@ -29,6 +29,14 @@
 // strings when they contain double quotes. `\\u0060` is the safe way to put
 // a backtick in the page source (it cooks to the character). The
 // "parses as a standalone script" test in overlay.test.ts is the backstop.
+// No font-dependent decorative glyphs: the dock renders into arbitrary pages
+// and the user's browser font lacked U+258C/▸ (tofu boxes) — draw shapes in
+// CSS (tool-row arrows) and keep only confirmed-common chars (braille
+// spinner, ⚙/✓/✗, •, …).
+// No font-dependent decorative glyphs: the dock renders into arbitrary pages
+// and the user's browser font lacked U+258C/▸ (tofu boxes) — draw shapes in
+// CSS (tool-row arrows) and keep only confirmed-common chars (braille
+// spinner, ⚙/✓/✗, •, …).
 
 export const OVERLAY_V = 20;
 
