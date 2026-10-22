@@ -229,14 +229,14 @@ async function axTargetPoint(
   role: string,
   name: string,
   opts: { allowDisabled?: boolean } = {},
-): Promise<{ x: number; y: number; role: string; name: string }> {
+): Promise<{ x: number; y: number; role: string; name: string; exact: boolean }> {
   const pick = (p: Awaited<ReturnType<typeof axPoint>>) => {
     if (p.props.disabled === "true" && !opts.allowDisabled) {
       throw new Error(
         `ax: ${role} "${name}" is disabled${p.context ? ` (${p.context})` : ""} — hover is allowed, click is not`,
       );
     }
-    return { x: p.x, y: p.y, role: p.match.role, name: p.match.name };
+    return { x: p.x, y: p.y, role: p.match.role, name: p.match.name, exact: p.match.exact };
   };
   const p = await axPoint(s, role, name);
   const cover = await axCover(s, p.match.node, p.x, p.y);
@@ -744,7 +744,7 @@ export default function (pi: ExtensionAPI) {
     name: "tab_click",
     label: "Tab Click",
     description:
-      "Click a TARGET in the target tab: polls actionability, then dispatches a TRUSTED CDP mouse sequence at its centre. Prefer role+name (e.g. `button \"Submit\"`, `menuitem Close` — take it from tab_ax; stable, and works into shadow DOM); a CSS selector works for edge cases. Fails with a reason: not-found (retried until timeout), disabled, covered-by-<el> (fix the overlay/target, don't retry blindly), ambiguous (candidates listed with their context).",
+      "Click a TARGET in the target tab: polls actionability, then dispatches a TRUSTED CDP mouse sequence at its centre. Prefer role+name (e.g. `button \"Submit\"`, `menuitem Close` — take it from tab_ax; stable, and works into shadow DOM); a CSS selector works for edge cases. The role+name result reports `matched: exact|substring` — a substring match can be a weaker hit, sanity-check `text`. Fails with a reason: not-found (retried until timeout), disabled, covered-by-<el> (fix the overlay/target, don't retry blindly), ambiguous (candidates listed with their context).",
     promptSnippet: "Trusted click on a role+name or CSS-selector target in the target tab",
     parameters: Type.Object({
       target: Type.String({
@@ -797,7 +797,7 @@ export default function (pi: ExtensionAPI) {
         // "not-found" (a page may still be loading).
         let lastErr: Error | null = null;
         for (;;) {
-          let pt: { x: number; y: number; role: string; name: string };
+          let pt: { x: number; y: number; role: string; name: string; exact: boolean };
           try {
             pt = await axTargetPoint(s, tgt.role, tgt.name);
           } catch (e: any) {
@@ -809,7 +809,14 @@ export default function (pi: ExtensionAPI) {
             continue;
           }
           await clickAt(s, pt.x, pt.y);
-          return { ok: true, trusted: true, via: "accessibility", tag: pt.role, text: pt.name };
+          return {
+            ok: true,
+            trusted: true,
+            via: "accessibility",
+            tag: pt.role,
+            text: pt.name,
+            matched: pt.exact ? "exact" : "substring",
+          };
         }
       });
       return toolResult(text(result));
@@ -820,7 +827,7 @@ export default function (pi: ExtensionAPI) {
     name: "tab_hover",
     label: "Tab Hover",
     description:
-      "Move the mouse in the target tab: over a TARGET — role+name (e.g. `link \"…\"`, from tab_ax; preferred) or a CSS selector (polls until visible and not covered, then a TRUSTED CDP mouseMoved to its centre) — or to exact viewport COORDINATES x/y (no polling; negative coords move the mouse outside the page). Fires :hover / mouseenter / mouseover so tooltips, hover menus and previews appear; the mouse STAYS where it is, so a follow-up tab_click can click what the hover revealed. The result reports elementAt — what is actually under the cursor: hover-generated overlays (link previews, menus) can land there, and the next jump may re-hover them. To UNHOVER reliably, move to an empty spot (e.g. x:-500, y:-500) — hovering body can land on a hover overlay and keep the hover alive. Pass waitFor to also wait for a result target (role+name, e.g. `tooltip \"Saved\"`, or a CSS selector) and report it. Fails with a reason: not-found (retried until timeout), covered-by-<el>, ambiguous (role+name mode, candidates listed).",
+      "Move the mouse in the target tab: over a TARGET — role+name (e.g. `link \"…\"`, from tab_ax; preferred) or a CSS selector (polls until visible and not covered, then a TRUSTED CDP mouseMoved to its centre) — or to exact viewport COORDINATES x/y (no polling; negative coords move the mouse outside the page). Fires :hover / mouseenter / mouseover so tooltips, hover menus and previews appear; the mouse STAYS where it is, so a follow-up tab_click can click what the hover revealed. The result reports elementAt — what is actually under the cursor: hover-generated overlays (link previews, menus) can land there, and the next jump may re-hover them. To UNHOVER reliably, move to an empty spot (e.g. x:-500, y:-500) — hovering body can land on a hover overlay and keep the hover alive. Pass waitFor to also wait for a result target (role+name, e.g. `tooltip \"Saved\"`, or a CSS selector) and report it. The role+name result also reports `matched: exact|substring` — a substring hit can be a weaker match, check `text`. Fails with a reason: not-found (retried until timeout), covered-by-<el>, ambiguous (role+name mode, candidates listed).",
     promptSnippet: "Trusted hover (mouseMoved) on a role+name/selector target or x/y coordinates in the target tab",
     parameters: Type.Object({
       target: Type.Optional(
@@ -847,7 +854,7 @@ export default function (pi: ExtensionAPI) {
       }
       const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 500), 120_000);
       const result = await run(params.tab, ctx.cwd, async (s) => {
-        let st: { x: number; y: number; tag?: string; text?: string };
+        let st: { x: number; y: number; tag?: string; text?: string; matched?: "exact" | "substring" };
         const t0 = Date.now();
         if (tgt?.kind === "selector") {
           let last: any = null;
@@ -874,7 +881,7 @@ export default function (pi: ExtensionAPI) {
           for (;;) {
             try {
               const pt = await axTargetPoint(s, tgt.role, tgt.name, { allowDisabled: true });
-              st = { x: pt.x, y: pt.y, tag: pt.role, text: pt.name };
+              st = { x: pt.x, y: pt.y, tag: pt.role, text: pt.name, matched: pt.exact ? "exact" : "substring" };
               break;
             } catch (e: any) {
               if (e instanceof AxTargetError && e.code === "not-found") lastErr = e;
@@ -923,7 +930,7 @@ export default function (pi: ExtensionAPI) {
             ms: Date.now() - wt0,
           };
         }
-        return { ok: true, trusted: true, hovered: st.tag ? { tag: st.tag, text: st.text } : { x: st.x, y: st.y }, elementAt, ...(wait ? { wait } : {}) };
+        return { ok: true, trusted: true, hovered: st.tag ? { tag: st.tag, text: st.text } : { x: st.x, y: st.y }, elementAt, ...(st.matched ? { matched: st.matched } : {}), ...(wait ? { wait } : {}) };
       });
       return toolResult(text(result));
     },

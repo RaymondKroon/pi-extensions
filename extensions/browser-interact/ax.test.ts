@@ -12,6 +12,7 @@ import {
   formatAXTree,
   matchTargets,
   notFoundHint,
+  normName,
   parseTarget,
   shownNodes,
   type RawAXNode,
@@ -118,6 +119,24 @@ describe("parseTarget", () => {
 // ---------------------------------------------------------------- matchTargets
 
 describe("matchTargets", () => {
+  test("unicode spaces match plain spaces (live pages use nbsp, tab_ax shows a space)", () => {
+    const nodes = [N("1", "link", "109\u00a0comments"), N("2", "link", "comments")];
+    const m = matchTargets(nodes, "link", "109 comments");
+    // the nbsp link is the EXACT hit and sorts first; the bare "comments" stays
+    // a substring candidate (axPoint filters to the exact pool when one exists)
+    expect(m.map((x) => ({ name: x.name, exact: x.exact }))).toEqual([
+      { name: "109\u00a0comments", exact: true },
+      { name: "comments", exact: false },
+    ]);
+  });
+
+  test("normName folds the unicode space set", () => {
+    expect(normName(" 109\u00a0Comments ")).toBe("109 comments");
+    for (const ch of ["\u00a0", "\u1680", "\u2000", "\u2009", "\u200a", "\u202f", "\u205f", "\u3000"]) {
+      expect(normName(`a${ch}b`)).toBe("a b");
+    }
+  });
+
   test("exact beats substring, case-insensitive", () => {
     const nodes = [N("a", "button", "Save draft"), N("b", "button", "SAVE")];
     const m = matchTargets(nodes, "button", "save");
@@ -261,6 +280,22 @@ describe("axPoint", () => {
     expect(pt.x).toBe(20);
     expect(pt.y).toBe(15);
     expect(pt.match.role).toBe("button");
+  });
+
+  test("nbsp name: exact hit wins over the bare-word substring (HN '109\u00a0comments')", async () => {
+    const s = fakeSession((m, p) => {
+      if (m === "Accessibility.getFullAXTree")
+        return { nodes: [N("1", "link", "109\u00a0comments", { rootId: "1", childIds: ["2"] }), N("2", "link", "comments", { parentId: "1" })] };
+      if (m === "DOM.resolveNode") {
+        expect(p.backendNodeId).toBe(100); // the byline link (node 1), not the nav link
+        return { object: { objectId: "obj1" } };
+      }
+      if (m === "Runtime.callFunctionOn") return { result: { value: RECT } };
+      throw new Error(`unexpected ${m}`);
+    });
+    const pt = await axPoint(s, "link", "109 comments");
+    expect(pt.match.name).toBe("109\u00a0comments");
+    expect(pt.match.exact).toBe(true);
   });
 
   test("ambiguous → AxTargetError listing the candidates", async () => {

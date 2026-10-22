@@ -123,14 +123,27 @@ export interface AxMatch {
   exact: boolean;
 }
 
+/** Unicode spaces that render as a plain space in the tab_ax output — an agent
+ * reading a name there types plain spaces, so matching must treat them alike
+ * (e.g. HN byline "109\u00a0comments"). Anything the display cannot show must
+ * not break what the display says. */
+const UNICODE_SPACE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]/g;
+
+/** Canonical form for name comparison: unicode spaces → plain space, trimmed,
+ * lowercased. */
+export function normName(s: string): string {
+  return s.replace(UNICODE_SPACE, " ").trim().toLowerCase();
+}
+
 /**
  * Match `role` + `name` against a raw tree. Skips ignored nodes and unnamed
  * ones. Exact role+name wins over substring (name contained in either
- * direction); result keeps tree order within each score class.
+ * direction, compared in canonical form); result keeps tree order within each
+ * score class.
  */
 export function matchTargets(nodes: RawAXNode[], role: string, name: string): AxMatch[] {
   const r = role.trim().toLowerCase();
-  const q = name.trim().toLowerCase();
+  const q = normName(name);
   if (!r || !q) return [];
   const out: AxMatch[] = [];
   for (const n of nodes) {
@@ -139,7 +152,7 @@ export function matchTargets(nodes: RawAXNode[], role: string, name: string): Ax
     if ((p.role ?? "").toLowerCase() !== r) continue;
     const nm = (p.name ?? "").trim();
     if (!nm) continue;
-    const nl = nm.toLowerCase();
+    const nl = normName(nm);
     if (nl === q) out.push({ node: n, role: p.role, name: nm, exact: true });
     else if (nl.includes(q) || q.includes(nl)) out.push({ node: n, role: p.role, name: nm, exact: false });
   }
