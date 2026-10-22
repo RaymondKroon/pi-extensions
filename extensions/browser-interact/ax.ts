@@ -361,7 +361,7 @@ export async function axPoint(s: CdpSession, role: string, name: string): Promis
   const pool = exact.length ? exact : m;
   if (!pool.length) {
     throw new AxTargetError(
-      `no ${role} named "~${name}" in the accessibility tree.\n${notFoundHint(nodes, role, name)}`,
+      `no ${role} named "${name}" (exact or substring) in the accessibility tree.\n${notFoundHint(nodes, role, name)}`,
       "not-found",
     );
   }
@@ -374,7 +374,7 @@ export async function axPoint(s: CdpSession, role: string, name: string): Promis
       })
       .join("  |  ");
     throw new AxTargetError(
-      `${pool.length} ${role}s named "~${name}" — ambiguous, pick one (or use a CSS selector / coordinates):\n  ${list}`,
+      `${pool.length} ${role}s named "${name}" — ambiguous, pick one (or use a CSS selector / coordinates):\n  ${list}`,
       "ambiguous",
     );
   }

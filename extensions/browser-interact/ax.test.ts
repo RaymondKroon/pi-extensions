@@ -268,7 +268,7 @@ describe("axPoint", () => {
       nodes: [N("1", "button", "Close", { rootId: "1", childIds: ["2"] }), N("2", "button", "Close", { parentId: "1" })],
     }));
     await expect(axPoint(s, "button", "Close")).rejects.toMatchObject({ code: "ambiguous" });
-    await expect(axPoint(s, "button", "Close")).rejects.toThrow(/2 buttons named/);
+    await expect(axPoint(s, "button", "Close")).rejects.toThrow('2 buttons named "Close" — ambiguous');
   });
 
   test("no match → AxTargetError with candidates", async () => {
@@ -277,6 +277,8 @@ describe("axPoint", () => {
     expect(err).toBeInstanceOf(AxTargetError);
     expect(err.code).toBe("not-found");
     expect(err.message).toContain('button "Go"');
+    expect(err.message).toContain('no button named "zzz" (exact or substring)');
+    expect(err.message).not.toContain("~");
   });
 
   test("missing box → scroll into view, then re-measure", async () => {
