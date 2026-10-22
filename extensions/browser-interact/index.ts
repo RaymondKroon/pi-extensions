@@ -21,6 +21,16 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CdpManager, evaluate, screenshot, type CdpSession, type CdpTarget } from "./cdp";
+import {
+  AxTargetError,
+  axCover,
+  axFind,
+  axPoint,
+  axScrollIntoView,
+  axTree,
+  formatAXTree,
+  parseTarget,
+} from "./ax";
 import { OVERLAY_SCRIPT, OVERLAY_V } from "./overlay";
 import { createOverlayChannel, type OverlayChannel } from "./overlay-channel";
 import { MAX_TOOL_ARGS, ToolCallTracker } from "./tool-update";
@@ -206,6 +216,39 @@ function keySpec(key: string): { key: string; code: string; keyCode: number; tex
 }
 
 // ------------------------------------------------------------------ tools ---
+
+/**
+ * AX target (role+name) → actionable point: box-model centre with a coverage
+ * check. "offpage"/"unresolved" (point outside the document, or node not
+ * backed by the DOM) triggers one scroll-into-view + re-resolve. Fails
+ * immediately for disabled / covered / ambiguous / no-box; AxTargetError
+ * "not-found" propagates so callers can poll while a page loads.
+ */
+async function axTargetPoint(
+  s: CdpSession,
+  role: string,
+  name: string,
+  opts: { allowDisabled?: boolean } = {},
+): Promise<{ x: number; y: number; role: string; name: string }> {
+  const pick = (p: Awaited<ReturnType<typeof axPoint>>) => {
+    if (p.props.disabled === "true" && !opts.allowDisabled) {
+      throw new Error(
+        `ax: ${role} "${name}" is disabled${p.context ? ` (${p.context})` : ""} — hover is allowed, click is not`,
+      );
+    }
+    return { x: p.x, y: p.y, role: p.match.role, name: p.match.name };
+  };
+  const p = await axPoint(s, role, name);
+  const cover = await axCover(s, p.match.node, p.x, p.y);
+  if (cover === "offpage" || cover === "unresolved") {
+    await axScrollIntoView(s, p.match.node);
+    return pick(await axPoint(s, role, name));
+  }
+  if (cover !== "self") {
+    throw new Error(`ax: ${role} "${name}" covered-by-${cover} (fix the overlay or target, don't retry blindly)`);
+  }
+  return pick(p);
+}
 
 export default function (pi: ExtensionAPI) {
   const mgr = new CdpManager();
@@ -559,6 +602,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "tab_ax",
+    label: "Tab AX",
+    description:
+      "Semantic snapshot of the page from the ACCESSIBILITY tree (what a screen reader sees): roles, computed accessible names, and states ([disabled] [focused] [checked] [expanded] [selected] [haspopup] [level:n]). Use it to orient on a page and to pick targets — take a role+name from the output (e.g. `button \"Save\"`) and pass it verbatim to tab_click / tab_hover / tab_scroll / tab_wait; no CSS selector needed, and it reaches into shadow DOM. The #n prefix is the node's number in THIS snapshot (stable until the page changes). Ignored and unnamed-generic nodes are collapsed; output is capped at 300 nodes. Pages with poor accessibility show many unnamed/generic nodes — prefer CSS selectors or coordinates (tab_screenshot + tab_hover x/y) there.",
+    promptSnippet: "Accessibility-tree snapshot of the target tab (roles, names, states)",
+    parameters: Type.Object({ tab: TAB }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const out = await run(params.tab, ctx.cwd, async (s) => {
+        return formatAXTree(await axTree(s)).text;
+      });
+      return toolResult(out);
+    },
+  });
+
+  pi.registerTool({
     name: "tab_evaluate",
     label: "Tab Evaluate",
     description:
@@ -578,17 +636,28 @@ export default function (pi: ExtensionAPI) {
     name: "tab_wait",
     label: "Tab Wait",
     description:
-      "Wait until a SYNCHRONOUS JS expression in the target tab is truthy (re-checked every 500ms). Use after any click/navigation instead of assuming the page updated. Returns {done, result, ms} or {done, error, ms}.",
-    promptSnippet: "Wait until a JS expression is truthy in the target tab",
+      "Wait until a SYNCHRONOUS JS expression in the target tab is truthy, or until a TARGET (role+name from tab_ax, e.g. `button \"Saved\"`, or a visible CSS selector) appears — re-checked every 500ms. Use after any click/navigation instead of assuming the page updated. Pass exactly one of expression / target. Returns {done, result, ms} or {done, error, ms}.",
+    promptSnippet: "Wait until a JS expression is truthy or a target appears in the target tab",
     parameters: Type.Object({
-      expression: Type.String({
-        description: "Synchronous JS expression, e.g. document.body.innerText.includes('Saved')",
-      }),
+      expression: Type.Optional(
+        Type.String({ description: "Synchronous JS expression, e.g. document.body.innerText.includes('Saved')" }),
+      ),
+      target: Type.Optional(
+        Type.String({
+          description: 'Target (role+name, e.g. `button "Saved"`, or a visible CSS selector) that should exist — alternative to expression',
+        }),
+      ),
       timeoutMs: Type.Optional(Type.Number({ description: "Max wait in ms (default 60000, max 300000)" })),
       tab: TAB,
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      const hasExpr = params.expression !== undefined;
+      const hasTarget = params.target !== undefined;
+      if (hasExpr === hasTarget) {
+        throw new Error("tab_wait: pass exactly one of expression or target");
+      }
       const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 60_000, 1000), 300_000);
+      const tgt = hasTarget ? parseTarget(String(params.target)) : undefined;
       // Poll from the extension side: each iteration is a plain
       // Runtime.evaluate (debug channel, exempt from page CSP). An in-page
       // eval() loop would be blocked by strict CSP pages (e.g. Slack).
@@ -596,8 +665,16 @@ export default function (pi: ExtensionAPI) {
         const t0 = Date.now();
         for (;;) {
           try {
-            const r = await evaluate(s, params.expression, { timeoutMs: 10_000 });
-            if (r) return { done: true, result: r, ms: Date.now() - t0 };
+            if (hasExpr) {
+              const r = await evaluate(s, String(params.expression), { timeoutMs: 10_000 });
+              if (r) return { done: true, result: r, ms: Date.now() - t0 };
+            } else if (tgt!.kind === "ax") {
+              const f = await axFind(s, tgt!.role, tgt!.name);
+              if (f) return { done: true, result: { role: f.role, name: f.name }, ms: Date.now() - t0 };
+            } else {
+              const r = await evaluate(s, `(${VISIBLE_FN})(${JSON.stringify(tgt!.value)})`, { timeoutMs: 10_000 });
+              if (r) return { done: true, result: r, ms: Date.now() - t0 };
+            }
           } catch (e: any) {
             const msg = String(e?.message ?? e);
             // A full page reload destroys the execution context — retry on
@@ -667,46 +744,72 @@ export default function (pi: ExtensionAPI) {
     name: "tab_click",
     label: "Tab Click",
     description:
-      "Click a CSS selector in the target tab: polls actionability (visible, enabled, not covered), then dispatches a TRUSTED CDP mouse sequence at the element's centre. Fails with a reason: not-found, not-visible, disabled, covered-by-<el> (fix the overlay/selector, don't retry blindly).",
-    promptSnippet: "Trusted click on a CSS selector in the target tab",
+      "Click a TARGET in the target tab: polls actionability, then dispatches a TRUSTED CDP mouse sequence at its centre. Prefer role+name (e.g. `button \"Submit\"`, `menuitem Close` — take it from tab_ax; stable, and works into shadow DOM); a CSS selector works for edge cases. Fails with a reason: not-found (retried until timeout), disabled, covered-by-<el> (fix the overlay/target, don't retry blindly), ambiguous (candidates listed with their context).",
+    promptSnippet: "Trusted click on a role+name or CSS-selector target in the target tab",
     parameters: Type.Object({
-      selector: Type.String({ description: "CSS selector of the element to click" }),
+      target: Type.String({
+        description: 'What to click: role+name (preferred, e.g. `button "Submit"` or `menuitem Close`) or a CSS selector',
+      }),
       timeoutMs: Type.Optional(Type.Number({ description: "Max wait for actionability in ms (default 10000)" })),
       tab: TAB,
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 500), 120_000);
+      const tgt = parseTarget(params.target);
+      const clickAt = async (s: CdpSession, x: number, y: number) => {
+        // mouseMoved is best-effort: on some busy pages it hangs until
+        // Chrome's internal debugger timeout; the press/release pair is
+        // what produces the click.
+        await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, 5_000).catch(() => {});
+        await s.send(
+          "Input.dispatchMouseEvent",
+          { type: "mousePressed", x, y, button: "left", clickCount: 1 },
+          10_000,
+        );
+        await s.send(
+          "Input.dispatchMouseEvent",
+          { type: "mouseReleased", x, y, button: "left", clickCount: 1 },
+          10_000,
+        );
+      };
       const result = await run(params.tab, ctx.cwd, async (s) => {
         const t0 = Date.now();
-        let last: any = null;
+        if (tgt.kind === "selector") {
+          let last: any = null;
+          for (;;) {
+            const st = await evaluate(s, `(${ACTIONABILITY})(${JSON.stringify(tgt.value)})`, {
+              timeoutMs: 10_000,
+            });
+            if (st?.ok) {
+              await clickAt(s, st.x, st.y);
+              return { ok: true, trusted: true, via: "selector", tag: st.tag, text: st.text };
+            }
+            last = st;
+            if (Date.now() - t0 > timeoutMs) {
+              throw new Error(
+                `click: selector "${tgt.value}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
+              );
+            }
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+        // Role+name path: resolve in the accessibility tree, polling only
+        // "not-found" (a page may still be loading).
+        let lastErr: Error | null = null;
         for (;;) {
-          const st = await evaluate(s, `(${ACTIONABILITY})(${JSON.stringify(params.selector)})`, {
-            timeoutMs: 10_000,
-          });
-          if (st?.ok) {
-            // mouseMoved is best-effort: on some busy pages it hangs until
-            // Chrome's internal debugger timeout; the press/release pair is
-            // what produces the click.
-            await s.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: st.x, y: st.y }, 5_000).catch(() => {});
-            await s.send(
-              "Input.dispatchMouseEvent",
-              { type: "mousePressed", x: st.x, y: st.y, button: "left", clickCount: 1 },
-              10_000,
-            );
-            await s.send(
-              "Input.dispatchMouseEvent",
-              { type: "mouseReleased", x: st.x, y: st.y, button: "left", clickCount: 1 },
-              10_000,
-            );
-            return { ok: true, trusted: true, tag: st.tag, text: st.text };
+          let pt: { x: number; y: number; role: string; name: string };
+          try {
+            pt = await axTargetPoint(s, tgt.role, tgt.name);
+          } catch (e: any) {
+            if (e instanceof AxTargetError && e.code === "not-found") lastErr = e;
+            else if (e instanceof AxTargetError) throw new Error(e.message);
+            else throw e;
+            if (Date.now() - t0 > timeoutMs) throw lastErr;
+            await new Promise((r) => setTimeout(r, 500));
+            continue;
           }
-          last = st;
-          if (Date.now() - t0 > timeoutMs) {
-            throw new Error(
-              `click: selector "${params.selector}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
-            );
-          }
-          await new Promise((r) => setTimeout(r, 500));
+          await clickAt(s, pt.x, pt.y);
+          return { ok: true, trusted: true, via: "accessibility", tag: pt.role, text: pt.name };
         }
       });
       return toolResult(text(result));
@@ -717,16 +820,20 @@ export default function (pi: ExtensionAPI) {
     name: "tab_hover",
     label: "Tab Hover",
     description:
-      "Move the mouse in the target tab: over a CSS selector (polls until visible and not covered, then a TRUSTED CDP mouseMoved to its centre) or to exact viewport COORDINATES x/y (no polling; negative coords move the mouse outside the page). Fires :hover / mouseenter / mouseover so tooltips, hover menus and previews appear; the mouse STAYS where it is, so a follow-up tab_click can click what the hover revealed. The result reports elementAt — what is actually under the cursor: hover-generated overlays (link previews, menus) can land there, and the next jump may re-hover them. To UNHOVER reliably, move to an empty spot (e.g. x:-500, y:-500) — hovering body can land on a hover overlay and keep the hover alive. Pass waitFor to also wait for a result element (e.g. a tooltip or menu item) and return its tag/text. Selector mode fails with a reason: not-found, not-visible, covered-by-<el>.",
-    promptSnippet: "Trusted hover (mouseMoved) on a CSS selector or x/y coordinates in the target tab",
+      "Move the mouse in the target tab: over a TARGET — role+name (e.g. `link \"…\"`, from tab_ax; preferred) or a CSS selector (polls until visible and not covered, then a TRUSTED CDP mouseMoved to its centre) — or to exact viewport COORDINATES x/y (no polling; negative coords move the mouse outside the page). Fires :hover / mouseenter / mouseover so tooltips, hover menus and previews appear; the mouse STAYS where it is, so a follow-up tab_click can click what the hover revealed. The result reports elementAt — what is actually under the cursor: hover-generated overlays (link previews, menus) can land there, and the next jump may re-hover them. To UNHOVER reliably, move to an empty spot (e.g. x:-500, y:-500) — hovering body can land on a hover overlay and keep the hover alive. Pass waitFor to also wait for a result target (role+name, e.g. `tooltip \"Saved\"`, or a CSS selector) and report it. Fails with a reason: not-found (retried until timeout), covered-by-<el>, ambiguous (role+name mode, candidates listed).",
+    promptSnippet: "Trusted hover (mouseMoved) on a role+name/selector target or x/y coordinates in the target tab",
     parameters: Type.Object({
-      selector: Type.Optional(Type.String({ description: "CSS selector of the element to hover (alternative to x/y)" })),
-      x: Type.Optional(Type.Number({ description: "Viewport x coordinate to move the mouse to (alternative to selector; pair with y). Negative = outside the page (unhover)." })),
-      y: Type.Optional(Type.Number({ description: "Viewport y coordinate to move the mouse to (alternative to selector; pair with x). Negative = outside the page (unhover)." })),
+      target: Type.Optional(
+        Type.String({
+          description: 'Target to hover: role+name (preferred, e.g. `link "Profile"` or `menuitem Close`) or a CSS selector (alternative to x/y)',
+        }),
+      ),
+      x: Type.Optional(Type.Number({ description: "Viewport x coordinate to move the mouse to (alternative to target; pair with y). Negative = outside the page (unhover)." })),
+      y: Type.Optional(Type.Number({ description: "Viewport y coordinate to move the mouse to (alternative to target; pair with x). Negative = outside the page (unhover)." })),
       waitFor: Type.Optional(
         Type.String({
           description:
-            "CSS selector that should APPEAR as a result of the hover (e.g. a tooltip or hover-menu item); waits for it before returning",
+            "Target that should APPEAR as a result of the hover (role+name, e.g. `tooltip \"Saved\"`, or a CSS selector); waits for it before returning",
         }),
       ),
       timeoutMs: Type.Optional(Type.Number({ description: "Max wait for actionability / waitFor in ms (default 10000)" })),
@@ -734,17 +841,18 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const byCoords = params.x !== undefined || params.y !== undefined;
-      if (byCoords === (params.selector !== undefined)) {
-        throw new Error("tab_hover: pass either a selector or BOTH x and y coordinates");
+      const tgt = params.target !== undefined ? parseTarget(params.target) : undefined;
+      if (byCoords === (tgt !== undefined)) {
+        throw new Error("tab_hover: pass either a target or BOTH x and y coordinates");
       }
       const timeoutMs = Math.min(Math.max(Number(params.timeoutMs) || 10_000, 500), 120_000);
       const result = await run(params.tab, ctx.cwd, async (s) => {
         let st: { x: number; y: number; tag?: string; text?: string };
-        if (params.selector !== undefined) {
-          const t0 = Date.now();
+        const t0 = Date.now();
+        if (tgt?.kind === "selector") {
           let last: any = null;
           for (;;) {
-            const chk = await evaluate(s, `(${HOVER_ACTIONABILITY})(${JSON.stringify(params.selector)})`, {
+            const chk = await evaluate(s, `(${HOVER_ACTIONABILITY})(${JSON.stringify(tgt.value)})`, {
               timeoutMs: 10_000,
             });
             if (chk?.ok) {
@@ -754,10 +862,27 @@ export default function (pi: ExtensionAPI) {
             last = chk;
             if (Date.now() - t0 > timeoutMs) {
               throw new Error(
-                `hover: selector "${params.selector}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
+                `hover: selector "${tgt.value}" not actionable after ${timeoutMs}ms (${last?.reason ?? "unknown"})`,
               );
             }
             await new Promise((r) => setTimeout(r, 500));
+          }
+        } else if (tgt) {
+          // Role+name via the AX tree (disabled allowed: tooltips on
+          // greyed-out controls are meaningful); polls only "not-found".
+          let lastErr: Error | null = null;
+          for (;;) {
+            try {
+              const pt = await axTargetPoint(s, tgt.role, tgt.name, { allowDisabled: true });
+              st = { x: pt.x, y: pt.y, tag: pt.role, text: pt.name };
+              break;
+            } catch (e: any) {
+              if (e instanceof AxTargetError && e.code === "not-found") lastErr = e;
+              else if (e instanceof AxTargetError) throw new Error(e.message);
+              else throw e;
+              if (Date.now() - t0 > timeoutMs) throw lastErr;
+              await new Promise((r) => setTimeout(r, 500));
+            }
           }
         } else {
           st = { x: Number(params.x), y: Number(params.y) };
@@ -774,19 +899,27 @@ export default function (pi: ExtensionAPI) {
           `(() => { const el = document.elementFromPoint(${st.x}, ${st.y}); return el ? { tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80) } : null })()`,
           { timeoutMs: 10_000 },
         );
-        let wait: { selector: string; found: boolean; tag?: string; text?: string; ms: number } | undefined;
+        let wait: { target: string; found: boolean; tag?: string; text?: string; role?: string; name?: string; ms: number } | undefined;
         if (params.waitFor) {
+          const wt = parseTarget(params.waitFor);
           const wt0 = Date.now();
           let found: any = null;
           for (;;) {
-            found = await evaluate(s, `(${VISIBLE_FN})(${JSON.stringify(params.waitFor)})`, { timeoutMs: 10_000 });
+            found =
+              wt.kind === "ax"
+                ? await axFind(s, wt.role, wt.name)
+                : await evaluate(s, `(${VISIBLE_FN})(${JSON.stringify(params.waitFor)})`, { timeoutMs: 10_000 });
             if (found || Date.now() - wt0 > timeoutMs) break;
             await new Promise((r) => setTimeout(r, 250));
           }
           wait = {
-            selector: params.waitFor,
+            target: params.waitFor,
             found: !!found,
-            ...(found ? { tag: found.tag, text: found.text } : {}),
+            ...(found
+              ? wt.kind === "ax"
+                ? { role: found.role, name: found.name }
+                : { tag: found.tag, text: found.text }
+              : {}),
             ms: Date.now() - wt0,
           };
         }
@@ -839,20 +972,29 @@ export default function (pi: ExtensionAPI) {
     name: "tab_scroll",
     label: "Tab Scroll",
     description:
-      "Scroll the target tab: by pixel offset (x, y) or scroll a CSS selector into view. Long tables need scrolling before screenshotting.",
-    promptSnippet: "Scroll the target tab (offset or selector into view)",
+      "Scroll the target tab: by pixel offset (x, y) or scroll a TARGET (role+name, e.g. `heading \"Billing\"` — from tab_ax — or a CSS selector) into view. Long tables need scrolling before screenshotting.",
+    promptSnippet: "Scroll the target tab (offset or target into view)",
     parameters: Type.Object({
       x: Type.Optional(Type.Number({ description: "Horizontal scroll offset in px" })),
       y: Type.Optional(Type.Number({ description: "Vertical scroll offset in px" })),
-      selector: Type.Optional(Type.String({ description: "CSS selector to scroll into view" })),
+      target: Type.Optional(
+        Type.String({ description: 'Target to scroll into view: role+name (e.g. `heading "Billing"`) or a CSS selector' }),
+      ),
       tab: TAB,
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      await run(params.tab, ctx.cwd, (s) =>
-        params.selector
-          ? evaluate(s, `document.querySelector(${JSON.stringify(params.selector)})?.scrollIntoView({ block: 'center' })`)
-          : evaluate(s, `window.scrollBy(${Number(params.x) || 0}, ${Number(params.y) || 0})`),
-      );
+      const tgt = params.target ? parseTarget(params.target) : undefined;
+      await run(params.tab, ctx.cwd, async (s) => {
+        if (tgt?.kind === "ax") {
+          const p = await axPoint(s, tgt.role, tgt.name);
+          const cover = await axCover(s, p.match.node, p.x, p.y);
+          if (cover === "offpage" || cover === "unresolved") await axScrollIntoView(s, p.match.node);
+        } else if (tgt) {
+          await evaluate(s, `document.querySelector(${JSON.stringify(tgt.value)})?.scrollIntoView({ block: 'center' })`);
+        } else {
+          await evaluate(s, `window.scrollBy(${Number(params.x) || 0}, ${Number(params.y) || 0})`);
+        }
+      });
       return toolResult("ok");
     },
   });

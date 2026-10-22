@@ -667,6 +667,14 @@ export class CdpManager {
     await s.send("Runtime.enable");
     await s.send("Page.enable");
     await s.send("Network.enable");
+    // DOM domain for the AX resolver (requestNode/resolveNode on backend
+    // node ids, box models). One documentUpdated event per navigation —
+    // no listeners, no state kept.
+    await s.send("DOM.enable");
+    // Accessibility tree for tab_ax snapshots and role+name targeting. Enabling
+    // the domain is what builds the tree in this tab (same as a screen reader
+    // being attached) — the overhead is small and constant.
+    await s.send("Accessibility.enable");
     this.sessions.set(key, s);
     this.lastTargetId.set(key, t.id);
     return s;
