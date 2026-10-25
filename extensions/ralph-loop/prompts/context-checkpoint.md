@@ -8,7 +8,7 @@ example_input: |
     "isGoal": false
   }
 ---
-The current Ralph {{#if isGoal}}goal {{/if}}iteration has reached its context budget. Record a checkpoint now, then stop working; a fresh iteration continues from it.
+The current Ralph {{#if isGoal}}goal {{/if}}iteration is finished. Record a checkpoint now, then stop working; a fresh iteration continues from it.
 
 {{#if isGoal}}Checkpoint the current task (if any) with a concise note: evidence so far, changed paths, known risks, approaches already tried (and why they failed), and the single exact next step.
 

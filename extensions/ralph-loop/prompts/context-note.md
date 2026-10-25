@@ -6,7 +6,7 @@ example_input: |
     "cycleNoteClause": ""
   }
 ---
-{{#if (eq reason "context-limit")~}}The previous iteration reached its context budget and finished up: the remaining work is recorded as todo entries in the backlog. Re-establish facts from the repository and TODO before continuing; do not rely on the old conversation.
+{{#if (eq reason "context-limit")~}}The previous iteration finished up: the remaining work is recorded as todo entries in the backlog. Re-establish facts from the repository and TODO before continuing; do not rely on the old conversation.
 {{~else if (eq reason "completed-task")~}}A previous TODO item was completed. Start the next independent iteration with a clean review of the repository.
 {{~else if (eq reason "plan-updated")~}}The plan was just updated with new tasks. Start the next independent iteration with a clean review of the repository and the updated plan.
 {{~else if (eq reason "phase-changed")~}}The goal phase changed. Start the next independent iteration with a clean review of the repository and the backlog.

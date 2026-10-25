@@ -913,7 +913,7 @@ describe('ralph-loop extension', () => {
 		expect(status).toContain('iteration 2/10');
 		// A context boundary was recorded and a fresh iteration prompt sent.
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
-		expect(fake.userMessages.at(-1)?.text).toContain('context budget');
+		expect(fake.userMessages.at(-1)?.text).toContain('The previous iteration finished up:');
 	});
 
 	test('completed-task cycle increments the iteration and resets the per-task counter', async () => {
@@ -2934,7 +2934,7 @@ D 2
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
 		const prompt = fake.userMessages.at(-1)!.text;
-		expect(prompt).toContain('context budget');
+		expect(prompt).toContain('The current Ralph goal iteration is finished.');
 		expect(prompt).toContain('Checkpoint the current task');
 		// No tool is named: the model picks ralph_goal / ralph_todo itself.
 		expect(prompt).not.toContain('ralph_todo');
@@ -4922,7 +4922,7 @@ GB
 		// A context boundary was recorded and the fresh auto iteration prompt sent.
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
-		expect(fake.userMessages.at(-1)?.text).toContain('context budget');
+		expect(fake.userMessages.at(-1)?.text).toContain('The previous iteration finished up:');
 		// The auto iteration commits every completed task locally (never pushes).
 		expect(fake.userMessages.at(-1)?.text).toContain('Commit the completed task locally');
 		expect(fake.userMessages.at(-1)?.text).toContain('Do not push');

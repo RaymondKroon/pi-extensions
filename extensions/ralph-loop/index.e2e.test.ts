@@ -415,7 +415,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// model's context.
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
 			const freshRequest = endpoint!.requests[2]!;
-			expect(requestText(freshRequest)).toContain('context budget');
+			expect(requestText(freshRequest)).toContain('The previous iteration finished up:');
 			expect(requestText(freshRequest)).not.toContain(BLOB_MARKER);
 
 			// The boundary marker is recorded in the session itself.
