@@ -913,7 +913,8 @@ describe('ralph-loop extension', () => {
 		expect(status).toContain('iteration 2/10');
 		// A context boundary was recorded and a fresh iteration prompt sent.
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
-		expect(fake.userMessages.at(-1)?.text).toContain('The previous iteration finished up:');
+		// Initial work, finish-up, and fresh work each get one instruction.
+		expect(fake.userMessages).toHaveLength(3);
 	});
 
 	test('completed-task cycle increments the iteration and resets the per-task counter', async () => {
@@ -2934,10 +2935,19 @@ D 2
 		await fake.fire('agent_settled', fakeCtx.ctx);
 
 		const prompt = fake.userMessages.at(-1)!.text;
-		expect(prompt).toContain('The current Ralph goal iteration is finished.');
+		expect(fake.userMessages).toHaveLength(2);
+		expect(statusLine(fakeCtx.widgets)).toContain('checkpointing');
+		expect(fake.entries.filter((entry) => entry.customType === 'ralph-loop-state').at(-1)!.data).toMatchObject({ mode: 'goal', iteration: 1 });
 		expect(prompt).toContain('Checkpoint the current task');
 		// No tool is named: the model picks ralph_goal / ralph_todo itself.
 		expect(prompt).not.toContain('ralph_todo');
+
+		// Settling the checkpoint advances to a fresh goal iteration.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fake.userMessages).toHaveLength(3);
+		expect(fake.entries.filter((entry) => entry.customType === 'ralph-loop-state').at(-1)!.data).toMatchObject({ mode: 'goal', iteration: 2 });
+		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 	});
 
 	test('goal execution iterations finish up at the context budget', async () => {
@@ -4922,7 +4932,8 @@ GB
 		// A context boundary was recorded and the fresh auto iteration prompt sent.
 		expect(fake.customMessages.some((m) => m.message.customType === 'ralph-loop-context-boundary')).toBe(true);
 		expect(fake.userMessages.at(-1)?.text).toContain('Run the Ralph auto loop');
-		expect(fake.userMessages.at(-1)?.text).toContain('The previous iteration finished up:');
+		expect(fake.userMessages).toHaveLength(3);
+		expect(stateEntries(fake).at(-1)!.data).toMatchObject({ mode: 'auto', iteration: 2 });
 		// The auto iteration commits every completed task locally (never pushes).
 		expect(fake.userMessages.at(-1)?.text).toContain('Commit the completed task locally');
 		expect(fake.userMessages.at(-1)?.text).toContain('Do not push');

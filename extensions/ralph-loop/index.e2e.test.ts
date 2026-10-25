@@ -415,8 +415,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			// model's context.
 			await waitFor(() => endpoint!.requests.length >= 3, 30000);
 			const freshRequest = endpoint!.requests[2]!;
-			expect(requestText(freshRequest)).toContain('The previous iteration finished up:');
+			// A fresh request retains the system prompt and gets a single new
+			// instruction, not either of the previous turns or their responses.
+			expect(freshRequest.body.messages?.map((message) => message.role)).toEqual(['system', 'user']);
 			expect(requestText(freshRequest)).not.toContain(BLOB_MARKER);
+			expect(requestText(freshRequest)).not.toContain('Finished up; todos recorded.');
 
 			// The boundary marker is recorded in the session itself.
 			await waitFor(

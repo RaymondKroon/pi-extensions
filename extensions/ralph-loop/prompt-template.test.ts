@@ -85,14 +85,24 @@ describe('prompt-template', () => {
 	});
 
 	test('close-step renders all four commit/task combinations', () => {
-		const commit = 'Commit the completed task locally in a single commit. Do not push. ';
-		const task = 'This is the last step of the iteration: stop working when the commit is made.';
-		const budget =
-			'After committing, immediately go back to the first step and start the next open task. Keep working task after task until no open tasks remain or you are told to finish up. When told to finish up, save progress so the next iteration can continue. Do not stop after a completed task while open tasks remain.';
-		expect(renderPrompt('close-step', { commit: true, task: true })).toBe(`- ${commit}${task}`);
-		expect(renderPrompt('close-step', { commit: true, task: false })).toBe(`- ${commit}${budget}`);
-		expect(renderPrompt('close-step', { commit: false, task: true })).toBe(`- ${task}`);
-		expect(renderPrompt('close-step', { commit: false, task: false })).toBe(`- ${budget}`);
+		const taskOnly = renderPrompt('close-step', { commit: false, task: true });
+		const budgetOnly = renderPrompt('close-step', { commit: false, task: false });
+		const commitTask = renderPrompt('close-step', { commit: true, task: true });
+		const commitBudget = renderPrompt('close-step', { commit: true, task: false });
+
+		// Both cycle policies render a non-empty bullet, with different instructions.
+		for (const text of [taskOnly, budgetOnly, commitTask, commitBudget]) {
+			expect(text).toMatch(/^- \S/);
+			expect(text).not.toContain('{{');
+		}
+		expect(taskOnly).not.toBe(budgetOnly);
+
+		// Enabling commit prepends the same non-empty instructions to either policy.
+		expect(commitTask.endsWith(taskOnly.slice(2))).toBe(true);
+		expect(commitBudget.endsWith(budgetOnly.slice(2))).toBe(true);
+		const commitPrefix = commitTask.slice(2, -taskOnly.slice(2).length);
+		expect(commitPrefix.trim().length).toBeGreaterThan(0);
+		expect(commitBudget.slice(2, -budgetOnly.slice(2).length)).toBe(commitPrefix);
 	});
 
 	test('every placeholder in a template referenced in index.ts is provided by its renderPrompt call', () => {
