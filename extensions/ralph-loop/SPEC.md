@@ -496,17 +496,15 @@ as a read-only archive that the model can consult.
   duplicate schedules are no-ops.
 - **Manual, immediate**: `/ralph rollover --now` (active loop + idle) performs
   the switch right away.
-- **Opt-in slowness trigger** (`/ralph config` → "Auto session rollover",
+- **Opt-in heaviness trigger** (`/ralph config` → "Auto session rollover",
   **off by default**): the session's health is measured by
-  `measureSessionHealth` — the timed `getBranch()` walk of the active branch
-  ("render time": the very work the TUI re-does on every render and resume,
-  sampled at every turn settle so the cost stays off the render path), the
-  session file size, and the branch message count. The render time is judged
-  on a HIGH-WATER MARK (`walkMsMax`, ratcheted at every settle and by
-  `/ralph status`) rather than a single sample — the session is not slow all
-  the time. At each cycle boundary, `probeSessionHealth` rolls the loop over
-  when any limit is met or exceeded (`walkMs`, `maxMB`, `maxMessages`; defaults
-  500ms / 50MB / 3000). The manual command works regardless of the setting.
+  `measureSessionHealth` — the session file size and the branch message
+  count. (A render-time limit was deliberately dropped: the timed
+  `getBranch()` walk measures the JS runtime's enumeration cost, not the TUI
+  render cost, so a fixed millisecond limit is not portable across
+  hardware.) At each cycle boundary, `probeSessionHealth` rolls the loop
+  over when any limit is met or exceeded (`maxMB`, `maxMessages`; defaults
+  50MB / 3000). The manual command works regardless of the setting.
 - The automatic/scheduled triggers dispatch the switch as
   `pi.sendUserMessage('/ralph rollover --now', { expandPromptTemplates: true })`
   — session control (`ctx.newSession`) is command-context-only, and pi
@@ -554,13 +552,11 @@ boundary dispatch):
 ## 5. Surface changes
 
 - `RalphState`: `+ rolloverRequested?: boolean`, `+ continuedFrom?:
-  { sessionId, sessionPath, iteration }`, `+ walkMsMax?: number` (validated;
-  ride `normalizeState`'s rest-spread). `walkMsMax` is the render-time
-  high-water mark — NOT carried over a rollover (the new session is measured
-  from scratch).
-- `RalphConfig`: `+ rollover: { enabled, walkMs, maxMB, maxMessages }`
+  { sessionId, sessionPath, iteration }` (validated; ride `normalizeState`
+  's rest-spread).
+- `RalphConfig`: `+ rollover: { enabled, maxMB, maxMessages }`
   (opt-in, `enabled` defaults false; `migrateRollover` fills older stored
-  configs); config GUI gains four rows.
+  configs); config GUI gains three rows.
 - `/ralph` completions + `knownCommands`: `+ rollover`.
 - `prompts/iteration.md`: `{{#if continuation}}` clause after the opening
   sentence.
@@ -574,11 +570,10 @@ boundary dispatch):
   session <id> (iteration <N> carried over)`.
 - Rollover-limit progress: every loop-active `/ralph status` notification
   (running, paused, blocked, cycle-boundary, and stop-pending states) appends
-  `· session: render <max>ms/<walkMs>ms · file <x.x>MB/<maxMB>MB · messages
-  <n>/<maxMessages> (auto rollover disabled)` — the `(auto rollover disabled)`
+  `· session: file <x.x>MB/<maxMB>MB · messages <n>/<maxMessages>
+  (auto rollover disabled)` — the `(auto rollover disabled)`
   note appears only when the automatic trigger is off, making explicit that a
-  manual `/ralph rollover` always works. `render` is the high-water mark
-  (`walkMsMax`), not the current sample; file size and message count are the
+  manual `/ralph rollover` always works. File size and message count are the
   current measurements (`measureSessionHealth`). Stopped loops show no
   segment (there is no loop to roll over).
 

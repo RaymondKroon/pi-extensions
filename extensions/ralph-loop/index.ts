@@ -117,8 +117,8 @@ function cycleOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): Cycle
 }
 /**
  * Session rollover (opt-in). When a cycle boundary is reached and the session
- * is slowing the UI down (measured branch-walk time, or the session-file /
- * message-count limits), or a manual `/ralph rollover` is scheduled, the loop
+ * is heavy (the session-file / message-count limits), or a manual
+ * `/ralph rollover` is scheduled, the loop
  * moves to a NEW pi session instead of a same-session context cut: the
  * backlog file is copied over (the old file recorded as a source), the loop
  * state (iteration count against maxIterations, category, pending decision)
@@ -126,24 +126,20 @@ function cycleOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): Cycle
  * the new session. The old session stays as a read-only archive.
  */
 interface RolloverConfig {
-	/** Master switch for the AUTOMATIC (slowness) trigger: when false, only a manual /ralph rollover rolls the session over — the manual command always works. */
+	/** Master switch for the AUTOMATIC (heaviness) trigger: when false, only a manual /ralph rollover rolls the session over — the manual command always works. */
 	enabled: boolean;
-	/** Roll over when the measured render time — the branch walk the TUI re-does on every render and resume, sampled at every turn and judged on the worst (high-water) value — takes at least this long (ms). */
-	walkMs: number;
 	/** Roll over when the session file is at least this large (MB). */
 	maxMB: number;
 	/** Roll over when the active branch has at least this many messages. */
 	maxMessages: number;
 }
-const DEFAULT_ROLLOVER: RolloverConfig = { enabled: false, walkMs: 500, maxMB: 50, maxMessages: 3000 };
+const DEFAULT_ROLLOVER: RolloverConfig = { enabled: false, maxMB: 50, maxMessages: 3000 };
 
 function isRolloverConfig(value: unknown): value is RolloverConfig {
 	if (!value || typeof value !== 'object') return false;
 	const v = value as Partial<RolloverConfig>;
 	return (
 		typeof v.enabled === 'boolean' &&
-		typeof v.walkMs === 'number' &&
-		v.walkMs >= 1 &&
 		typeof v.maxMB === 'number' &&
 		v.maxMB >= 1 &&
 		typeof v.maxMessages === 'number' &&
@@ -157,30 +153,24 @@ function migrateRollover(value: unknown): RolloverConfig {
 	const v = (value ?? {}) as Partial<RolloverConfig>;
 	return {
 		enabled: typeof v.enabled === 'boolean' ? v.enabled : DEFAULT_ROLLOVER.enabled,
-		walkMs: typeof v.walkMs === 'number' && v.walkMs >= 1 ? v.walkMs : DEFAULT_ROLLOVER.walkMs,
 		maxMB: typeof v.maxMB === 'number' && v.maxMB >= 1 ? v.maxMB : DEFAULT_ROLLOVER.maxMB,
 		maxMessages: typeof v.maxMessages === 'number' && v.maxMessages >= 10 ? v.maxMessages : DEFAULT_ROLLOVER.maxMessages
 	};
 }
 
 interface SessionHealth {
-	/** Render time: the cost to walk the active branch — the very work the TUI re-does on every render and resume. */
-	walkMs: number;
 	sizeMB: number;
 	messages: number;
 }
 /**
- * Measure how heavy a session's transcript is — the cost pi's TUI pays on
- * every render and resume: the active-branch walk (timed: the very work the
- * UI re-does), the session file size, and the message count.
+ * Measure how heavy a session's transcript is — the signals the UI render
+ * cost tracks: the session file size (the transcript only ever grows) and the
+ * branch message count.
  */
 function measureSessionHealth(ctx: ExtensionContext): SessionHealth {
 	let messages = 0;
-	let walkMs = 0;
 	try {
-		const start = performance.now();
 		for (const entry of ctx.sessionManager.getBranch()) if (entry.type === 'message') messages += 1;
-		walkMs = performance.now() - start;
 	} catch {
 		// Unreadable session (in-memory test context): rely on the file signals.
 	}
@@ -190,13 +180,11 @@ function measureSessionHealth(ctx: ExtensionContext): SessionHealth {
 	} catch {
 		// In-memory session: no file to measure.
 	}
-	return { walkMs, sizeMB, messages };
+	return { sizeMB, messages };
 }
-/** Compare a session's health against the rollover limits. The render time is judged on the high-water mark (worst sample so far), not the current one — the session is not slow all the time. Returns a reason string when any limit is met or exceeded. */
-function probeSessionHealth(health: SessionHealth, walkMsMax: number, rollover: RolloverConfig): { reason?: string } {
+/** Compare a session's health against the rollover limits. Returns a reason string when any limit is met or exceeded. */
+function probeSessionHealth(health: SessionHealth, rollover: RolloverConfig): { reason?: string } {
 	const reasons: string[] = [];
-	const renderMs = Math.max(health.walkMs, walkMsMax);
-	if (renderMs >= rollover.walkMs) reasons.push(`render time ${Math.round(renderMs)}ms (limit ${rollover.walkMs}ms)`);
 	if (health.sizeMB >= rollover.maxMB) reasons.push(`session file ${health.sizeMB.toFixed(0)}MB (limit ${rollover.maxMB}MB)`);
 	if (health.messages >= rollover.maxMessages) reasons.push(`${health.messages} messages (limit ${rollover.maxMessages})`);
 	return { reason: reasons.length > 0 ? reasons.join('; ') : undefined };
@@ -334,14 +322,6 @@ interface RalphState {
 	checkpointHandoff?: boolean;
 	/** The next cycle boundary rolls the loop over to a new pi session instead of a same-session context cut (set by /ralph rollover; cleared by the rollover or --cancel). */
 	rolloverRequested?: boolean;
-	/**
-	 * High-water mark of the measured render time (the branch walk the TUI
-	 * re-does on every render and resume), in ms. Ratcheted at every turn
-	 * settle and by /ralph status; reset by a rollover (the new session is
-	 * measured from scratch). The rollover probe and /ralph status decide on
-	 * the mark, not a single sample — the session is not slow all the time.
-	 */
-	walkMsMax?: number;
 	/** Lineage: the session this loop was rolled over from (set by the rollover). */
 	continuedFrom?: ContinuedFrom;
 }
@@ -457,7 +437,6 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.blocked === undefined || typeof state.blocked === 'boolean') &&
 		(state.blockedItem === undefined || typeof state.blockedItem === 'string') &&
 		(state.rolloverRequested === undefined || typeof state.rolloverRequested === 'boolean') &&
-		(state.walkMsMax === undefined || (typeof state.walkMsMax === 'number' && state.walkMsMax >= 0)) &&
 		(state.continuedFrom === undefined || isContinuedFrom(state.continuedFrom)) &&
 		(state.category === undefined || typeof state.category === 'string') &&
 			(state.completedTasks === undefined ||
@@ -3034,7 +3013,7 @@ export default function (pi: ExtensionAPI) {
 				// request flag stays set: the command clears it on success, and a
 				// failed dispatch retries at the next boundary.
 				const slowness = config.rollover.enabled
-					? probeSessionHealth(measureSessionHealth(ctx), state.walkMsMax ?? 0, config.rollover)
+					? probeSessionHealth(measureSessionHealth(ctx), config.rollover)
 					: { reason: undefined };
 				if (state.rolloverRequested || slowness.reason !== undefined) {
 					ctx.ui.notify(
@@ -3217,13 +3196,10 @@ export default function (pi: ExtensionAPI) {
 				// The carried state: the new session's ralph file plus the
 				// continuedFrom lineage. Written before the new instance's
 				// session_start runs, so its branch scan restores exactly this
-				// state (the loop keeps running in the new session). walkMsMax
-				// is NOT carried: the new session's render time is measured from
-				// scratch.
+				// state (the loop keeps running in the new session).
 				sm.appendCustomEntry(STATE_TYPE, {
 					...next,
 					todoPath: dest,
-					walkMsMax: undefined,
 					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration }
 				});
 				return Promise.resolve();
@@ -4071,16 +4047,6 @@ export default function (pi: ExtensionAPI) {
 		// A paused loop stays paused: settles must not queue cycles or fresh
 		// iterations (a typed message resumes the loop before its turn runs).
 		if (state.paused) return;
-		// Render-time high-water mark: sample the branch-walk cost at every
-		// settle — the TUI re-does that walk on every render, so one extra per
-		// turn is negligible. The mark (worst sample so far), not a single
-		// sample, is what /ralph status shows and what the rollover probe
-		// decides on: the session is not slow all the time. It rides the next
-		// state write; after a reload the next settle re-records it.
-		{
-			const { walkMs } = measureSessionHealth(ctx);
-			if (walkMs > (state.walkMsMax ?? 0)) state = { ...state, walkMsMax: walkMs };
-		}
 		if (userAborted) {
 			if (loopPoliceAbort) {
 				// loop-police truncated a looping stream and aborted the run
@@ -4431,15 +4397,13 @@ export default function (pi: ExtensionAPI) {
 									? { ...cfg, cycleOn: { ...cfg.cycleOn, goal: value as CycleOnPolicy } }
 						: id === 'cycleOnAuto'
 							? { ...cfg, cycleOn: { ...cfg.cycleOn, auto: value as CycleOnPolicy } }
-							: id === 'rolloverEnabled'
-								? { ...cfg, rollover: { ...cfg.rollover, enabled: value === 'enabled' } }
-								: id === 'rolloverWalkMs'
-									? { ...cfg, rollover: { ...cfg.rollover, walkMs: Number.parseInt(value, 10) } }
-									: id === 'rolloverMaxMB'
-										? { ...cfg, rollover: { ...cfg.rollover, maxMB: Number.parseInt(value, 10) } }
-										: id === 'rolloverMaxMessages'
-											? { ...cfg, rollover: { ...cfg.rollover, maxMessages: Number.parseInt(value, 10) } }
-										: { ...cfg, autoApproveDecisions: value === 'enabled' };
+				: id === 'rolloverEnabled'
+						? { ...cfg, rollover: { ...cfg.rollover, enabled: value === 'enabled' } }
+						: id === 'rolloverMaxMB'
+							? { ...cfg, rollover: { ...cfg.rollover, maxMB: Number.parseInt(value, 10) } }
+							: id === 'rolloverMaxMessages'
+								? { ...cfg, rollover: { ...cfg.rollover, maxMessages: Number.parseInt(value, 10) } }
+								: { ...cfg, autoApproveDecisions: value === 'enabled' };
 		const savedDescription = (id: string, next: RalphConfig): string =>
 			id === 'contextThreshold'
 				? contextThresholdLabel(contextThresholdFor(next, ctx))
@@ -4455,15 +4419,13 @@ export default function (pi: ExtensionAPI) {
 						? `cycle (goal loop) ${next.cycleOn.goal}`
 					: id === 'cycleOnAuto'
 						? `cycle (auto loop) ${next.cycleOn.auto}`
-						: id === 'rolloverEnabled'
+					: id === 'rolloverEnabled'
 							? `auto session rollover ${next.rollover.enabled ? 'enabled' : 'disabled'}`
-							: id === 'rolloverWalkMs'
-								? `rollover render time limit ${next.rollover.walkMs}ms`
-								: id === 'rolloverMaxMB'
-									? `rollover file limit ${next.rollover.maxMB}MB`
-									: id === 'rolloverMaxMessages'
-										? `rollover message limit ${next.rollover.maxMessages}`
-										: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
+							: id === 'rolloverMaxMB'
+								? `rollover file limit ${next.rollover.maxMB}MB`
+								: id === 'rolloverMaxMessages'
+									? `rollover message limit ${next.rollover.maxMessages}`
+									: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
 
 		const items: SettingItem[] = [
 			{
@@ -4568,27 +4530,6 @@ export default function (pi: ExtensionAPI) {
 					'Automatic trigger: at a cycle boundary, roll the loop over to a new pi session when the session is slowing down the UI (the session file only ever grows, and the TUI re-does the whole transcript on every render and resume): the backlog and the loop state (iteration count against maxIterations, category, pending decision) move to the new session, and the old session stays as a read-only archive. Disabling this only turns off the automatic trigger — a manual /ralph rollover always works. /ralph status shows the progress on each limit either way.',
 				currentValue: config.rollover.enabled ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
-			},
-			{
-				id: 'rolloverWalkMs',
-				label: 'Rollover: render time limit (ms)',
-				description:
-					'Roll over when the measured render time — the branch walk the TUI re-does on every render and resume, sampled at every turn and judged on the worst (high-water) value — takes at least this long. Requires auto session rollover enabled.',
-				currentValue: String(config.rollover.walkMs),
-				submenu: (currentValue, done) =>
-					numericSettingSubmenu(
-						'Rollover render time limit (positive whole number, ms)',
-						currentValue,
-						(value) => {
-							const limit = Number(value.trim());
-							if (!Number.isFinite(limit) || limit < 1) {
-								ctx.ui.notify('The walk limit must be a positive whole number of milliseconds.', 'error');
-								return undefined;
-							}
-							return String(Math.round(limit));
-						},
-						done
-					)
 			},
 			{
 				id: 'rolloverMaxMB',
@@ -4966,18 +4907,12 @@ export default function (pi: ExtensionAPI) {
 			if (command === 'status') {
 				const loopName =
 					state?.mode === 'goal' ? 'Ralph goal loop' : state?.mode === 'auto' ? 'Ralph auto loop' : 'Ralph loop';
-				// The session's rollover-limit progress: the render time is the
-				// high-water mark (worst measured branch walk so far — a single
-				// sample is noise), sampled at every turn settle and here. The
-				// "auto rollover disabled" note makes explicit that the limits
-				// only trip the automatic trigger — a manual /ralph rollover
-				// always works.
-				const health = measureSessionHealth(ctx);
-				if (state?.enabled && health.walkMs > (state.walkMsMax ?? 0)) {
-					persistState({ ...state, walkMsMax: health.walkMs });
-				}
-				const renderMs = state?.enabled ? state.walkMsMax ?? health.walkMs : health.walkMs;
-				const healthSegment = ` · session: render ${Math.round(renderMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}${config.rollover.enabled ? '' : ' (auto rollover disabled)'}`;
+			// The session's rollover-limit progress: the current measurements
+			// (`measureSessionHealth`). The "auto rollover disabled" note makes
+			// explicit that the limits only trip the automatic trigger — a manual
+			// /ralph rollover always works.
+			const health = measureSessionHealth(ctx);
+			const healthSegment = ` · session: file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}${config.rollover.enabled ? '' : ' (auto rollover disabled)'}`;
 				ctx.ui.notify(
 					(!state?.enabled
 					? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`
