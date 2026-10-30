@@ -482,6 +482,13 @@ as a read-only archive that the model can consult.
   inputs, not history). New field `continuedFrom: { sessionId, sessionPath,
   iteration }` records the lineage; the fresh iteration's prompt renders a
   continuation clause naming the old session id and transcript path.
+- **Model selection**: the old session's model and thinking (reasoning)
+  level are captured before the switch, recorded on the new session's branch
+  as `model_change` / `thinking_level_change` entries (in `setup`), and
+  applied to the live runtime by the new instance's `session_start` (the
+  host re-issues it after `setup`, before the fresh iteration's first turn)
+  — a fresh session otherwise resolves its model from the configured
+  defaults.
 - **Config**: per-directory/global settings already travel (same directory,
   global store); the session file's settings win in the new session as usual.
 - **Audit**: the loop is *handed off, not stopped*: the old session's last
@@ -529,7 +536,10 @@ boundary dispatch):
    - `setup(sm)`: copy the old `.db` to `<new session id>.db`, `addSource` +
      save (the new session simply has its backlog file), then append the
      carried `STATE_TYPE` entry via `sm.appendCustomEntry` — on the NEW
-     session's SessionManager. This must happen here, not in `withSession`: the
+     session's SessionManager — and record the old session's model selection
+     (`sm.appendModelChange` / `sm.appendThinkingLevelChange`) so a later
+     resume of the new session restores it natively. This must happen here,
+     not in `withSession`: the
      moment the session is replaced the old extension instance's `pi` facade
      goes stale (the runtime tears the old runtime down — any `pi.appendEntry` /
      `pi.sendUserMessage` from the old instance throws "stale after session
@@ -554,6 +564,18 @@ boundary dispatch):
 - `RalphState`: `+ rolloverRequested?: boolean`, `+ continuedFrom?:
   { sessionId, sessionPath, iteration }` (validated; ride `normalizeState`
   's rest-spread).
+- Model/reasoning-level preservation: a fresh session resolves its model and
+  thinking level from the configured defaults (an empty session has nothing
+  to restore from), so `rolloverNow` captures `ctx.model` /
+  `ctx.thinkingLevel` before the switch, `setup` records them on the new
+  branch, and `session_start` applies them to the live runtime
+  (`restoreContinuedSelection`, only when the restored state has
+  `continuedFrom`): the branch's latest `model_change` / `thinking_level_change` entries are
+  compared with the live selection, and `pi.setModel` (resolved via
+  `ctx.modelRegistry.find`) / `pi.setThinkingLevel` apply the difference —
+  unavailable models and missing auth are reported as warnings, not fatal.
+  A later resume is a no-op: the session then has messages, so pi restores
+  the selection from the branch itself and the live model already matches.
 - `RalphConfig`: `+ rollover: { enabled, maxMB, maxMessages }`
   (opt-in, `enabled` defaults false; `migrateRollover` fills older stored
   configs); config GUI gains three rows.

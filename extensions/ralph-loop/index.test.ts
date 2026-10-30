@@ -56,6 +56,8 @@ function createFakePi() {
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
 	const userMessages: FakeUserMessage[] = [];
 	const customMessages: FakeCustomMessage[] = [];
+	const setModelCalls: Array<{ provider: string; id: string }> = [];
+	const setThinkingLevelCalls: string[] = [];
 	// Mirrors pi: registered tools are active by default.
 	const activeTools: string[] = ['read', 'bash', 'edit', 'write'];
 
@@ -98,6 +100,13 @@ function createFakePi() {
 		setActiveTools: (names: string[]) => {
 			activeTools.length = 0;
 			activeTools.push(...names);
+		},
+		setModel: (model: { provider: string; id: string }) => {
+			setModelCalls.push(model);
+			return Promise.resolve(true);
+		},
+		setThinkingLevel: (level: string) => {
+			setThinkingLevelCalls.push(level);
 		}
 	};
 
@@ -109,6 +118,10 @@ function createFakePi() {
 		userMessages,
 		customMessages,
 		activeTools,
+		/** pi.setModel calls, in order. */
+		setModelCalls,
+		/** pi.setThinkingLevel calls, in order. */
+		setThinkingLevelCalls,
 		fire: async (name: string, ctx: unknown, event: unknown = {}) => {
 			let last: unknown;
 			for (const handler of handlers.get(name) ?? []) {
@@ -128,6 +141,10 @@ interface FakeCtx {
 	ctx: {
 		cwd: string;
 		model: { provider: string; id: string; contextWindow: number };
+		/** Current thinking level (the live runtime's selection). */
+		thinkingLevel: string | undefined;
+		/** Model registry lookup for restoring a recorded selection. */
+		modelRegistry: { find: (provider: string, modelId: string) => unknown };
 		mode: string;
 		isIdle: () => boolean;
 		getContextUsage: () => { percent: number; tokens: number };
@@ -141,7 +158,13 @@ interface FakeCtx {
 		};
 		newSession: (options?: {
 			parentSession?: string;
-			setup?: (sessionManager: { getSessionId: () => string; getSessionFile: () => string; appendCustomEntry: (customType: string, data: unknown) => string }) => Promise<void>;
+			setup?: (sessionManager: {
+				getSessionId: () => string;
+				getSessionFile: () => string;
+				appendCustomEntry: (customType: string, data: unknown) => string;
+				appendModelChange: (provider: string, modelId: string) => string;
+				appendThinkingLevelChange: (thinkingLevel: string) => string;
+			}) => Promise<void>;
 			withSession?: (ctx: {
 				ui: {
 					notify: (message: string, type?: string) => void;
@@ -237,6 +260,13 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const ctx = {
 		cwd,
 		model: { provider: 'test', id: 'test-model', contextWindow: 200_000 },
+		// The live session's model selection (the new session's runtime
+		// starts on the configured defaults — tests reassign it to simulate
+		// a post-rollover runtime).
+		thinkingLevel: 'high',
+		modelRegistry: {
+			find: (provider: string, modelId: string) => ({ provider, id: modelId, contextWindow: 100_000 })
+		},
 		mode: 'tui',
 		isIdle: () => idle.value,
 		// Like pi's ExtensionContext.abort: abort the current run.
@@ -294,6 +324,14 @@ function createFakeCtx(cwd: string): FakeCtx {
 				// the branch the extension scans (like the real SessionManager).
 				appendCustomEntry: (customType: string, data: unknown) => {
 					branchEntries.push({ type: 'custom', customType, data });
+					return `entry-${branchEntries.length}`;
+				},
+				appendModelChange: (provider: string, modelId: string) => {
+					branchEntries.push({ type: 'model_change', provider, modelId });
+					return `entry-${branchEntries.length}`;
+				},
+				appendThinkingLevelChange: (thinkingLevel: string) => {
+					branchEntries.push({ type: 'thinking_level_change', thinkingLevel });
 					return `entry-${branchEntries.length}`;
 				}
 			};
@@ -2188,6 +2226,41 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			expect(fakeCtx.notifications.some((n) => n.message.includes('slowing down the UI'))).toBe(true);
 			const dispatch = fake.userMessages.at(-1);
 			expect(dispatch?.text).toBe('/ralph rollover --now');
+		});
+
+		test('the rollover preserves the session’s model and thinking level', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+			await runRollover(fake, fakeCtx, '--now');
+
+			// The old session's selection is recorded on the new session's
+			// branch (setup), so a later resume of the new session restores it
+			// natively.
+			const recorded = fakeCtx.branchEntries.filter(
+				(e) => (e as { type?: string }).type !== 'custom'
+			) as Array<Record<string, unknown>>;
+			expect(recorded).toContainEqual({ type: 'model_change', provider: 'test', modelId: 'test-model' });
+			expect(recorded).toContainEqual({ type: 'thinking_level_change', thinkingLevel: 'high' });
+
+			// The new instance's session_start (re-issued by the host after
+			// setup) applies the selection to the live runtime: the new session
+			// starts on the configured defaults, not the old session's choice.
+			fakeCtx.ctx.model = { provider: 'default', id: 'default-model', contextWindow: 100_000 };
+			fakeCtx.ctx.thinkingLevel = 'medium';
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'new' });
+			expect(fake.setModelCalls).toEqual([{ provider: 'test', id: 'test-model', contextWindow: 100_000 }]);
+			expect(fake.setThinkingLevelCalls).toEqual(['high']);
+
+			// A resume that already carries the selection (pi restores it from
+			// the branch once the session has messages) is a no-op.
+			fakeCtx.ctx.model = { provider: 'test', id: 'test-model', contextWindow: 200_000 };
+			fakeCtx.ctx.thinkingLevel = 'high';
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'resume' });
+			expect(fake.setModelCalls).toHaveLength(1);
+			expect(fake.setThinkingLevelCalls).toHaveLength(1);
 		});
 
 		test('a stored state with rollover fields restores (validation)', async () => {
