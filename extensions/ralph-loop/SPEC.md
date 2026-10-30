@@ -566,16 +566,21 @@ boundary dispatch):
   's rest-spread).
 - Model/reasoning-level preservation: a fresh session resolves its model and
   thinking level from the configured defaults (an empty session has nothing
-  to restore from), so `rolloverNow` captures `ctx.model` /
-  `ctx.thinkingLevel` before the switch, `setup` records them on the new
-  branch, and `session_start` applies them to the live runtime
-  (`restoreContinuedSelection`, only when the restored state has
-  `continuedFrom`): the branch's latest `model_change` / `thinking_level_change` entries are
-  compared with the live selection, and `pi.setModel` (resolved via
-  `ctx.modelRegistry.find`) / `pi.setThinkingLevel` apply the difference —
-  unavailable models and missing auth are reported as warnings, not fatal.
-  A later resume is a no-op: the session then has messages, so pi restores
-  the selection from the branch itself and the live model already matches.
+  to restore from), and other extensions' `session_start` handlers may move
+  the live model further (and append their own `model_change` entries to the
+  branch — live regression: a model-syncing extension re-applied its default
+  before the rollover restore ran). So the selection is captured by
+  `rolloverNow` (`ctx.model` / `ctx.thinkingLevel`) and carried in the loop
+  state as `carriedSelection: { provider, modelId, thinkingLevel? }` (never
+  re-derived from the branch). `session_start` applies it to the live
+  runtime (`restoreContinuedSelection`): only on reason `"new"` (the host
+  re-issues session_start after the rollover's setup; a later resume restores
+  the selection from the branch itself and must not clobber a user model
+  change made since) and only when the restored state has `continuedFrom` —
+  the carried `provider`/`modelId` are compared with the live selection, and
+  `pi.setModel` (resolved via `ctx.modelRegistry.find`) /
+  `pi.setThinkingLevel` apply the difference. Unavailable models and missing
+  auth are reported as warnings, not fatal.
 - `RalphConfig`: `+ rollover: { enabled, maxMB, maxMessages }`
   (opt-in, `enabled` defaults false; `migrateRollover` fills older stored
   configs); config GUI gains three rows.

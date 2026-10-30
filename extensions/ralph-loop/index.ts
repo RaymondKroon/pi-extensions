@@ -274,6 +274,23 @@ function isContinuedFrom(value: unknown): value is ContinuedFrom {
 	return typeof v.sessionId === 'string' && typeof v.sessionPath === 'string' && v.iteration >= 1;
 }
 
+/** The model selection a rollover captured from the old session, applied to the new runtime at the continued session's session_start. */
+interface CarriedSelection {
+	provider: string;
+	modelId: string;
+	thinkingLevel?: string;
+}
+
+function isCarriedSelection(value: unknown): value is CarriedSelection {
+	if (!value || typeof value !== 'object') return false;
+	const v = value as Partial<CarriedSelection>;
+	return (
+		typeof v.provider === 'string' &&
+		typeof v.modelId === 'string' &&
+		(v.thinkingLevel === undefined || typeof v.thinkingLevel === 'string')
+	);
+}
+
 interface RalphState {
 	/** The active model's threshold, retained for this Ralph session. */
 	contextThreshold: number;
@@ -324,6 +341,8 @@ interface RalphState {
 	rolloverRequested?: boolean;
 	/** Lineage: the session this loop was rolled over from (set by the rollover). */
 	continuedFrom?: ContinuedFrom;
+	/** The old session's model selection, captured by the rollover and applied to the new runtime at the continued session's session_start ("new" only — never re-derived from the branch, which other extensions' session_start handlers can clobber). */
+	carriedSelection?: CarriedSelection;
 }
 
 /**
@@ -438,6 +457,7 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.blockedItem === undefined || typeof state.blockedItem === 'string') &&
 		(state.rolloverRequested === undefined || typeof state.rolloverRequested === 'boolean') &&
 		(state.continuedFrom === undefined || isContinuedFrom(state.continuedFrom)) &&
+		(state.carriedSelection === undefined || isCarriedSelection(state.carriedSelection)) &&
 		(state.category === undefined || typeof state.category === 'string') &&
 			(state.completedTasks === undefined ||
 				(Array.isArray(state.completedTasks) && state.completedTasks.every((value) => typeof value === 'string')))
@@ -3162,14 +3182,13 @@ export default function (pi: ExtensionAPI) {
 		const oldSessionFile = ctx.sessionManager.getSessionFile();
 		// The old session's model selection: a new session resolves its model
 		// and thinking level from the configured defaults (an empty session
-		// has nothing to restore from), so the rollover records the selection
-		// on the new session's branch (setup) and the new instance's
-		// session_start applies it to the live runtime before the fresh
-		// iteration's first turn.
-		const carriedModel = ctx.model
-			? { provider: ctx.model.provider, modelId: ctx.model.id }
+		// has nothing to restore from), so the rollover carries the selection
+		// in the loop state (applied to the live runtime by the new
+		// instance's session_start) and records it on the new session's
+		// branch (setup, restored natively on a later resume).
+		const carriedSelection: CarriedSelection | undefined = ctx.model
+			? { provider: ctx.model.provider, modelId: ctx.model.id, thinkingLevel: ctx.thinkingLevel }
 			: undefined;
-		const carriedThinkingLevel = ctx.thinkingLevel;
 		persistState({
 			...previous,
 			enabled: false,
@@ -3210,15 +3229,17 @@ export default function (pi: ExtensionAPI) {
 				sm.appendCustomEntry(STATE_TYPE, {
 					...next,
 					todoPath: dest,
-					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration }
+					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration },
+					carriedSelection
 				});
 				// The old session's model selection, recorded on the new branch
 			// before the state entry: pi restores it on a later resume of the
 			// new session; the new instance's session_start (re-issued by the
-			// host after setup) applies it to the live runtime now, since a
-			// fresh session otherwise starts on the configured defaults.
-				if (carriedModel) sm.appendModelChange(carriedModel.provider, carriedModel.modelId);
-				if (carriedThinkingLevel) sm.appendThinkingLevelChange(carriedThinkingLevel);
+			// host after setup) applies the carried state's selection to the
+			// live runtime now, since a fresh session otherwise starts on the
+			// configured defaults.
+				if (carriedSelection) sm.appendModelChange(carriedSelection.provider, carriedSelection.modelId);
+				if (carriedSelection.thinkingLevel) sm.appendThinkingLevelChange(carriedSelection.thinkingLevel);
 				return Promise.resolve();
 			},
 			withSession: (rctx) => {
@@ -3226,7 +3247,8 @@ export default function (pi: ExtensionAPI) {
 				const carried: RalphState = {
 					...next,
 					todoPath,
-					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration }
+					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration },
+					carriedSelection
 				};
 				// Memory-only (no appendEntry: the entry is written in setup on the
 				// new session's manager, and the old pi facade is stale anyway):
@@ -3540,43 +3562,33 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * A rollover continuation (state.continuedFrom): pi resolves a new
 	 * (empty) session's model and thinking level from the configured
-	 * defaults — the model_change / thinking_level_change entries the
-	 * rollover recorded on the branch do not reach the live runtime until
-	 * the next resume — so apply the branch's recorded selection to the
-	 * live runtime here. The host re-issues this session's session_start
-	 * after the rollover's setup, before the fresh iteration's first turn,
-	 * which is where the selection lands. A later resume (the session then
-	 * has messages, so pi restores the selection itself) is a no-op: the
-	 * live model already matches the branch's latest entries.
+	 * defaults, and other extensions' session_start handlers may move the
+	 * live model further (and append their own model_change entries to the
+	 * branch) — so the selection to restore is the one the rollover itself
+	 * captured (state.carriedSelection), never re-derived from the branch's
+	 * latest entries. The host re-issues this session's session_start after
+	 * the rollover's setup, before the fresh iteration's first turn, which
+	 * is where the selection lands.
 	 */
 	const restoreContinuedSelection = async (ctx: ExtensionContext) => {
-		let provider: string | undefined;
-		let modelId: string | undefined;
-		let level: string | undefined;
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === 'model_change') {
-				provider = entry.provider;
-				modelId = entry.modelId;
-			} else if (entry.type === 'thinking_level_change') {
-				level = entry.thinkingLevel;
-			}
-		}
-		if (provider && modelId && (ctx.model?.provider !== provider || ctx.model?.id !== modelId)) {
-			const model = ctx.modelRegistry.find(provider, modelId);
+		const selection = state?.carriedSelection;
+		if (!selection) return;
+		if (ctx.model?.provider !== selection.provider || ctx.model?.id !== selection.modelId) {
+			const model = ctx.modelRegistry.find(selection.provider, selection.modelId);
 			if (!model) {
-				ctx.ui.notify(`Rollover: the continued session's model ${provider}/${modelId} is not available.`, 'warning');
+				ctx.ui.notify(`Rollover: the continued session's model ${selection.provider}/${selection.modelId} is not available.`, 'warning');
 				return;
 			}
 			if (!(await pi.setModel(model))) {
 				ctx.ui.notify(
-					`Rollover: the continued session's model ${provider}/${modelId} has no configured auth.`,
+					`Rollover: the continued session's model ${selection.provider}/${selection.modelId} has no configured auth.`,
 					'warning'
 				);
 				return;
 			}
 		}
-		if (level && ctx.thinkingLevel !== level) {
-			pi.setThinkingLevel(level as Parameters<ExtensionAPI['setThinkingLevel']>[0]);
+		if (selection.thinkingLevel && ctx.thinkingLevel !== selection.thinkingLevel) {
+			pi.setThinkingLevel(selection.thinkingLevel as Parameters<ExtensionAPI['setThinkingLevel']>[0]);
 		}
 	};
 
@@ -3632,8 +3644,12 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// A rollover continuation restores the old session's model and
-		// reasoning level (recorded on the branch by the rollover's setup).
-		if (state?.continuedFrom) await restoreContinuedSelection(ctx);
+		// reasoning level (captured by the rollover in the carried state).
+		// "new" only: the host re-issues session_start after the rollover's
+		// setup; a later resume restores the selection from the branch
+		// itself (the session then has messages), and a user model change
+		// made since must not be clobbered.
+		if (event.reason === 'new' && state?.continuedFrom) await restoreContinuedSelection(ctx);
 		// Sessions created before the config entry retain their last active setting.
 		if (state && !hasSessionConfig) {
 			config = {

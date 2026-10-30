@@ -2263,6 +2263,58 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			expect(fake.setThinkingLevelCalls).toHaveLength(1);
 		});
 
+		test('the rollover restore survives another extension resetting the model at session_start', async () => {
+			// Live regression (session 01a18f20): a model-syncing extension
+			// (qwen-reasoning) re-applies its default model on every
+			// session_start; registered before ralph-loop, like global
+			// extensions load before project extensions, and the runner awaits
+			// each session_start handler in registration order — so its
+			// model_change entry lands on the branch before ralph's restore
+			// runs, and a restore that re-derives the selection from the
+			// branch's latest model_change sees the wrong model and no-ops.
+			const fake = createFakePi();
+			const modelSync = (pi: {
+				on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
+				setModel: (model: { provider: string; id: string }) => Promise<boolean>;
+			}) => {
+				pi.on('session_start', (event: unknown) => {
+					if ((event as { reason?: string }).reason !== 'new') return;
+					return pi.setModel({ provider: 'default', id: 'default-model' });
+				});
+			};
+			modelSync(fake.pi as never);
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			// Wire the fake pi's model actions to the fake session like pi
+			// does: a setModel records the selection on the branch and becomes
+			// the live model (the old, decoupled fake hid exactly this).
+			const realSetModel = fake.pi.setModel;
+			fake.pi.setModel = (model: { provider: string; id: string; contextWindow?: number }) => {
+				fakeCtx.branchEntries.push({ type: 'model_change', provider: model.provider, modelId: model.id });
+				fakeCtx.ctx.model = { provider: model.provider, id: model.id, contextWindow: model.contextWindow ?? 100_000 };
+				return realSetModel(model);
+			};
+			const realSetThinkingLevel = fake.pi.setThinkingLevel;
+			fake.pi.setThinkingLevel = (level: string) => {
+				fakeCtx.ctx.thinkingLevel = level;
+				realSetThinkingLevel(level);
+			};
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+			await runRollover(fake, fakeCtx, '--now');
+
+			// The new runtime starts on the configured defaults (the sync
+			// extension's session_start handler resets it again).
+			fakeCtx.ctx.model = { provider: 'default', id: 'default-model', contextWindow: 100_000 };
+			fakeCtx.ctx.thinkingLevel = 'medium';
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'new' });
+
+			// The carried selection must be the LAST setModel: the live model
+			// after all session_start handlers have run.
+			expect(fake.setModelCalls.at(-1)).toEqual({ provider: 'test', id: 'test-model', contextWindow: 100_000 });
+			expect(fake.setThinkingLevelCalls.at(-1)).toBe('high');
+		});
+
 		test('a stored state with rollover fields restores (validation)', async () => {
 			const fake = createFakePi();
 			extension(fake.pi as never);
