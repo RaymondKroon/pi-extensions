@@ -19,7 +19,7 @@ import {
 	visibleWidth
 } from '@earendil-works/pi-tui';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { copyFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Type } from 'typebox';
@@ -115,6 +115,82 @@ const DEFAULT_CYCLE_ON: CycleOn = { tasks: 'task', goal: 'task', auto: 'budget' 
 function cycleOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): CycleOnPolicy {
 	return config.cycleOn?.[mode] ?? DEFAULT_CYCLE_ON[mode];
 }
+/**
+ * Session rollover (opt-in). When a cycle boundary is reached and the session
+ * is slowing the UI down (measured branch-walk time, or the session-file /
+ * message-count limits), or a manual `/ralph rollover` is scheduled, the loop
+ * moves to a NEW pi session instead of a same-session context cut: the
+ * backlog file is copied over (the old file recorded as a source), the loop
+ * state (iteration count against maxIterations, category, pending decision)
+ * is carried with a continuedFrom lineage, and the fresh iteration starts in
+ * the new session. The old session stays as a read-only archive.
+ */
+interface RolloverConfig {
+	/** Master switch: when false, only an explicit /ralph rollover schedules a rollover. */
+	enabled: boolean;
+	/** Roll over when a cycle-boundary branch walk (the work the TUI re-does on every render and resume) takes at least this long (ms). */
+	walkMs: number;
+	/** Roll over when the session file is at least this large (MB). */
+	maxMB: number;
+	/** Roll over when the active branch has at least this many messages. */
+	maxMessages: number;
+}
+const DEFAULT_ROLLOVER: RolloverConfig = { enabled: false, walkMs: 500, maxMB: 50, maxMessages: 3000 };
+
+function isRolloverConfig(value: unknown): value is RolloverConfig {
+	if (!value || typeof value !== 'object') return false;
+	const v = value as Partial<RolloverConfig>;
+	return (
+		typeof v.enabled === 'boolean' &&
+		typeof v.walkMs === 'number' &&
+		v.walkMs >= 1 &&
+		typeof v.maxMB === 'number' &&
+		v.maxMB >= 1 &&
+		typeof v.maxMessages === 'number' &&
+		v.maxMessages >= 10
+	);
+}
+
+/** Fill in rollover fields missing from configs saved before the setting existed. */
+function migrateRollover(value: unknown): RolloverConfig {
+	if (isRolloverConfig(value)) return value;
+	const v = (value ?? {}) as Partial<RolloverConfig>;
+	return {
+		enabled: typeof v.enabled === 'boolean' ? v.enabled : DEFAULT_ROLLOVER.enabled,
+		walkMs: typeof v.walkMs === 'number' && v.walkMs >= 1 ? v.walkMs : DEFAULT_ROLLOVER.walkMs,
+		maxMB: typeof v.maxMB === 'number' && v.maxMB >= 1 ? v.maxMB : DEFAULT_ROLLOVER.maxMB,
+		maxMessages: typeof v.maxMessages === 'number' && v.maxMessages >= 10 ? v.maxMessages : DEFAULT_ROLLOVER.maxMessages
+	};
+}
+
+/**
+ * Measure how heavy a session's transcript is — the cost pi's TUI pays on
+ * every render and resume: the active-branch walk (timed: the very work the
+ * UI re-does), the session file size, and the message count. Returns a reason
+ * string when any limit is met or exceeded.
+ */
+function probeSessionHealth(ctx: ExtensionContext, rollover: RolloverConfig): { reason?: string } {
+	let messages = 0;
+	let walkMs = 0;
+	try {
+		const start = performance.now();
+		for (const entry of ctx.sessionManager.getBranch()) if (entry.type === 'message') messages += 1;
+		walkMs = performance.now() - start;
+	} catch {
+		// Unreadable session (in-memory test context): rely on the file signals.
+	}
+	let sizeMB = 0;
+	try {
+		sizeMB = statSync(ctx.sessionManager.getSessionFile()).size / 1048576;
+	} catch {
+		// In-memory session: no file to measure.
+	}
+	const reasons: string[] = [];
+	if (walkMs >= rollover.walkMs) reasons.push(`branch walk ${Math.round(walkMs)}ms (limit ${rollover.walkMs}ms)`);
+	if (sizeMB >= rollover.maxMB) reasons.push(`session file ${sizeMB.toFixed(0)}MB (limit ${rollover.maxMB}MB)`);
+	if (messages >= rollover.maxMessages) reasons.push(`${messages} messages (limit ${rollover.maxMessages})`);
+	return { reason: reasons.length > 0 ? reasons.join('; ') : undefined };
+}
 /** The cycle tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a cycle — and arm the auto loop — even while no loop is active yet. */
 const CYCLE_TOOL_NAME = 'ralph_cycle';
 /** Tools activated additively (defer_loading) by /ralph start; disabled again on session start when no loop is active. Once in context they stay in context for the rest of the session. */
@@ -154,6 +230,8 @@ interface RalphConfig {
 	autoMode: AutoMode;
 	/** When a fresh iteration starts, per loop mode: task — after every completed task; budget — only at the context budget. */
 	cycleOn: CycleOn;
+	/** Session rollover at cycle boundaries (opt-in; see RolloverConfig). */
+	rollover: RolloverConfig;
 }
 
 interface LegacyRalphConfig {
@@ -182,6 +260,20 @@ function migrateCycleOn(value: unknown): CycleOn {
 	if (isCycleOn(value)) return value;
 	if (value === 'task' || value === 'budget') return { tasks: value, goal: value, auto: value };
 	return { ...DEFAULT_CYCLE_ON };
+}
+
+/** Lineage written at a session rollover: the session the loop was handed off from. */
+interface ContinuedFrom {
+	sessionId: string;
+	sessionPath: string;
+	/** The iteration number the loop carried into this session. */
+	iteration: number;
+}
+
+function isContinuedFrom(value: unknown): value is ContinuedFrom {
+	if (!value || typeof value !== 'object') return false;
+	const v = value as Partial<ContinuedFrom>;
+	return typeof v.sessionId === 'string' && typeof v.sessionPath === 'string' && v.iteration >= 1;
 }
 
 interface RalphState {
@@ -230,6 +322,10 @@ interface RalphState {
 	reloadRequested?: boolean;
 	/** Auto loops started with the checkpoint handoff: the finish-up records the in-progress task's progress in its checkpoint field instead of rewriting its body. Restored loops started before the handoff keep the body-rewrite handoff for the rest of the run. */
 	checkpointHandoff?: boolean;
+	/** The next cycle boundary rolls the loop over to a new pi session instead of a same-session context cut (set by /ralph rollover; cleared by the rollover or --cancel). */
+	rolloverRequested?: boolean;
+	/** Lineage: the session this loop was rolled over from (set by the rollover). */
+	continuedFrom?: ContinuedFrom;
 }
 
 /**
@@ -342,7 +438,9 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.paused === undefined || typeof state.paused === 'boolean') &&
 		(state.blocked === undefined || typeof state.blocked === 'boolean') &&
 		(state.blockedItem === undefined || typeof state.blockedItem === 'string') &&
-			(state.category === undefined || typeof state.category === 'string') &&
+		(state.rolloverRequested === undefined || typeof state.rolloverRequested === 'boolean') &&
+		(state.continuedFrom === undefined || isContinuedFrom(state.continuedFrom)) &&
+		(state.category === undefined || typeof state.category === 'string') &&
 			(state.completedTasks === undefined ||
 				(Array.isArray(state.completedTasks) && state.completedTasks.every((value) => typeof value === 'string')))
 	);
@@ -427,7 +525,8 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		isMaxIterations(config.maxIterations) &&
 		typeof config.compactionMode === 'boolean' &&
 		isAutoMode(config.autoMode) &&
-		isCycleOn(config.cycleOn)
+		isCycleOn(config.cycleOn) &&
+		isRolloverConfig(config.rollover)
 	);
 }
 
@@ -448,7 +547,9 @@ function isRalphConfigPartial(
 		(config.autoMode === undefined || normalizeAutoMode(config.autoMode) !== undefined) &&
 		(config.cycleOn === undefined || isCycleOn(config.cycleOn) || isLegacyCycleOn(config.cycleOn)) &&
 		// Configs saved before the cycle rename carry the per-mode policy under the old key.
-		(config.rotateOn === undefined || isCycleOn(config.rotateOn) || isLegacyCycleOn(config.rotateOn))
+		(config.rotateOn === undefined || isCycleOn(config.rotateOn) || isLegacyCycleOn(config.rotateOn)) &&
+		// Configs saved before session rollover has no rollover section; migrateRollover fills it.
+		(config.rollover === undefined || (typeof config.rollover === 'object' && config.rollover !== null))
 	);
 }
 
@@ -471,7 +572,8 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
 			autoMode: normalizeAutoMode(value.autoMode) ?? DEFAULT_AUTO_MODE,
-			cycleOn: migrateCycleOn(value.cycleOn ?? legacyCycleOn)
+			cycleOn: migrateCycleOn(value.cycleOn ?? legacyCycleOn),
+			rollover: migrateRollover(value.rollover)
 		};
 	}
 	if (isLegacyRalphConfig(value)) {
@@ -481,7 +583,8 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
 			autoMode: DEFAULT_AUTO_MODE,
-			cycleOn: { ...DEFAULT_CYCLE_ON }
+			cycleOn: { ...DEFAULT_CYCLE_ON },
+			rollover: { ...DEFAULT_ROLLOVER }
 		};
 	}
 }
@@ -493,7 +596,8 @@ function defaultConfig(): RalphConfig {
 		maxIterations: DEFAULT_MAX_ITERATIONS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
 		autoMode: DEFAULT_AUTO_MODE,
-		cycleOn: { ...DEFAULT_CYCLE_ON }
+		cycleOn: { ...DEFAULT_CYCLE_ON },
+		rollover: { ...DEFAULT_ROLLOVER }
 	};
 }
 
@@ -938,6 +1042,12 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	const isAuto = state.mode === 'auto';
 	const decisionNote = renderPrompt('decision-note', { autoApprove: state.autoApproveDecisions });
 	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
+	// Session-rollover lineage: the fresh iteration in the new session must
+	// know the loop comes from an older session (and where its transcript is)
+	// so it consults history instead of redoing finished work.
+	const continuation = state.continuedFrom
+		? ` This loop continues from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} of ${state.maxIterations} carried over); its full transcript is at ${state.continuedFrom.sessionPath}. Consult it — and the backlog's completion log — before redoing any work.`
+		: '';
 	const contextNote = isAuto
 		? renderPrompt('context-note-auto', {
 				reason: reason ?? 'first',
@@ -964,6 +1074,7 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		isGoal: goalInfo !== undefined,
 		phase: goalInfo?.phase ?? '',
 		contextNote,
+		continuation,
 		category: String(state.category),
 		backlogNote: 'The backlog is accessible with the ralph_todo tool.',
 		goalBlock: goalInfo ? goalBlock(goalInfo.goal) : '',
@@ -1963,9 +2074,11 @@ export default function (pi: ExtensionAPI) {
 						: 'finishing'
 					: state?.stopRequested
 						? 'stopping'
-						: state?.cycleQueued || freshIterationPending
-							? 'starting'
-							: 'on';
+				: state?.cycleQueued || freshIterationPending
+						? 'starting'
+					: state?.rolloverRequested
+						? 'on (rollover: next cycle)'
+						: 'on';
 		// The label reflects the active loop's mode; a stopped goal loop keeps
 		// its marker only while auto mode is off — with auto mode "on" the
 		// setting shows in the state word instead (the stale marker would hide
@@ -1992,12 +2105,17 @@ export default function (pi: ExtensionAPI) {
 		// auto loop's configured value when idle (the loop that will start).
 		const cycle = state?.enabled ? state.cycleOn : config.autoMode === 'on' ? config.cycleOn.auto : undefined;
 		const cycleSuffix = cycle ? ` · cycle: ${cycle}` : '';
+		// Session-rollover lineage: this session's loop was handed off from an
+		// older session (the fresh iteration's prompt carries the full id and
+		// transcript path; /ralph status does too). The marker stays after a
+		// stop — the session is still the continuation.
+		const contSuffix = state?.continuedFrom ? ` · ↩ ${state.continuedFrom.sessionId.slice(0, 8)}` : '';
 		// In the idle on/auto states the context percentage is still shown: the
 		// auto loop cycles on the context budget, so the headroom matters.
 		const idleContext = idleState !== 'off' ? ` · context: ${contextUsageLabel(ctx, contextThresholdFor(config, ctx))}` : '';
 		const status = !state?.enabled
-			? `${label}: ${idleState}${modifierSuffix}${cycleSuffix}${idleContext}`
-			: `${label}: ${mode}${modifierSuffix}${cycleSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: ${idleState}${contSuffix}${modifierSuffix}${cycleSuffix}${idleContext}`
+			: `${label}: ${mode}${contSuffix}${modifierSuffix}${cycleSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -2830,47 +2948,81 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	/**
+	 * Compute the next iteration's state from the on-disk backlog (the cycle
+	 * logic diffs the SQLite file against the iteration baseline). Shared by
+	 * the same-session cycle and the session rollover. Stops the loop (with a
+	 * notification) and returns undefined when the loop is done (backlog
+	 * exhausted / goal complete / max iterations reached).
+	 */
+	const prepareNextIteration = (ctx: ExtensionContext): { current: Backlog; next: RalphState } | undefined => {
+		if (!state?.enabled) return undefined;
+		const current = Backlog.open(state.todoPath);
+		// Goal mode is done when the goal is done, not when the plan is
+		// exhausted: an empty plan is the planning state. Auto mode never
+		// stops on an empty backlog: the session category starts empty.
+		if (state.mode !== 'goal' && state.mode !== 'auto' && isBacklogFinished(current, state?.category)) {
+			stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
+			return undefined;
+		}
+		// Goal mode: never start a fresh iteration once the goal is done.
+		if (state.mode === 'goal' && goalStatus(current) === 'done') {
+			stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
+			return undefined;
+		}
+		refreshCounts(current, countCategory(state));
+		const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
+		const next: RalphState = {
+			...state,
+			baseline: snapshotBaselineFrom(current, countCategory(state)),
+			baselineTime: Date.now(),
+			iteration: state.iteration + 1,
+			taskIteration: taskChanged ? 1 : state.taskIteration + 1,
+			taskNumber: currentTaskNumber(taskCount.current),
+			cycleQueued: false,
+			cycleReason: undefined,
+			cycleCheckpointing: false,
+			// A pending rollover request does not leak into the next iteration
+			// (the rollover or a --cancel already consumed or cleared it).
+			rolloverRequested: false,
+			// The reload (if any) is dispatched at this cycle boundary;
+			// the flag must not leak into a later, unrelated cycle.
+			// (cycleNote is kept: it is descriptive, only read while the
+			// model-requested reason is active, and overwritten by the next
+			// model-requested cycle.)
+			reloadRequested: undefined
+		};
+		if (next.iteration > next.maxIterations) {
+			stopLoop(ctx, `Ralph loop stopped after reaching the maximum of ${next.maxIterations} iterations`);
+			return undefined;
+		}
+		return { current, next };
+	};
+
 	const startFreshIteration = (ctx: ExtensionContext) => {
 		void (async () => {
-			if (!state?.enabled) return;
+			const prep = prepareNextIteration(ctx);
+			if (!prep || !state) return;
+			const { current, next } = prep;
 			const reason = state.cycleReason ?? 'completed-task';
 		try {
-				// The cycle logic diffs the on-disk backlog (SQLite file)
-				// against the iteration baseline.
-				const current = Backlog.open(state.todoPath);
-				// Goal mode is done when the goal is done, not when the plan is
-				// exhausted: an empty plan is the planning state. Auto mode never
-				// stops on an empty backlog: the session category starts empty.
-				if (state.mode !== 'goal' && state.mode !== 'auto' && isBacklogFinished(current, state?.category)) {
-					stopLoop(ctx, 'Ralph loop stopped because all TODO items are complete');
-					return;
-				}
-				// Goal mode: never start a fresh iteration once the goal is done.
-				if (state.mode === 'goal' && goalStatus(current) === 'done') {
-					stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete');
-					return;
-				}
-				refreshCounts(current, countCategory(state));
-				const taskChanged = state.taskNumber !== undefined && state.taskNumber !== taskCount.current;
-				const next: RalphState = {
-					...state,
-					baseline: snapshotBaselineFrom(current, countCategory(state)),
-					baselineTime: Date.now(),
-					iteration: state.iteration + 1,
-					taskIteration: taskChanged ? 1 : state.taskIteration + 1,
-					taskNumber: currentTaskNumber(taskCount.current),
-					cycleQueued: false,
-					cycleReason: undefined,
-					cycleCheckpointing: false,
-					// The reload (if any) is dispatched at this cycle boundary;
-					// the flag must not leak into a later, unrelated cycle.
-					// (cycleNote is kept: it is descriptive, only read while the
-					// model-requested reason is active, and overwritten by the next
-					// model-requested cycle.)
-					reloadRequested: undefined
-				};
-				if (next.iteration > next.maxIterations) {
-					stopLoop(ctx, `Ralph loop stopped after reaching the maximum of ${next.maxIterations} iterations`);
+				// Rollover: a scheduled /ralph rollover, or the opt-in slowness
+				// probe at this boundary, moves the fresh iteration to a new pi
+				// session instead of a same-session context cut. The switch needs
+				// a command context (session control is command-only), so it is
+				// dispatched as the /ralph rollover --now command — executed
+				// immediately, or deferred until this settle finishes. The
+				// request flag stays set: the command clears it on success, and a
+				// failed dispatch retries at the next boundary.
+				const slowness = config.rollover.enabled ? probeSessionHealth(ctx, config.rollover) : { reason: undefined };
+				if (state.rolloverRequested || slowness.reason !== undefined) {
+					ctx.ui.notify(
+						state.rolloverRequested
+							? 'Ralph session rollover: the loop moves to a new session at this cycle boundary.'
+							: `Ralph session rollover: the session is slowing down the UI (${slowness.reason}) — the loop moves to a new session.`,
+						'info'
+					);
+					pi.sendUserMessage('/ralph rollover --now', { expandPromptTemplates: true });
 					return;
 				}
 				persistState(next);
@@ -2973,6 +3125,120 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Ralph loop could not continue: ${message}`, 'error');
 			}
 		})();
+	};
+
+	/**
+	 * Roll the active loop over to a new pi session now (the /ralph rollover
+	 * --now path — manual, or dispatched at the cycle boundary by
+	 * startFreshIteration). The loop is handed off, not stopped: the old
+	 * session's loop is terminated (a later resume of it must not re-run the
+	 * loop — the new session's continuedFrom links the two), the backlog file
+	 * is copied into the new session (the old file recorded as a source: the
+	 * lineage, and a guard against a later double import), the loop state —
+	 * iteration count against maxIterations, category, pending decision — is
+	 * carried with the continuedFrom lineage, and the fresh iteration starts
+	 * in the new session with a continuation note pointing at the old
+	 * session's transcript.
+	 */
+	const rolloverNow = async (ctx: ExtensionCommandContext): Promise<void> => {
+		if (!state?.enabled) {
+			ctx.ui.notify('No active Ralph loop to roll over.', 'info');
+			return;
+		}
+		if (!ctx.isIdle()) {
+			ctx.ui.notify('Wait for the current agent run to finish before rolling over.', 'warning');
+			return;
+		}
+		const prep = prepareNextIteration(ctx);
+		if (!prep || !state) return; // the loop stopped (notified)
+		const { current, next } = prep;
+		const reason = state.cycleReason ?? 'iteration-ended';
+		// The completion summary diffs the carried loop-start snapshot against
+		// the on-disk backlog — computed here (old session) and re-sent in the
+		// new session, so the loop's progress so far travels with the loop.
+		const completion = completionSummary(current, state.loopStart, next.category);
+		const previous = state;
+		const oldSessionId = ctx.sessionManager.getSessionId();
+		const oldSessionFile = ctx.sessionManager.getSessionFile();
+		persistState({
+			...previous,
+			enabled: false,
+			cycleQueued: false,
+			cycleReason: undefined,
+			cycleCheckpointing: false,
+			cycleNote: undefined,
+			rolloverRequested: false,
+			reloadRequested: undefined
+		});
+		const srcPath = next.todoPath;
+		// The carried state is written by the new session's SessionManager in
+		// setup() — the old extension instance's pi facade goes stale the moment
+		// the session is replaced (the runtime tears it down), so nothing must
+		// be sent through `pi` from within withSession. The new instance's
+		// session_start (re-issued by the runtime host after setup) restores
+		// the state from that entry, then withSession delivers the iteration
+		// prompt through the fresh replacement context (rctx).
+		const result = await ctx.newSession({
+			parentSession: oldSessionFile,
+			// The new session's ralph file is a wholesale copy of the old
+			// session's backlog (tasks, goal, completion log, checkpoints,
+			// source records) — the new session simply has its file.
+			setup: (sm) => {
+				const dest = join(getAgentDir(), AUTO_TODO_DIR, `${sm.getSessionId()}.db`);
+				try {
+					copyFileSync(srcPath, dest);
+					const target = Backlog.open(dest);
+					target.addSource(srcPath);
+					target.save(dest);
+				} catch {
+					// Reported in withSession, where the new session's UI lives.
+				}
+				// The carried state: the new session's ralph file plus the
+				// continuedFrom lineage. Written before the new instance's
+				// session_start runs, so its branch scan restores exactly this
+				// state (the loop keeps running in the new session).
+				sm.appendCustomEntry(STATE_TYPE, {
+					...next,
+					todoPath: dest,
+					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration }
+				});
+				return Promise.resolve();
+			},
+			withSession: (rctx) => {
+				const todoPath = autoTodoPath(rctx);
+				const carried: RalphState = {
+					...next,
+					todoPath,
+					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration }
+				};
+				// Memory-only (no appendEntry: the entry is written in setup on the
+				// new session's manager, and the old pi facade is stale anyway):
+				// the new instance restores this state from that entry, and the
+				// status render below shows it on the new session's surface at once.
+				state = carried;
+				updateStatus(rctx);
+				if (!existsSync(todoPath)) {
+					rctx.ui.notify('Rollover: the backlog copy failed — the new session starts with an empty ralph file.', 'error');
+				}
+				if (completion) {
+					rctx.sendMessage(
+						{ customType: COMPLETION_SUMMARY_TYPE, content: completion, display: true },
+						{ triggerTurn: false, deliverAs: 'followUp' }
+					);
+				}
+				// No CONTEXT_BOUNDARY marker: the fresh session has no prior
+				// iteration context to cut. Delivered on the fresh replacement
+				// context — the old pi facade is stale after the replacement.
+				void rctx.sendUserMessage(iterationPrompt(carried, reason), { deliverAs: 'followUp' });
+			}
+		});
+		if (result.cancelled) {
+			// The session switch was cancelled (an extension's before-switch
+			// hook): restore the loop exactly as it was (queued cycle intact).
+			persistState(previous);
+			ctx.ui.notify('Session rollover was cancelled — the loop continues in this session.', 'warning');
+			return;
+		}
 	};
 
 	/**
@@ -3313,7 +3579,8 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: state.maxIterations,
 				compactionMode: DEFAULT_COMPACTION_MODE,
 				autoMode: DEFAULT_AUTO_MODE,
-				cycleOn: { ...DEFAULT_CYCLE_ON }
+				cycleOn: { ...DEFAULT_CYCLE_ON },
+				rollover: { ...DEFAULT_ROLLOVER }
 			};
 		}
 
@@ -4128,9 +4395,17 @@ export default function (pi: ExtensionAPI) {
 								? { ...cfg, cycleOn: { ...cfg.cycleOn, tasks: value as CycleOnPolicy } }
 								: id === 'cycleOnGoal'
 									? { ...cfg, cycleOn: { ...cfg.cycleOn, goal: value as CycleOnPolicy } }
-									: id === 'cycleOnAuto'
-										? { ...cfg, cycleOn: { ...cfg.cycleOn, auto: value as CycleOnPolicy } }
-									: { ...cfg, autoApproveDecisions: value === 'enabled' };
+						: id === 'cycleOnAuto'
+							? { ...cfg, cycleOn: { ...cfg.cycleOn, auto: value as CycleOnPolicy } }
+							: id === 'rolloverEnabled'
+								? { ...cfg, rollover: { ...cfg.rollover, enabled: value === 'enabled' } }
+								: id === 'rolloverWalkMs'
+									? { ...cfg, rollover: { ...cfg.rollover, walkMs: Number.parseInt(value, 10) } }
+									: id === 'rolloverMaxMB'
+										? { ...cfg, rollover: { ...cfg.rollover, maxMB: Number.parseInt(value, 10) } }
+										: id === 'rolloverMaxMessages'
+											? { ...cfg, rollover: { ...cfg.rollover, maxMessages: Number.parseInt(value, 10) } }
+										: { ...cfg, autoApproveDecisions: value === 'enabled' };
 		const savedDescription = (id: string, next: RalphConfig): string =>
 			id === 'contextThreshold'
 				? contextThresholdLabel(contextThresholdFor(next, ctx))
@@ -4146,7 +4421,15 @@ export default function (pi: ExtensionAPI) {
 						? `cycle (goal loop) ${next.cycleOn.goal}`
 					: id === 'cycleOnAuto'
 						? `cycle (auto loop) ${next.cycleOn.auto}`
-						: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
+						: id === 'rolloverEnabled'
+							? `session rollover ${next.rollover.enabled ? 'enabled' : 'disabled'}`
+							: id === 'rolloverWalkMs'
+								? `rollover walk limit ${next.rollover.walkMs}ms`
+								: id === 'rolloverMaxMB'
+									? `rollover file limit ${next.rollover.maxMB}MB`
+									: id === 'rolloverMaxMessages'
+										? `rollover message limit ${next.rollover.maxMessages}`
+										: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
 
 		const items: SettingItem[] = [
 			{
@@ -4243,6 +4526,77 @@ export default function (pi: ExtensionAPI) {
 					'When a fresh iteration starts for the auto loop: task — after every completed task; budget — only at the context budget, working task after task. Applies immediately to active auto loops.',
 				currentValue: config.cycleOn.auto,
 				values: ['task', 'budget']
+			},
+			{
+				id: 'rolloverEnabled',
+				label: 'Session rollover',
+				description:
+					'At a cycle boundary, roll the loop over to a new pi session when the session is slowing down the UI (the session file only ever grows, and the TUI re-does the whole transcript on every render and resume): the backlog and the loop state (iteration count against maxIterations, category, pending decision) move to the new session, and the old session stays as a read-only archive. Opt-in; /ralph rollover schedules a rollover manually regardless of this setting.',
+				currentValue: config.rollover.enabled ? 'enabled' : 'disabled',
+				values: ['enabled', 'disabled']
+			},
+			{
+				id: 'rolloverWalkMs',
+				label: 'Rollover: branch walk limit (ms)',
+				description:
+					'Roll over when a cycle-boundary walk of the session transcript (the work the TUI re-does on every render and resume) takes at least this long. Requires session rollover enabled.',
+				currentValue: String(config.rollover.walkMs),
+				submenu: (currentValue, done) =>
+					numericSettingSubmenu(
+						'Rollover branch walk limit (positive whole number, ms)',
+						currentValue,
+						(value) => {
+							const limit = Number(value.trim());
+							if (!Number.isFinite(limit) || limit < 1) {
+								ctx.ui.notify('The walk limit must be a positive whole number of milliseconds.', 'error');
+								return undefined;
+							}
+							return String(Math.round(limit));
+						},
+						done
+					)
+			},
+			{
+				id: 'rolloverMaxMB',
+				label: 'Rollover: session file limit (MB)',
+				description:
+					'Roll over when the session file (the transcript, which only ever grows) reaches this size. Requires session rollover enabled.',
+				currentValue: String(config.rollover.maxMB),
+				submenu: (currentValue, done) =>
+					numericSettingSubmenu(
+						'Rollover session file limit (positive whole number, MB)',
+						currentValue,
+						(value) => {
+							const limit = Number(value.trim());
+							if (!Number.isFinite(limit) || limit < 1) {
+								ctx.ui.notify('The file limit must be a positive whole number of megabytes.', 'error');
+								return undefined;
+							}
+							return String(Math.round(limit));
+						},
+						done
+					)
+			},
+			{
+				id: 'rolloverMaxMessages',
+				label: 'Rollover: message limit',
+				description:
+					'Roll over when the session transcript reaches this many messages. Requires session rollover enabled.',
+				currentValue: String(config.rollover.maxMessages),
+				submenu: (currentValue, done) =>
+					numericSettingSubmenu(
+						'Rollover message limit (whole number of at least 10)',
+						currentValue,
+						(value) => {
+							const limit = Number(value.trim());
+							if (!Number.isInteger(limit) || limit < 10) {
+								ctx.ui.notify('The message limit must be a whole number of at least 10.', 'error');
+								return undefined;
+							}
+							return String(limit);
+						},
+						done
+					)
 			}
 		];
 
@@ -4512,7 +4866,8 @@ export default function (pi: ExtensionAPI) {
 					label: 'start',
 					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal) or pi --ralph-goal <goal-text | goal-file.md> at session start (pi --ralph-max-context <percent> and pi --ralph-cycle <task|budget> override its context threshold and cycle mode). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
-				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start.' },
+				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start. For an ACTIVE loop, prefer /ralph rollover — it also carries the loop state and keeps running.' },
+				{ value: 'rollover', label: 'rollover', description: 'Move the active loop to a new pi session without losing ralph state: the backlog is copied (old file recorded as a source), the loop state (iteration count against maxIterations, category, pending decision) is carried with a lineage note, and the fresh iteration starts in the new session. No argument schedules it for the end of the current iteration; --now rolls over immediately (idle only); --cancel unschedules. An opt-in slowness trigger (session rollover in /ralph config) does the same automatically.' },
 				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
 			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
@@ -4597,13 +4952,13 @@ export default function (pi: ExtensionAPI) {
 									: state.stopRequested
 										? `${loopName} will stop after the current iteration`
 										: state.cycleQueued
-											? `${loopName} is starting a fresh iteration`
-											: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}`,
+							? `${loopName} is starting a fresh iteration`
+							: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}${state.continuedFrom ? ` · continued from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} carried over)` : ''}`,
 					'info'
 				);
 				return;
 			}
-			const knownCommands = ['start', 'new', 'import', 'set-goal', 'stop', 'status', 'config', 'reload'];
+			const knownCommands = ['start', 'new', 'rollover', 'import', 'set-goal', 'stop', 'status', 'config', 'reload'];
 			if (command !== '' && !knownCommands.includes(command)) {
 				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
@@ -4788,6 +5143,46 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify('New session cancelled', 'info');
 					return;
 				}
+				return;
+			}
+			if (command === 'rollover') {
+				const rolloverArgs = commandArgs.slice(1);
+				if (rolloverArgs.length > 1 || (rolloverArgs[0] !== undefined && rolloverArgs[0] !== '--now' && rolloverArgs[0] !== '--cancel')) {
+					ctx.ui.notify('Usage: /ralph rollover [--now | --cancel]', 'warning');
+					return;
+				}
+				if (rolloverArgs[0] === '--cancel') {
+					if (!state?.enabled) {
+						ctx.ui.notify('No active Ralph loop — nothing to cancel.', 'info');
+						return;
+					}
+					if (!state.rolloverRequested) {
+						ctx.ui.notify('No session rollover is scheduled.', 'info');
+						return;
+					}
+					persistState({ ...state, rolloverRequested: false });
+					updateStatus(ctx);
+					ctx.ui.notify('Session rollover cancelled — the loop stays in this session.', 'info');
+					return;
+				}
+				if (!state?.enabled) {
+					ctx.ui.notify('No active Ralph loop — start one first (/ralph start).', 'warning');
+					return;
+				}
+				if (rolloverArgs[0] === '--now') {
+					await rolloverNow(ctx);
+					return;
+				}
+				if (state.rolloverRequested) {
+					ctx.ui.notify('A session rollover is already scheduled for the end of the current iteration.', 'info');
+					return;
+				}
+				persistState({ ...state, rolloverRequested: true });
+				updateStatus(ctx);
+				ctx.ui.notify(
+					'Session rollover scheduled: at the end of this iteration (after the recording turn) the loop moves to a new pi session — the backlog and the loop state (iteration count, category, pending decision) move, and the fresh iteration starts there. /ralph rollover --cancel to undo.',
+					'info'
+				);
 				return;
 			}
 			const startFiles = parseStartFiles(commandArgs.slice(1));

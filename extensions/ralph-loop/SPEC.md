@@ -453,3 +453,121 @@ model (no shared/project backlog, no loop-state cloning):
   `setup(sm)`, which runs before the new instance's `session_start`, so the
   new session's file exists before it starts; `withSession` only notifies.
   No new dependencies; `bun test` in full is the quality gate.
+
+## Session rollover (addendum)
+
+### ## 1. Purpose
+
+Long-running Ralph sessions accumulate an ever-growing, append-only pi session
+file (the TUI re-does the whole transcript on every render and resume, so a
+multi-hundred-MB session slows the UI down). The loop must be able to move
+itself into a **fresh pi session** at a **cycle boundary** — the one point
+where the loop's state is fully settled (work committed, recording turn done,
+backlog persisted) — without losing any ralph state. The old session remains
+as a read-only archive that the model can consult.
+
+## 2. What moves
+
+- **Backlog**: the session's ralph file (`<agent dir>/ralph/<session-id>.db`)
+  is copied *wholesale* into the new session's ralph file (tasks, goal,
+  completion log, checkpoints, source records). The old session's file path is
+  recorded as a **source** of the new backlog (`Backlog.addSource`) — the
+  lineage (chains survive: A → B → C lists A and B) and the guard against a
+  later double import of the old session's backlog.
+- **Loop state** (`RalphState`, carried as a `STATE_TYPE` entry written in
+  `withSession`): `mode`, `category`, `iteration` (the `maxIterations` budget
+  continues across sessions), `taskIteration`/`taskNumber`, `blocked` /
+  `blockedItem`, `cycleOn`, thresholds. `loopStart`/`baseline` are
+  re-snapshotted from the on-disk backlog at the boundary (they are diff
+  inputs, not history). New field `continuedFrom: { sessionId, sessionPath,
+  iteration }` records the lineage; the fresh iteration's prompt renders a
+  continuation clause naming the old session id and transcript path.
+- **Config**: per-directory/global settings already travel (same directory,
+  global store); the session file's settings win in the new session as usual.
+- **Audit**: the loop is *handed off, not stopped*: the old session's last
+  state entry is a terminal one (`enabled: false`, pending cycle fields
+  cleared) so a later resume of the old session cannot re-run the loop
+  (double loop). A cancelled switch restores the previous state exactly.
+
+## 3. Triggers (all at cycle boundaries only — never mid-turn)
+
+- **Manual, scheduled**: `/ralph rollover` (active loop required) sets
+  `rolloverRequested` (persisted; survives reloads); `--cancel` clears it;
+  duplicate schedules are no-ops.
+- **Manual, immediate**: `/ralph rollover --now` (active loop + idle) performs
+  the switch right away.
+- **Opt-in slowness trigger** (`/ralph config` → "Session rollover",
+  **off by default**): at each boundary, `probeSessionHealth` measures the
+  cost the TUI pays — the timed `getBranch()` walk of the active branch, the
+  session file size, and the branch message count — and the loop rolls over
+  when any configured limit is met or exceeded (`walkMs`, `maxMB`,
+  `maxMessages`; defaults 500ms / 50MB / 3000). The manual command works
+  regardless of the setting.
+- The automatic/scheduled triggers dispatch the switch as
+  `pi.sendUserMessage('/ralph rollover --now', { expandPromptTemplates: true })`
+  — session control (`ctx.newSession`) is command-context-only, and pi
+  executes extension commands immediately (or defers them until the in-flight
+  settle finishes). The `rolloverRequested` flag is NOT cleared on dispatch:
+  a failed dispatch retries at the next boundary; the command clears it on
+  success (carried state) and the terminal old-session entry clears it there.
+- Done/budget checks still win: an exhausted backlog, a completed goal, or a
+  reached `maxIterations` stops the loop instead of rolling over.
+
+## 4. Mechanism
+
+`rolloverNow(ctx: ExtensionCommandContext)` (shared by `--now` and the
+boundary dispatch):
+
+1. `prepareNextIteration(ctx)` — the next-iteration state computation extracted
+   from `startFreshIteration` (backlog done/goal done/max-iterations stops
+   included), so both paths increment `iteration` identically.
+2. Persist the terminal state in the old session; capture the completion
+   summary (carried `loopStart` vs on-disk backlog).
+3. `ctx.newSession({ parentSession, setup, withSession })`:
+   - `setup(sm)`: copy the old `.db` to `<new session id>.db`, `addSource` +
+     save (the new session simply has its backlog file), then append the
+     carried `STATE_TYPE` entry via `sm.appendCustomEntry` — on the NEW
+     session's SessionManager. This must happen here, not in `withSession`: the
+     moment the session is replaced the old extension instance's `pi` facade
+     goes stale (the runtime tears the old runtime down — any `pi.appendEntry` /
+     `pi.sendUserMessage` from the old instance throws "stale after session
+     replacement"), so nothing may be sent through the old `pi`. The runtime
+     host re-issues the new instance's `session_start` after `setup` (all
+     modes: TUI, RPC, print), so its branch scan finds the carried entry and
+     restores the loop state (tool activation and status included). An
+     entry appended in `setup` is visible whichever way the first
+     `session_start` ordered itself.
+   - `withSession(rctx)`: only the fresh replacement context is used —
+     `rctx.sendUserMessage` delivers the fresh iteration prompt (with the
+     continuation clause), `rctx.sendMessage` the completion summary (when
+     non-empty), `rctx.ui.notify` the copy-failure error. The old instance's
+     in-memory state is set to the carried state (memory only) so the one-shot
+     status render shows the active loop on the new session's surface. No
+     `CONTEXT_BOUNDARY` marker (a fresh session has no prior iteration context
+     to cut).
+4. Cancelled switch → restore the previous state (queued cycle intact).
+
+## 5. Surface changes
+
+- `RalphState`: `+ rolloverRequested?: boolean`, `+ continuedFrom?:
+  { sessionId, sessionPath, iteration }` (validated; ride `normalizeState`'s
+  rest-spread).
+- `RalphConfig`: `+ rollover: { enabled, walkMs, maxMB, maxMessages }`
+  (opt-in, `enabled` defaults false; `migrateRollover` fills older stored
+  configs); config GUI gains four rows.
+- `/ralph` completions + `knownCommands`: `+ rollover`.
+- `prompts/iteration.md`: `{{#if continuation}}` clause after the opening
+  sentence.
+- Status bar mode word: `on (rollover: next cycle)` while scheduled.
+- Continuation marker: the rolled-into session's status bar shows
+  `· ↩ <source-session-id[0:8]>` (both the active and the idle lines; it stays
+  after a stop — the session is still the continuation), and `/ralph status`
+  appends `· continued from session <id> (iteration <N> carried over)`.
+
+### Boundary
+
+- No change to same-session cycle behaviour when rollover is off/unset (the
+  default): the opt-in probe is the only new code path on the hot path, and it
+  runs at most once per cycle boundary.
+- `/ralph new` (backlog-only clone for idle/manual use) is unchanged except
+  its description now points active loops at `/ralph rollover`.

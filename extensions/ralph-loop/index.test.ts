@@ -141,8 +141,19 @@ interface FakeCtx {
 		};
 		newSession: (options?: {
 			parentSession?: string;
-			setup?: (sessionManager: { getSessionId: () => string; getSessionFile: () => string }) => Promise<void>;
-			withSession?: (ctx: { ui: { notify: (message: string, type?: string) => void } }) => Promise<void>;
+			setup?: (sessionManager: { getSessionId: () => string; getSessionFile: () => string; appendCustomEntry: (customType: string, data: unknown) => string }) => Promise<void>;
+			withSession?: (ctx: {
+				ui: {
+					notify: (message: string, type?: string) => void;
+					setWidget: (id: string, widget: unknown) => void;
+					setStatus: (id: string, value: unknown) => void;
+					setHeader: (value: unknown) => void;
+				};
+				sessionManager: { getSessionId: () => string; getSessionFile: () => string };
+				getContextUsage: () => { percent: number; tokens: number };
+				sendUserMessage: (text: string, options?: unknown) => void;
+				sendMessage: (message: { customType?: string; content?: string }, options?: unknown) => void;
+			}) => Promise<void>;
 		}) => Promise<{ cancelled: boolean }>;
 		ui: {
 			setWidget: (id: string, widget: unknown) => void;
@@ -189,6 +200,10 @@ interface FakeCtx {
 	compactAutoSettle: { value: boolean };
 	/** ctx.newSession() calls, in order (with the simulated new session id). */
 	newSessionCalls: Array<{ parentSession?: string; newId: string }>;
+	/** Messages delivered on the fresh replacement context (withSession). */
+	replacementMessages: FakeUserMessage[];
+	/** Custom messages delivered on the fresh replacement context (withSession). */
+	replacementCustomMessages: FakeCustomMessage[];
 }
 
 interface FakeCompactCall {
@@ -216,6 +231,8 @@ function createFakeCtx(cwd: string): FakeCtx {
 	const compactCalls: FakeCompactCall[] = [];
 	const compactAutoSettle = { value: true };
 	const newSessionCalls: FakeCtx['newSessionCalls'] = [];
+	const replacementMessages: FakeUserMessage[] = [];
+	const replacementCustomMessages: FakeCustomMessage[] = [];
 
 	const ctx = {
 		cwd,
@@ -255,21 +272,56 @@ function createFakeCtx(cwd: string): FakeCtx {
 		// session id, then withSession() against a replacement context. The
 		// new session's ralph file is <agentDir>/ralph/<newId>.db.
 		newSession: (options?: {
-		parentSession?: string;
-		setup?: (sm: { getSessionId: () => string; getSessionFile: () => string }) => Promise<void>;
-		withSession?: (ctx: { ui: { notify: (message: string, type?: string) => void } }) => Promise<void>;
+			parentSession?: string;
+			setup?: (sm: { getSessionId: () => string; getSessionFile: () => string }) => Promise<void>;
+			withSession?: (ctx: {
+				ui: {
+					notify: (message: string, type?: string) => void;
+					setWidget: (id: string, widget: unknown) => void;
+					setStatus: (id: string, value: unknown) => void;
+					setHeader: (value: unknown) => void;
+				};
+				sessionManager: { getSessionId: () => string; getSessionFile: () => string };
+				getContextUsage: () => { percent: number; tokens: number };
+			}) => Promise<void>;
 		}) => {
-		const newId = `new-session-${newSessionCalls.length + 1}`;
-		newSessionCalls.push({ parentSession: options?.parentSession, newId });
-		const fakeSm = { getSessionId: () => newId, getSessionFile: () => join(cwd, `${newId}.jsonl`) };
-		const replacementCtx = {
-		ui: {
-		notify: (message: string, type?: string) => {
-		notifications.push({ message, type });
-		}
-		}
-		};
-		return Promise.resolve(
+			const newId = `new-session-${newSessionCalls.length + 1}`;
+			newSessionCalls.push({ parentSession: options?.parentSession, newId });
+		const fakeSm = {
+				getSessionId: () => newId,
+				getSessionFile: () => join(cwd, `${newId}.jsonl`),
+				// The new session's entries: the state appended by setup lands on
+				// the branch the extension scans (like the real SessionManager).
+				appendCustomEntry: (customType: string, data: unknown) => {
+					branchEntries.push({ type: 'custom', customType, data });
+					return `entry-${branchEntries.length}`;
+				}
+			};
+			const replacementCtx = {
+				ui: {
+					notify: (message: string, type?: string) => {
+						notifications.push({ message, type });
+					},
+					// The new session's status surface shares the fake's widgets
+					// map, so the post-rollover status line is assertable.
+					setWidget: (id: string, widget: unknown) => {
+						widgets.set(id, widget);
+					},
+					setStatus: () => {},
+					setHeader: () => {}
+				},
+				sessionManager: fakeSm,
+				getContextUsage: () => ({ percent: 10, tokens: 10 }),
+				// Messages delivered on the fresh replacement context (the old
+				// pi facade is stale after the session replacement).
+				sendUserMessage: (text: string, options?: unknown) => {
+					replacementMessages.push({ text, options });
+				},
+				sendMessage: (message: { customType?: string; content?: string }, options?: unknown) => {
+					replacementCustomMessages.push({ message, options });
+				}
+			};
+			return Promise.resolve(
 		(async () => {
 		await options?.setup?.(fakeSm);
 		await options?.withSession?.(replacementCtx);
@@ -334,7 +386,9 @@ function createFakeCtx(cwd: string): FakeCtx {
 		branchEntries,
 		compactCalls,
 		compactAutoSettle,
-		newSessionCalls
+		newSessionCalls,
+		replacementMessages,
+		replacementCustomMessages
 	};
 }
 
@@ -427,6 +481,7 @@ describe('ralph-loop extension', () => {
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect(statusLine(fakeCtx.widgets)).toContain('cycle: task');
 		}
@@ -439,6 +494,7 @@ describe('ralph-loop extension', () => {
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect(statusLine(fakeCtx.widgets)).toContain('cycle: budget');
 		}
@@ -1587,6 +1643,18 @@ async function runNew(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx, a
 	await ralph.handler(args ? `new ${args}` : 'new', fakeCtx.ctx);
 }
 
+/** Run the /ralph rollover subcommand. */
+async function runRollover(fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx, args = '') {
+	const ralph = fake.commands.get('ralph')!;
+	await ralph.handler(args ? `rollover ${args}` : 'rollover', fakeCtx.ctx);
+}
+
+/** The last persisted ralph state entry in the fake session. */
+const lastState = (fake: ReturnType<typeof createFakePi>) =>
+	(fake.entries.filter((e) => (e as { customType?: string }).customType === 'ralph-loop-state') as Array<{
+		data: Record<string, unknown>;
+	}>).at(-1)?.data;
+
 /** The ralph file of another (source) session in the fake agent directory. */
 const srcSessionFile = (id: string) => join(agentDir, 'ralph', `${id}.db`);
 /** Create a source session's ralph file with the given tasks/goal. */
@@ -1947,6 +2015,208 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			await runNew(fake, fakeCtx, '--bogus');
 			expect(fakeCtx.newSessionCalls).toHaveLength(0);
 			expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph new [--all]');
+		});
+	});
+	describe('/ralph rollover', () => {
+		test('refuses without an active loop', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			await runRollover(fake, fakeCtx);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('No active Ralph loop');
+			await runRollover(fake, fakeCtx, '--now');
+			expect(fakeCtx.newSessionCalls).toHaveLength(0);
+		});
+
+		test('schedules for the next cycle boundary and --cancel unschedules', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+
+			await runRollover(fake, fakeCtx);
+			expect(lastState(fake)?.rolloverRequested).toBe(true);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Session rollover scheduled');
+
+			// Scheduling twice does not stack.
+			await runRollover(fake, fakeCtx);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('already scheduled');
+
+			await runRollover(fake, fakeCtx, '--cancel');
+			expect(lastState(fake)?.rolloverRequested).toBe(false);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('cancelled');
+
+			// Cancelling without a schedule is a no-op notice.
+			await runRollover(fake, fakeCtx, '--cancel');
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('No session rollover is scheduled');
+		});
+
+		test('--now rolls the loop over to a new session with the state carried', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+			const before = readBacklog().counts();
+
+			await runRollover(fake, fakeCtx, '--now');
+			expect(fakeCtx.newSessionCalls).toHaveLength(1);
+			expect(fakeCtx.newSessionCalls[0]!.parentSession).toBe(join(dir, 'session.jsonl'));
+
+			// The new session's backlog is a wholesale copy of the old one, with
+			// the old session's file recorded as a source (the lineage).
+			const cloned = Backlog.open(join(agentDir, 'ralph', 'new-session-1.db'));
+			expect(cloned.counts()).toEqual(before);
+			expect(cloned.sources()).toContain(autoFile());
+			// The old session's backlog is untouched.
+			expect(readBacklog().counts()).toEqual(before);
+
+			// The carried loop state: the old session's last entry is the
+			// terminal one (the loop is handed off, not stopped in place), and
+			// the new session's branch carries the enabled state on the new
+			// session's ralph file with the continuedFrom lineage and the
+			// carried iteration count.
+			const terminal = lastState(fake)!
+			expect(terminal.enabled).toBe(false);
+			const carriedEntry = ((fakeCtx.branchEntries
+				.filter((e) => (e as { customType?: string }).customType === 'ralph-loop-state') as Array<{
+					data: Record<string, unknown>;
+				}>).at(-1))?.data
+			expect(carriedEntry?.enabled).toBe(true);
+			expect(carriedEntry?.todoPath).toBe(join(agentDir, 'ralph', 'new-session-1.db'));
+			expect(carriedEntry?.iteration).toBe(2);
+			expect(carriedEntry?.rolloverRequested).toBe(false);
+			expect(carriedEntry?.continuedFrom).toEqual({
+				sessionId: 'test-session',
+				sessionPath: join(dir, 'session.jsonl'),
+				iteration: 2
+			});
+
+			// The fresh iteration prompt (delivered on the replacement context)
+			// names the old session's transcript.
+			const prompt = fakeCtx.replacementMessages.at(-1)?.text ?? '';
+			expect(prompt).toContain('Run the Ralph loop');
+			expect(prompt).toContain('continues from session test-session');
+			expect(prompt).toContain(join(dir, 'session.jsonl'));
+
+			// The new session's status bar shows the continuation marker (the
+			// rolled-over session's short id) for the life of the session.
+			expect(statusLine(fakeCtx.widgets)).toContain('↩ test-ses');
+			// /ralph status names the full lineage.
+			const ralph = fake.commands.get('ralph')!;
+			await ralph.handler('status', fakeCtx.ctx);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain(
+				'continued from session test-session (iteration 2 carried over)'
+			);
+		});
+
+		test('--now waits for the run to finish', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+			fakeCtx.idle.value = false;
+
+			await runRollover(fake, fakeCtx, '--now');
+			expect(fakeCtx.newSessionCalls).toHaveLength(0);
+			expect(fakeCtx.notifications.at(-1)?.message).toContain('Wait for the current agent run to finish');
+		});
+
+		test('a scheduled rollover dispatches the switch at the cycle boundary', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+			await runRollover(fake, fakeCtx);
+
+			// The model completes task one and settles; the recording turn settles:
+			// the cycle boundary rolls over instead of cutting the context.
+			await writeFile(autoFile(), RALPH_V2_TASK_ONE_DONE_LOGGED);
+			fakeCtx.usagePercent.value = 10;
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			await flush();
+
+			expect(fakeCtx.compactCalls).toHaveLength(0);
+			const dispatch = fake.userMessages.at(-1);
+			expect(dispatch?.text).toBe('/ralph rollover --now');
+			expect(dispatch?.options).toEqual({ expandPromptTemplates: true });
+			// The same-session fresh-iteration prompt was NOT sent (only the start prompt).
+			expect(fake.userMessages.filter((m) => m.text.includes('Run the Ralph loop')).length).toBe(1);
+		});
+
+		test('the opt-in slowness trigger dispatches a rollover at the cycle boundary', async () => {
+			// A saved config with session rollover enabled and a low message limit.
+			await writeFile(
+				join(dir, '.pi', 'ralph-loop.json'),
+				`${JSON.stringify({
+					contextThresholds: {},
+					autoApproveDecisions: false,
+					maxIterations: 10,
+					rollover: { enabled: true, walkMs: 500, maxMB: 50, maxMessages: 10 }
+				})}\n`
+			);
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			// A "heavy" transcript: the probe counts branch messages.
+			for (let i = 0; i < 10; i += 1) {
+				fakeCtx.branchEntries.push({ type: 'message', id: `heavy-${i}`, message: { role: 'user', content: 'x' } });
+			}
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+
+			await writeFile(autoFile(), RALPH_V2_TASK_ONE_DONE_LOGGED);
+			fakeCtx.usagePercent.value = 10;
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			await flush();
+
+			expect(fakeCtx.notifications.some((n) => n.message.includes('slowing down the UI'))).toBe(true);
+			const dispatch = fake.userMessages.at(-1);
+			expect(dispatch?.text).toBe('/ralph rollover --now');
+		});
+
+		test('a stored state with rollover fields restores (validation)', async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			// The branch already carries a rolled-over state before the
+			// session starts (the new session's file has the carried entry).
+			fakeCtx.branchEntries.push({
+				type: 'custom',
+				customType: 'ralph-loop-state',
+				data: {
+					enabled: true,
+					mode: 'tasks',
+					todoPath: autoFile(),
+					baseline: { ralph: true, completed: 0 },
+					iteration: 7,
+					taskIteration: 1,
+					maxIterations: 20,
+					contextThreshold: 0.8,
+					autoApproveDecisions: false,
+					cycleQueued: false,
+					cycleCheckpointing: false,
+					stopRequested: false,
+					paused: false,
+					blocked: false,
+					cycleOn: 'task',
+					rolloverRequested: false,
+					continuedFrom: { sessionId: 'old-session', sessionPath: '/old/session.jsonl', iteration: 7 }
+				}
+			});
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			// The restored state carries the iteration count (the session's saved
+			// config — maxIterations 10 — wins over the carried 20).
+			const status = statusLine(fakeCtx.widgets);
+			expect(status).toContain('iteration 7/10');
 		});
 	});
 
@@ -3911,6 +4181,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		expect((command.getArgumentCompletions('') ?? []).map((o) => o.value)).toEqual([
 			'start',
 			'new',
+			'rollover',
 			'import',
 			'set-goal',
 			'stop',
@@ -5799,6 +6070,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
@@ -5808,6 +6080,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
@@ -5817,6 +6090,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
@@ -5830,6 +6104,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
@@ -5850,6 +6125,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
@@ -5862,6 +6138,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
@@ -5871,6 +6148,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
@@ -5880,6 +6158,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('task');
 		}
@@ -5892,6 +6171,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
@@ -5901,6 +6181,7 @@ M list "Plan"
 			const fake = createFakePi();
 			extension(fake.pi as never);
 			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
 			await startLoop(fake, fakeCtx);
 			expect((stateEntries(fake).at(-1)!.data as { cycleOn: string }).cycleOn).toBe('budget');
 		}
