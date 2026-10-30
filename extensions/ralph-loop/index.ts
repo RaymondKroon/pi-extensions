@@ -126,7 +126,7 @@ function cycleOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): Cycle
  * the new session. The old session stays as a read-only archive.
  */
 interface RolloverConfig {
-	/** Master switch: when false, only an explicit /ralph rollover schedules a rollover. */
+	/** Master switch for the AUTOMATIC (slowness) trigger: when false, only a manual /ralph rollover rolls the session over — the manual command always works. */
 	enabled: boolean;
 	/** Roll over when a cycle-boundary branch walk (the work the TUI re-does on every render and resume) takes at least this long (ms). */
 	walkMs: number;
@@ -4426,7 +4426,7 @@ export default function (pi: ExtensionAPI) {
 					: id === 'cycleOnAuto'
 						? `cycle (auto loop) ${next.cycleOn.auto}`
 						: id === 'rolloverEnabled'
-							? `session rollover ${next.rollover.enabled ? 'enabled' : 'disabled'}`
+							? `auto session rollover ${next.rollover.enabled ? 'enabled' : 'disabled'}`
 							: id === 'rolloverWalkMs'
 								? `rollover walk limit ${next.rollover.walkMs}ms`
 								: id === 'rolloverMaxMB'
@@ -4533,9 +4533,9 @@ export default function (pi: ExtensionAPI) {
 			},
 			{
 				id: 'rolloverEnabled',
-				label: 'Session rollover',
+				label: 'Auto session rollover',
 				description:
-					'At a cycle boundary, roll the loop over to a new pi session when the session is slowing down the UI (the session file only ever grows, and the TUI re-does the whole transcript on every render and resume): the backlog and the loop state (iteration count against maxIterations, category, pending decision) move to the new session, and the old session stays as a read-only archive. Opt-in; /ralph rollover schedules a rollover manually regardless of this setting.',
+					'Automatic trigger: at a cycle boundary, roll the loop over to a new pi session when the session is slowing down the UI (the session file only ever grows, and the TUI re-does the whole transcript on every render and resume): the backlog and the loop state (iteration count against maxIterations, category, pending decision) move to the new session, and the old session stays as a read-only archive. Disabling this only turns off the automatic trigger — a manual /ralph rollover always works. /ralph status shows the progress on each limit either way.',
 				currentValue: config.rollover.enabled ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
 			},
@@ -4543,7 +4543,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'rolloverWalkMs',
 				label: 'Rollover: branch walk limit (ms)',
 				description:
-					'Roll over when a cycle-boundary walk of the session transcript (the work the TUI re-does on every render and resume) takes at least this long. Requires session rollover enabled.',
+					'Roll over when a cycle-boundary walk of the session transcript (the work the TUI re-does on every render and resume) takes at least this long. Requires auto session rollover enabled.',
 				currentValue: String(config.rollover.walkMs),
 				submenu: (currentValue, done) =>
 					numericSettingSubmenu(
@@ -4564,7 +4564,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'rolloverMaxMB',
 				label: 'Rollover: session file limit (MB)',
 				description:
-					'Roll over when the session file (the transcript, which only ever grows) reaches this size. Requires session rollover enabled.',
+					'Roll over when the session file (the transcript, which only ever grows) reaches this size. Requires auto session rollover enabled.',
 				currentValue: String(config.rollover.maxMB),
 				submenu: (currentValue, done) =>
 					numericSettingSubmenu(
@@ -4585,7 +4585,7 @@ export default function (pi: ExtensionAPI) {
 				id: 'rolloverMaxMessages',
 				label: 'Rollover: message limit',
 				description:
-					'Roll over when the session transcript reaches this many messages. Requires session rollover enabled.',
+					'Roll over when the session transcript reaches this many messages. Requires auto session rollover enabled.',
 				currentValue: String(config.rollover.maxMessages),
 				submenu: (currentValue, done) =>
 					numericSettingSubmenu(
@@ -4871,7 +4871,7 @@ export default function (pi: ExtensionAPI) {
 					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal) or pi --ralph-goal <goal-text | goal-file.md> at session start (pi --ralph-max-context <percent> and pi --ralph-cycle <task|budget> override its context threshold and cycle mode). Markdown TODOs must be imported first: /ralph import TODO.md.'
 				},
 				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start. For an ACTIVE loop, prefer /ralph rollover — it also carries the loop state and keeps running.' },
-				{ value: 'rollover', label: 'rollover', description: 'Move the active loop to a new pi session without losing ralph state: the backlog is copied (old file recorded as a source), the loop state (iteration count against maxIterations, category, pending decision) is carried with a lineage note, and the fresh iteration starts in the new session. No argument schedules it for the end of the current iteration; --now rolls over immediately (idle only); --cancel unschedules. An opt-in slowness trigger (session rollover in /ralph config) does the same automatically.' },
+				{ value: 'rollover', label: 'rollover', description: 'Move the active loop to a new pi session without losing ralph state: the backlog is copied (old file recorded as a source), the loop state (iteration count against maxIterations, category, pending decision) is carried with a lineage note, and the fresh iteration starts in the new session. No argument schedules it for the end of the current iteration; --now rolls over immediately (idle only); --cancel unschedules. The automatic trigger (auto session rollover in /ralph config) does the same at a cycle boundary.' },
 				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
 			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
@@ -4938,9 +4938,12 @@ export default function (pi: ExtensionAPI) {
 					state?.mode === 'goal' ? 'Ralph goal loop' : state?.mode === 'auto' ? 'Ralph auto loop' : 'Ralph loop';
 				// How far the session is along each rollover limit (the probe's
 				// measurements at a glance; the probe itself only runs at cycle
-				// boundaries, so measure here on demand).
+				// boundaries, so measure here on demand). The auto marker makes
+				// explicit that "off" only disables the automatic trigger — a
+				// manual /ralph rollover always works.
 				const health = measureSessionHealth(ctx);
-				const healthSegment = ` · session: walk ${Math.round(health.walkMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}`;
+				const rolloverMode = config.rollover.enabled ? 'on' : 'off (manual: /ralph rollover)';
+				const healthSegment = ` · session: rollover auto: ${rolloverMode} · walk ${Math.round(health.walkMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}`;
 				ctx.ui.notify(
 					(!state?.enabled
 					? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`

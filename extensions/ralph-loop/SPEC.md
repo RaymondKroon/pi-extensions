@@ -496,7 +496,7 @@ as a read-only archive that the model can consult.
   duplicate schedules are no-ops.
 - **Manual, immediate**: `/ralph rollover --now` (active loop + idle) performs
   the switch right away.
-- **Opt-in slowness trigger** (`/ralph config` → "Session rollover",
+- **Opt-in slowness trigger** (`/ralph config` → "Auto session rollover",
   **off by default**): at each boundary, `probeSessionHealth` measures the
   cost the TUI pays — the timed `getBranch()` walk of the active branch, the
   session file size, and the branch message count — and the loop rolls over
@@ -565,11 +565,14 @@ boundary dispatch):
   appends `· continued from session <id> (iteration <N> carried over)`.
 - Rollover-limit progress: every loop-active `/ralph status` notification
   (running, paused, blocked, cycle-boundary, and stop-pending states) appends
-  `· session: walk <ms>/<walkMs>ms · file <x.x>MB/<maxMB>MB ·
-  messages <n>/<maxMessages>` — the same three measurements the boundary
-  probe takes (`measureSessionHealth`, which the probe reuses), measured on
-  demand so the timed branch walk never runs on the render path. Stopped
-  loops show no segment (there is no loop to roll over).
+  `· session: rollover auto: on|off (manual: /ralph rollover) · walk
+  <ms>/<walkMs>ms · file <x.x>MB/<maxMB>MB · messages <n>/<maxMessages>` —
+  the same three measurements the boundary probe takes (`measureSessionHealth`,
+  which the probe reuses), measured on demand so the timed branch walk never
+  runs on the render path. The `rollover auto:` marker makes explicit that
+  disabling the setting only turns off the automatic trigger — a manual
+  `/ralph rollover` always works. Stopped loops show no segment (there is no
+  loop to roll over).
 
 ### Boundary
 

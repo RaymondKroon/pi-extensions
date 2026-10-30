@@ -425,8 +425,8 @@ let agentDir: string;
 const autoFile = () => join(agentDir, 'ralph', 'test-session.db');
 /** Read a ralph file from disk (a SQLite database; legacy text auto-migrates). */
 const readBacklog = (path: string = autoFile()): Backlog => Backlog.open(path);
-/** Matches the /ralph status session-health segment against the default rollover limits. */
-const ROLLOVER_PROGRESS_PATTERN = / · session: walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/;
+/** Matches the /ralph status session-health segment (auto rollover off — the default) against the default rollover limits. */
+const ROLLOVER_PROGRESS_PATTERN = / · session: rollover auto: off \(manual: \/ralph rollover\) · walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/;
 /** The rendered text form of a ralph file (for snapshot comparisons). */
 const renderFile = (path: string = autoFile()): string => Backlog.open(path).render();
 
@@ -3122,7 +3122,30 @@ GB
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
 		const message = fakeCtx.notifications.at(-1)?.message ?? '';
 		expect(message).toContain('Ralph loop is active');
-		expect(message).toMatch(/ · session: walk \d+ms\/500ms · file 2\.0MB\/50MB · messages 5\/3000$/);
+		expect(message).toMatch(/ · session: rollover auto: off \(manual: \/ralph rollover\) · walk \d+ms\/500ms · file 2\.0MB\/50MB · messages 5\/3000$/);
+	});
+
+	test('status shows rollover auto on when enabled', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({
+				contextThresholds: {},
+				autoApproveDecisions: false,
+				maxIterations: 10,
+				rollover: { enabled: true, walkMs: 500, maxMB: 50, maxMessages: 3000 }
+			})}\n`
+		);
+		await writeFile(autoFile(), RALPH_V1);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		const message = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(message).toContain('Ralph loop is active');
+		expect(message).toMatch(/ · session: rollover auto: on · walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/);
 	});
 });
 
