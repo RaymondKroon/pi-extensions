@@ -426,7 +426,7 @@ const autoFile = () => join(agentDir, 'ralph', 'test-session.db');
 /** Read a ralph file from disk (a SQLite database; legacy text auto-migrates). */
 const readBacklog = (path: string = autoFile()): Backlog => Backlog.open(path);
 /** Matches the /ralph status session-health segment (auto rollover off — the default) against the default rollover limits. */
-const ROLLOVER_PROGRESS_PATTERN = / · session: rollover auto: off \(manual: \/ralph rollover\) · walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/;
+const ROLLOVER_PROGRESS_PATTERN = / · session: render \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000 \(auto rollover disabled\)$/;
 /** The rendered text form of a ralph file (for snapshot comparisons). */
 const renderFile = (path: string = autoFile()): string => Backlog.open(path).render();
 
@@ -2190,6 +2190,70 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			expect(dispatch?.text).toBe('/ralph rollover --now');
 		});
 
+		test('the render-time high-water mark drives status and the slowness trigger, not a single sample', async () => {
+			// Auto rollover enabled, default 500ms render-time limit.
+			await writeFile(
+				join(dir, '.pi', 'ralph-loop.json'),
+				`${JSON.stringify({
+					contextThresholds: {},
+					autoApproveDecisions: false,
+					maxIterations: 20,
+					rollover: { enabled: true, walkMs: 500, maxMB: 50, maxMessages: 3000 }
+				})}\n`
+			);
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			// A restored loop whose session was slow at some point: the
+			// high-water mark is 600ms (over the 500ms limit) even though the
+			// session is fast right now — a current sample would say "healthy".
+			fakeCtx.branchEntries.push({
+				type: 'custom',
+				customType: 'ralph-loop-state',
+				data: {
+					enabled: true,
+					mode: 'tasks',
+					todoPath: autoFile(),
+					baseline: { ralph: true, completed: 0 },
+					iteration: 7,
+					taskIteration: 1,
+					maxIterations: 20,
+					contextThreshold: 0.8,
+					autoApproveDecisions: false,
+					cycleQueued: false,
+					cycleCheckpointing: false,
+					stopRequested: false,
+					paused: false,
+					blocked: false,
+					cycleOn: 'task',
+					rolloverRequested: false,
+					walkMsMax: 600
+				}
+			});
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+
+			// /ralph status shows the worst measured render time, not the (fast)
+			// current sample.
+			await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+			const status = fakeCtx.notifications.at(-1)?.message ?? '';
+			expect(status).toContain('Ralph loop is active · iteration 7/20');
+			expect(status).toMatch(/ · session: render 600ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/);
+
+			// The slowness trigger decides on the mark too: a completed task at
+			// the cycle boundary rolls the loop over, though the current walk is
+			// fast.
+			await writeFile(autoFile(), RALPH_V2_TASK_ONE_DONE_LOGGED);
+			fakeCtx.usagePercent.value = 10;
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			await flush();
+
+			expect(fakeCtx.notifications.some((n) => n.message.includes('render time 600ms (limit 500ms)'))).toBe(true);
+			const dispatch = fake.userMessages.at(-1);
+			expect(dispatch?.text).toBe('/ralph rollover --now');
+		});
+
 		test('a stored state with rollover fields restores (validation)', async () => {
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -3122,10 +3186,10 @@ GB
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
 		const message = fakeCtx.notifications.at(-1)?.message ?? '';
 		expect(message).toContain('Ralph loop is active');
-		expect(message).toMatch(/ · session: rollover auto: off \(manual: \/ralph rollover\) · walk \d+ms\/500ms · file 2\.0MB\/50MB · messages 5\/3000$/);
+		expect(message).toMatch(/ · session: render \d+ms\/500ms · file 2\.0MB\/50MB · messages 5\/3000 \(auto rollover disabled\)$/);
 	});
 
-	test('status shows rollover auto on when enabled', async () => {
+	test('status shows the render limit without the disabled note when auto rollover is on', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3145,7 +3209,7 @@ GB
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
 		const message = fakeCtx.notifications.at(-1)?.message ?? '';
 		expect(message).toContain('Ralph loop is active');
-		expect(message).toMatch(/ · session: rollover auto: on · walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/);
+		expect(message).toMatch(/ · session: render \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/);
 	});
 });
 

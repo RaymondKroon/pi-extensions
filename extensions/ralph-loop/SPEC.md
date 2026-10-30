@@ -497,12 +497,16 @@ as a read-only archive that the model can consult.
 - **Manual, immediate**: `/ralph rollover --now` (active loop + idle) performs
   the switch right away.
 - **Opt-in slowness trigger** (`/ralph config` → "Auto session rollover",
-  **off by default**): at each boundary, `probeSessionHealth` measures the
-  cost the TUI pays — the timed `getBranch()` walk of the active branch, the
-  session file size, and the branch message count — and the loop rolls over
-  when any configured limit is met or exceeded (`walkMs`, `maxMB`,
-  `maxMessages`; defaults 500ms / 50MB / 3000). The manual command works
-  regardless of the setting.
+  **off by default**): the session's health is measured by
+  `measureSessionHealth` — the timed `getBranch()` walk of the active branch
+  ("render time": the very work the TUI re-does on every render and resume,
+  sampled at every turn settle so the cost stays off the render path), the
+  session file size, and the branch message count. The render time is judged
+  on a HIGH-WATER MARK (`walkMsMax`, ratcheted at every settle and by
+  `/ralph status`) rather than a single sample — the session is not slow all
+  the time. At each cycle boundary, `probeSessionHealth` rolls the loop over
+  when any limit is met or exceeded (`walkMs`, `maxMB`, `maxMessages`; defaults
+  500ms / 50MB / 3000). The manual command works regardless of the setting.
 - The automatic/scheduled triggers dispatch the switch as
   `pi.sendUserMessage('/ralph rollover --now', { expandPromptTemplates: true })`
   — session control (`ctx.newSession`) is command-context-only, and pi
@@ -550,8 +554,10 @@ boundary dispatch):
 ## 5. Surface changes
 
 - `RalphState`: `+ rolloverRequested?: boolean`, `+ continuedFrom?:
-  { sessionId, sessionPath, iteration }` (validated; ride `normalizeState`'s
-  rest-spread).
+  { sessionId, sessionPath, iteration }`, `+ walkMsMax?: number` (validated;
+  ride `normalizeState`'s rest-spread). `walkMsMax` is the render-time
+  high-water mark — NOT carried over a rollover (the new session is measured
+  from scratch).
 - `RalphConfig`: `+ rollover: { enabled, walkMs, maxMB, maxMessages }`
   (opt-in, `enabled` defaults false; `migrateRollover` fills older stored
   configs); config GUI gains four rows.
@@ -561,18 +567,20 @@ boundary dispatch):
 - Status bar mode word: `on (rollover: next cycle)` while scheduled.
 - Continuation marker: the rolled-into session's status bar shows
   `· ↩ <source-session-id[0:8]>` (both the active and the idle lines; it stays
-  after a stop — the session is still the continuation), and `/ralph status`
-  appends `· continued from session <id> (iteration <N> carried over)`.
+  after a stop — the session is still the continuation). It follows the
+  non-default modifiers, so the active line reads e.g. `on (compaction) ·
+  ↩ 01a18824 · cycle: task …` — the modifiers group with the state word, the
+  lineage marker comes after. `/ralph status` appends `· continued from
+  session <id> (iteration <N> carried over)`.
 - Rollover-limit progress: every loop-active `/ralph status` notification
   (running, paused, blocked, cycle-boundary, and stop-pending states) appends
-  `· session: rollover auto: on|off (manual: /ralph rollover) · walk
-  <ms>/<walkMs>ms · file <x.x>MB/<maxMB>MB · messages <n>/<maxMessages>` —
-  the same three measurements the boundary probe takes (`measureSessionHealth`,
-  which the probe reuses), measured on demand so the timed branch walk never
-  runs on the render path. The `rollover auto:` marker makes explicit that
-  disabling the setting only turns off the automatic trigger — a manual
-  `/ralph rollover` always works. Stopped loops show no segment (there is no
-  loop to roll over).
+  `· session: render <max>ms/<walkMs>ms · file <x.x>MB/<maxMB>MB · messages
+  <n>/<maxMessages> (auto rollover disabled)` — the `(auto rollover disabled)`
+  note appears only when the automatic trigger is off, making explicit that a
+  manual `/ralph rollover` always works. `render` is the high-water mark
+  (`walkMsMax`), not the current sample; file size and message count are the
+  current measurements (`measureSessionHealth`). Stopped loops show no
+  segment (there is no loop to roll over).
 
 ### Boundary
 

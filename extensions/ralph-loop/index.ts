@@ -128,7 +128,7 @@ function cycleOnFor(mode: 'tasks' | 'goal' | 'auto', config: RalphConfig): Cycle
 interface RolloverConfig {
 	/** Master switch for the AUTOMATIC (slowness) trigger: when false, only a manual /ralph rollover rolls the session over — the manual command always works. */
 	enabled: boolean;
-	/** Roll over when a cycle-boundary branch walk (the work the TUI re-does on every render and resume) takes at least this long (ms). */
+	/** Roll over when the measured render time — the branch walk the TUI re-does on every render and resume, sampled at every turn and judged on the worst (high-water) value — takes at least this long (ms). */
 	walkMs: number;
 	/** Roll over when the session file is at least this large (MB). */
 	maxMB: number;
@@ -163,12 +163,18 @@ function migrateRollover(value: unknown): RolloverConfig {
 	};
 }
 
+interface SessionHealth {
+	/** Render time: the cost to walk the active branch — the very work the TUI re-does on every render and resume. */
+	walkMs: number;
+	sizeMB: number;
+	messages: number;
+}
 /**
  * Measure how heavy a session's transcript is — the cost pi's TUI pays on
  * every render and resume: the active-branch walk (timed: the very work the
  * UI re-does), the session file size, and the message count.
  */
-function measureSessionHealth(ctx: ExtensionContext): { walkMs: number; sizeMB: number; messages: number } {
+function measureSessionHealth(ctx: ExtensionContext): SessionHealth {
 	let messages = 0;
 	let walkMs = 0;
 	try {
@@ -186,13 +192,13 @@ function measureSessionHealth(ctx: ExtensionContext): { walkMs: number; sizeMB: 
 	}
 	return { walkMs, sizeMB, messages };
 }
-/** Compare a session's health against the rollover limits. Returns a reason string when any limit is met or exceeded. */
-function probeSessionHealth(ctx: ExtensionContext, rollover: RolloverConfig): { reason?: string } {
-	const { walkMs, sizeMB, messages } = measureSessionHealth(ctx);
+/** Compare a session's health against the rollover limits. The render time is judged on the high-water mark (worst sample so far), not the current one — the session is not slow all the time. Returns a reason string when any limit is met or exceeded. */
+function probeSessionHealth(health: SessionHealth, walkMsMax: number, rollover: RolloverConfig): { reason?: string } {
 	const reasons: string[] = [];
-	if (walkMs >= rollover.walkMs) reasons.push(`branch walk ${Math.round(walkMs)}ms (limit ${rollover.walkMs}ms)`);
-	if (sizeMB >= rollover.maxMB) reasons.push(`session file ${sizeMB.toFixed(0)}MB (limit ${rollover.maxMB}MB)`);
-	if (messages >= rollover.maxMessages) reasons.push(`${messages} messages (limit ${rollover.maxMessages})`);
+	const renderMs = Math.max(health.walkMs, walkMsMax);
+	if (renderMs >= rollover.walkMs) reasons.push(`render time ${Math.round(renderMs)}ms (limit ${rollover.walkMs}ms)`);
+	if (health.sizeMB >= rollover.maxMB) reasons.push(`session file ${health.sizeMB.toFixed(0)}MB (limit ${rollover.maxMB}MB)`);
+	if (health.messages >= rollover.maxMessages) reasons.push(`${health.messages} messages (limit ${rollover.maxMessages})`);
 	return { reason: reasons.length > 0 ? reasons.join('; ') : undefined };
 }
 /** The cycle tool name. It is part of the auto tool set (pre-activated in auto mode) so the model can request a cycle — and arm the auto loop — even while no loop is active yet. */
@@ -328,6 +334,14 @@ interface RalphState {
 	checkpointHandoff?: boolean;
 	/** The next cycle boundary rolls the loop over to a new pi session instead of a same-session context cut (set by /ralph rollover; cleared by the rollover or --cancel). */
 	rolloverRequested?: boolean;
+	/**
+	 * High-water mark of the measured render time (the branch walk the TUI
+	 * re-does on every render and resume), in ms. Ratcheted at every turn
+	 * settle and by /ralph status; reset by a rollover (the new session is
+	 * measured from scratch). The rollover probe and /ralph status decide on
+	 * the mark, not a single sample — the session is not slow all the time.
+	 */
+	walkMsMax?: number;
 	/** Lineage: the session this loop was rolled over from (set by the rollover). */
 	continuedFrom?: ContinuedFrom;
 }
@@ -443,6 +457,7 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.blocked === undefined || typeof state.blocked === 'boolean') &&
 		(state.blockedItem === undefined || typeof state.blockedItem === 'string') &&
 		(state.rolloverRequested === undefined || typeof state.rolloverRequested === 'boolean') &&
+		(state.walkMsMax === undefined || (typeof state.walkMsMax === 'number' && state.walkMsMax >= 0)) &&
 		(state.continuedFrom === undefined || isContinuedFrom(state.continuedFrom)) &&
 		(state.category === undefined || typeof state.category === 'string') &&
 			(state.completedTasks === undefined ||
@@ -2118,8 +2133,8 @@ export default function (pi: ExtensionAPI) {
 		// auto loop cycles on the context budget, so the headroom matters.
 		const idleContext = idleState !== 'off' ? ` · context: ${contextUsageLabel(ctx, contextThresholdFor(config, ctx))}` : '';
 		const status = !state?.enabled
-			? `${label}: ${idleState}${contSuffix}${modifierSuffix}${cycleSuffix}${idleContext}`
-			: `${label}: ${mode}${contSuffix}${modifierSuffix}${cycleSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
+			? `${label}: ${idleState}${modifierSuffix}${contSuffix}${cycleSuffix}${idleContext}`
+			: `${label}: ${mode}${modifierSuffix}${contSuffix}${cycleSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
 		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
 		// Persistent reminder with the explicit options while paused; the status
@@ -3018,7 +3033,9 @@ export default function (pi: ExtensionAPI) {
 				// immediately, or deferred until this settle finishes. The
 				// request flag stays set: the command clears it on success, and a
 				// failed dispatch retries at the next boundary.
-				const slowness = config.rollover.enabled ? probeSessionHealth(ctx, config.rollover) : { reason: undefined };
+				const slowness = config.rollover.enabled
+					? probeSessionHealth(measureSessionHealth(ctx), state.walkMsMax ?? 0, config.rollover)
+					: { reason: undefined };
 				if (state.rolloverRequested || slowness.reason !== undefined) {
 					ctx.ui.notify(
 						state.rolloverRequested
@@ -3200,10 +3217,13 @@ export default function (pi: ExtensionAPI) {
 				// The carried state: the new session's ralph file plus the
 				// continuedFrom lineage. Written before the new instance's
 				// session_start runs, so its branch scan restores exactly this
-				// state (the loop keeps running in the new session).
+				// state (the loop keeps running in the new session). walkMsMax
+				// is NOT carried: the new session's render time is measured from
+				// scratch.
 				sm.appendCustomEntry(STATE_TYPE, {
 					...next,
 					todoPath: dest,
+					walkMsMax: undefined,
 					continuedFrom: { sessionId: oldSessionId, sessionPath: oldSessionFile, iteration: next.iteration }
 				});
 				return Promise.resolve();
@@ -4051,6 +4071,16 @@ export default function (pi: ExtensionAPI) {
 		// A paused loop stays paused: settles must not queue cycles or fresh
 		// iterations (a typed message resumes the loop before its turn runs).
 		if (state.paused) return;
+		// Render-time high-water mark: sample the branch-walk cost at every
+		// settle — the TUI re-does that walk on every render, so one extra per
+		// turn is negligible. The mark (worst sample so far), not a single
+		// sample, is what /ralph status shows and what the rollover probe
+		// decides on: the session is not slow all the time. It rides the next
+		// state write; after a reload the next settle re-records it.
+		{
+			const { walkMs } = measureSessionHealth(ctx);
+			if (walkMs > (state.walkMsMax ?? 0)) state = { ...state, walkMsMax: walkMs };
+		}
 		if (userAborted) {
 			if (loopPoliceAbort) {
 				// loop-police truncated a looping stream and aborted the run
@@ -4428,7 +4458,7 @@ export default function (pi: ExtensionAPI) {
 						: id === 'rolloverEnabled'
 							? `auto session rollover ${next.rollover.enabled ? 'enabled' : 'disabled'}`
 							: id === 'rolloverWalkMs'
-								? `rollover walk limit ${next.rollover.walkMs}ms`
+								? `rollover render time limit ${next.rollover.walkMs}ms`
 								: id === 'rolloverMaxMB'
 									? `rollover file limit ${next.rollover.maxMB}MB`
 									: id === 'rolloverMaxMessages'
@@ -4541,13 +4571,13 @@ export default function (pi: ExtensionAPI) {
 			},
 			{
 				id: 'rolloverWalkMs',
-				label: 'Rollover: branch walk limit (ms)',
+				label: 'Rollover: render time limit (ms)',
 				description:
-					'Roll over when a cycle-boundary walk of the session transcript (the work the TUI re-does on every render and resume) takes at least this long. Requires auto session rollover enabled.',
+					'Roll over when the measured render time — the branch walk the TUI re-does on every render and resume, sampled at every turn and judged on the worst (high-water) value — takes at least this long. Requires auto session rollover enabled.',
 				currentValue: String(config.rollover.walkMs),
 				submenu: (currentValue, done) =>
 					numericSettingSubmenu(
-						'Rollover branch walk limit (positive whole number, ms)',
+						'Rollover render time limit (positive whole number, ms)',
 						currentValue,
 						(value) => {
 							const limit = Number(value.trim());
@@ -4936,14 +4966,18 @@ export default function (pi: ExtensionAPI) {
 			if (command === 'status') {
 				const loopName =
 					state?.mode === 'goal' ? 'Ralph goal loop' : state?.mode === 'auto' ? 'Ralph auto loop' : 'Ralph loop';
-				// How far the session is along each rollover limit (the probe's
-				// measurements at a glance; the probe itself only runs at cycle
-				// boundaries, so measure here on demand). The auto marker makes
-				// explicit that "off" only disables the automatic trigger — a
-				// manual /ralph rollover always works.
+				// The session's rollover-limit progress: the render time is the
+				// high-water mark (worst measured branch walk so far — a single
+				// sample is noise), sampled at every turn settle and here. The
+				// "auto rollover disabled" note makes explicit that the limits
+				// only trip the automatic trigger — a manual /ralph rollover
+				// always works.
 				const health = measureSessionHealth(ctx);
-				const rolloverMode = config.rollover.enabled ? 'on' : 'off (manual: /ralph rollover)';
-				const healthSegment = ` · session: rollover auto: ${rolloverMode} · walk ${Math.round(health.walkMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}`;
+				if (state?.enabled && health.walkMs > (state.walkMsMax ?? 0)) {
+					persistState({ ...state, walkMsMax: health.walkMs });
+				}
+				const renderMs = state?.enabled ? state.walkMsMax ?? health.walkMs : health.walkMs;
+				const healthSegment = ` · session: render ${Math.round(renderMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}${config.rollover.enabled ? '' : ' (auto rollover disabled)'}`;
 				ctx.ui.notify(
 					(!state?.enabled
 					? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`
