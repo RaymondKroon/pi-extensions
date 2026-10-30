@@ -563,11 +563,13 @@ boundary dispatch):
   `· ↩ <source-session-id[0:8]>` (both the active and the idle lines; it stays
   after a stop — the session is still the continuation), and `/ralph status`
   appends `· continued from session <id> (iteration <N> carried over)`.
-- Rollover-limit progress: the active-line `/ralph status` notification
-  appends `· session: walk <ms>/<walkMs>ms · file <x.x>MB/<maxMB>MB ·
+- Rollover-limit progress: every loop-active `/ralph status` notification
+  (running, paused, blocked, cycle-boundary, and stop-pending states) appends
+  `· session: walk <ms>/<walkMs>ms · file <x.x>MB/<maxMB>MB ·
   messages <n>/<maxMessages>` — the same three measurements the boundary
   probe takes (`measureSessionHealth`, which the probe reuses), measured on
-  demand so the timed branch walk never runs on the render path.
+  demand so the timed branch walk never runs on the render path. Stopped
+  loops show no segment (there is no loop to roll over).
 
 ### Boundary
 

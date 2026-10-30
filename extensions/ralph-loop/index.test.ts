@@ -425,6 +425,8 @@ let agentDir: string;
 const autoFile = () => join(agentDir, 'ralph', 'test-session.db');
 /** Read a ralph file from disk (a SQLite database; legacy text auto-migrates). */
 const readBacklog = (path: string = autoFile()): Backlog => Backlog.open(path);
+/** Matches the /ralph status session-health segment against the default rollover limits. */
+const ROLLOVER_PROGRESS_PATTERN = / · session: walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/;
 /** The rendered text form of a ralph file (for snapshot comparisons). */
 const renderFile = (path: string = autoFile()): string => Backlog.open(path).render();
 
@@ -1249,6 +1251,12 @@ D 3 2026-01-01T00:00:00Z
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
 		// A persistent hint widget offers the explicit alternatives.
 		expect(fakeCtx.widgets.get('ralph-paused')).toBeDefined();
+
+		// /ralph status names the paused state AND the rollover-limit progress.
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		const pausedStatus = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(pausedStatus).toContain('Ralph loop is paused — type a message to resume it with extra info');
+		expect(pausedStatus).toMatch(ROLLOVER_PROGRESS_PATTERN);
 
 		// The user types a message: it resumes the loop as extra info — no
 		// separate loop prompt is sent, the typed message carries it.
@@ -2984,9 +2992,6 @@ GB
 		expect(tool).toBeDefined();
 		return tool!;
 	};
-
-	/** Matches the /ralph status session-health segment against the default rollover limits. */
-	const ROLLOVER_PROGRESS_PATTERN = / · session: walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/;
 
 	test('task-mode status is unchanged: no mode marker, no goal segment', async () => {
 		const fake = createFakePi();

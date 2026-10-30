@@ -4942,27 +4942,31 @@ export default function (pi: ExtensionAPI) {
 				const health = measureSessionHealth(ctx);
 				const healthSegment = ` · session: walk ${Math.round(health.walkMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}`;
 				ctx.ui.notify(
-					!state?.enabled
-						? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`
-						: state.blocked
-							? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
-							: state.paused
-								? `${loopName} is paused — type a message to resume it with extra info`
-				: state.cycleCheckpointing
-					? state.cycleReason === 'completed-task'
-						? `${loopName} is recording the completed task’s progress`
-						: state.cycleReason === 'plan-updated'
-							? `${loopName} is committing the updated plan`
-							: state.cycleReason === 'phase-changed'
-								? `${loopName} is finishing up after the goal phase change`
-								: state.cycleReason === 'model-requested'
-								? `${loopName} is finishing up before the requested fresh iteration`
-								: `${loopName} is finishing up and recording todos for the next iteration`
-									: state.stopRequested
-										? `${loopName} will stop after the current iteration`
-										: state.cycleQueued
-							? `${loopName} is starting a fresh iteration`
-							: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}${state.continuedFrom ? ` · continued from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} carried over)` : ''}${healthSegment}`,
+					(!state?.enabled
+					? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`
+					: state.blocked
+						? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
+						: state.paused
+							? `${loopName} is paused — type a message to resume it with extra info`
+						: state.cycleCheckpointing
+							? state.cycleReason === 'completed-task'
+								? `${loopName} is recording the completed task’s progress`
+								: state.cycleReason === 'plan-updated'
+									? `${loopName} is committing the updated plan`
+									: state.cycleReason === 'phase-changed'
+										? `${loopName} is finishing up after the goal phase change`
+										: state.cycleReason === 'model-requested'
+											? `${loopName} is finishing up before the requested fresh iteration`
+											: `${loopName} is finishing up and recording todos for the next iteration`
+								: state.stopRequested
+									? `${loopName} will stop after the current iteration`
+									: state.cycleQueued
+										? `${loopName} is starting a fresh iteration`
+										: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}${state.continuedFrom ? ` · continued from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} carried over)` : ''}`) +
+					// Shown in every loop-active state (paused, blocked, cycle boundary, and
+					// running): the rollover limits are decided at the boundaries, where the
+					// limits matter most.
+					(state?.enabled ? healthSegment : ''),
 					'info'
 				);
 				return;
