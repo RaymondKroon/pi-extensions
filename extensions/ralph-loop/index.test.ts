@@ -2985,6 +2985,9 @@ GB
 		return tool!;
 	};
 
+	/** Matches the /ralph status session-health segment against the default rollover limits. */
+	const ROLLOVER_PROGRESS_PATTERN = / · session: walk \d+ms\/500ms · file \d+\.\dMB\/50MB · messages \d+\/3000$/;
+
 	test('task-mode status is unchanged: no mode marker, no goal segment', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3001,7 +3004,9 @@ GB
 		expect(status).toContain('task: 1/3 (iteration 1)');
 
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
-		expect(fakeCtx.notifications.at(-1)?.message).toBe('Ralph loop is active · iteration 1/10 · task: 1/3 (iteration 1)');
+		const message = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(message).toContain('Ralph loop is active · iteration 1/10 · task: 1/3 (iteration 1)');
+		expect(message).toMatch(ROLLOVER_PROGRESS_PATTERN);
 	});
 
 	test('task-mode status ignores a goal present in the backlog', async () => {
@@ -3018,9 +3023,9 @@ GB
 		expect(status).not.toContain('goal:');
 
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
-		expect(fakeCtx.notifications.at(-1)?.message).toBe(
-			'Ralph loop is active · iteration 1/10 · task: 1/1 (iteration 1)'
-		);
+		const message = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(message).toContain('Ralph loop is active · iteration 1/10 · task: 1/1 (iteration 1)');
+		expect(message).toMatch(ROLLOVER_PROGRESS_PATTERN);
 	});
 
 	test('goal-mode status shows the mode marker and an open goal', async () => {
@@ -3038,9 +3043,9 @@ GB
 		expect(status).toContain('goal: open');
 
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
-		expect(fakeCtx.notifications.at(-1)?.message).toBe(
-			'Ralph goal loop is active · iteration 1/10 · task: 1/1 (iteration 1) · goal: open'
-		);
+		const message = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(message).toContain('Ralph goal loop is active · iteration 1/10 · task: 1/1 (iteration 1) · goal: open');
+		expect(message).toMatch(ROLLOVER_PROGRESS_PATTERN);
 	});
 
 	test('goal status follows claim and confirm', async () => {
@@ -3091,9 +3096,28 @@ GB
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
 		expect(statusLine(fakeCtx.widgets)).toContain('goal: open');
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
-		expect(fakeCtx.notifications.at(-1)?.message).toBe(
-			'Ralph goal loop is active · iteration 1/10 · task: 0/0 (iteration 1) · goal: open'
-		);
+		const message = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(message).toContain('Ralph goal loop is active · iteration 1/10 · task: 0/0 (iteration 1) · goal: open');
+		expect(message).toMatch(ROLLOVER_PROGRESS_PATTERN);
+	});
+
+	test('status shows the progress on each rollover limit', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), RALPH_V1);
+		// A measurable session: five branch messages and a 2MB session file.
+		for (let i = 0; i < 5; i += 1) {
+			fakeCtx.branchEntries.push({ type: 'message', id: `m-${i}`, message: { role: 'user', content: 'x' } });
+		}
+		await writeFile(join(dir, 'session.jsonl'), Buffer.alloc(2 * 1048576));
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
+		const message = fakeCtx.notifications.at(-1)?.message ?? '';
+		expect(message).toContain('Ralph loop is active');
+		expect(message).toMatch(/ · session: walk \d+ms\/500ms · file 2\.0MB\/50MB · messages 5\/3000$/);
 	});
 });
 

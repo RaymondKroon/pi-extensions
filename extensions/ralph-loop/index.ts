@@ -166,10 +166,9 @@ function migrateRollover(value: unknown): RolloverConfig {
 /**
  * Measure how heavy a session's transcript is — the cost pi's TUI pays on
  * every render and resume: the active-branch walk (timed: the very work the
- * UI re-does), the session file size, and the message count. Returns a reason
- * string when any limit is met or exceeded.
+ * UI re-does), the session file size, and the message count.
  */
-function probeSessionHealth(ctx: ExtensionContext, rollover: RolloverConfig): { reason?: string } {
+function measureSessionHealth(ctx: ExtensionContext): { walkMs: number; sizeMB: number; messages: number } {
 	let messages = 0;
 	let walkMs = 0;
 	try {
@@ -185,6 +184,11 @@ function probeSessionHealth(ctx: ExtensionContext, rollover: RolloverConfig): { 
 	} catch {
 		// In-memory session: no file to measure.
 	}
+	return { walkMs, sizeMB, messages };
+}
+/** Compare a session's health against the rollover limits. Returns a reason string when any limit is met or exceeded. */
+function probeSessionHealth(ctx: ExtensionContext, rollover: RolloverConfig): { reason?: string } {
+	const { walkMs, sizeMB, messages } = measureSessionHealth(ctx);
 	const reasons: string[] = [];
 	if (walkMs >= rollover.walkMs) reasons.push(`branch walk ${Math.round(walkMs)}ms (limit ${rollover.walkMs}ms)`);
 	if (sizeMB >= rollover.maxMB) reasons.push(`session file ${sizeMB.toFixed(0)}MB (limit ${rollover.maxMB}MB)`);
@@ -4932,6 +4936,11 @@ export default function (pi: ExtensionAPI) {
 			if (command === 'status') {
 				const loopName =
 					state?.mode === 'goal' ? 'Ralph goal loop' : state?.mode === 'auto' ? 'Ralph auto loop' : 'Ralph loop';
+				// How far the session is along each rollover limit (the probe's
+				// measurements at a glance; the probe itself only runs at cycle
+				// boundaries, so measure here on demand).
+				const health = measureSessionHealth(ctx);
+				const healthSegment = ` · session: walk ${Math.round(health.walkMs)}ms/${config.rollover.walkMs}ms · file ${health.sizeMB.toFixed(1)}MB/${config.rollover.maxMB}MB · messages ${health.messages}/${config.rollover.maxMessages}`;
 				ctx.ui.notify(
 					!state?.enabled
 						? `${loopName} is stopped${config.autoMode === 'on' ? ' · auto mode: on' : ''}`
@@ -4953,7 +4962,7 @@ export default function (pi: ExtensionAPI) {
 										? `${loopName} will stop after the current iteration`
 										: state.cycleQueued
 							? `${loopName} is starting a fresh iteration`
-							: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}${state.continuedFrom ? ` · continued from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} carried over)` : ''}`,
+							: `${loopName} is active · iteration ${state.iteration}/${state.maxIterations}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''}${state.continuedFrom ? ` · continued from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} carried over)` : ''}${healthSegment}`,
 					'info'
 				);
 				return;
