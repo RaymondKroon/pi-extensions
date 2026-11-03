@@ -19,9 +19,6 @@ example_input: |
   }
 ---
 Run the Ralph {{loopWord}} for this repository. {{contextNote}}
-{{#if continuation~}}
-{{continuation}}
-{{~/if}}
 
 {{#if isAuto~}}
 Read the backlog. The backlog may contain several categories and the loop works through all of them; new todos you record go to your category "{{category}}".

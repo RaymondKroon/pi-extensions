@@ -2142,11 +2142,12 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 			});
 
 			// The fresh iteration prompt (delivered on the replacement context)
-			// names the old session's transcript.
+			// carries no continuation clause — the lineage stays out of the
+			// prompt context (status bar and /ralph status show it).
 			const prompt = fakeCtx.replacementMessages.at(-1)?.text ?? '';
 			expect(prompt).toContain('Run the Ralph loop');
-			expect(prompt).toContain('continues from session test-session');
-			expect(prompt).toContain(join(dir, 'session.jsonl'));
+			expect(prompt).not.toContain('continues from session test-session');
+			expect(prompt).not.toContain(join(dir, 'session.jsonl'));
 
 			// The new session's status bar shows the continuation marker (the
 			// rolled-over session's short id) for the life of the session.

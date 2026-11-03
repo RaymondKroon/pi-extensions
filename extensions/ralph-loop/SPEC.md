@@ -480,8 +480,8 @@ as a read-only archive that the model can consult.
   `blockedItem`, `cycleOn`, thresholds. `loopStart`/`baseline` are
   re-snapshotted from the on-disk backlog at the boundary (they are diff
   inputs, not history). New field `continuedFrom: { sessionId, sessionPath,
-  iteration }` records the lineage; the fresh iteration's prompt renders a
-  continuation clause naming the old session id and transcript path.
+  iteration }` records the lineage (surfaced in the status bar and
+  `/ralph status`, never rendered into the iteration prompt).
 - **Model selection**: the old session's model and thinking (reasoning)
   level are captured before the switch, recorded on the new session's branch
   as `model_change` / `thinking_level_change` entries (in `setup`), and
@@ -550,8 +550,7 @@ boundary dispatch):
      entry appended in `setup` is visible whichever way the first
      `session_start` ordered itself.
    - `withSession(rctx)`: only the fresh replacement context is used —
-     `rctx.sendUserMessage` delivers the fresh iteration prompt (with the
-     continuation clause), `rctx.sendMessage` the completion summary (when
+     `rctx.sendUserMessage` delivers the fresh iteration prompt, `rctx.sendMessage` the completion summary (when
      non-empty), `rctx.ui.notify` the copy-failure error. The old instance's
      in-memory state is set to the carried state (memory only) so the one-shot
      status render shows the active loop on the new session's surface. No
@@ -585,8 +584,9 @@ boundary dispatch):
   (opt-in, `enabled` defaults false; `migrateRollover` fills older stored
   configs); config GUI gains three rows.
 - `/ralph` completions + `knownCommands`: `+ rollover`.
-- `prompts/iteration.md`: `{{#if continuation}}` clause after the opening
-  sentence.
+- `prompts/iteration.md`: no continuation clause — the session-rollover
+  lineage stays out of the iteration prompt (context budget); the status bar
+  marker and `/ralph status` carry it.
 - Status bar mode word: `on (rollover: next cycle)` while scheduled.
 - Continuation marker: the rolled-into session's status bar shows
   `· ↩ <source-session-id[0:8]>` (both the active and the idle lines; it stays

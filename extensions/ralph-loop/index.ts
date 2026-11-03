@@ -1060,12 +1060,6 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 	const isAuto = state.mode === 'auto';
 	const decisionNote = renderPrompt('decision-note', { autoApprove: state.autoApproveDecisions });
 	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
-	// Session-rollover lineage: the fresh iteration in the new session must
-	// know the loop comes from an older session (and where its transcript is)
-	// so it consults history instead of redoing finished work.
-	const continuation = state.continuedFrom
-		? ` This loop continues from session ${state.continuedFrom.sessionId} (iteration ${state.continuedFrom.iteration} of ${state.maxIterations} carried over); its full transcript is at ${state.continuedFrom.sessionPath}. Consult it — and the backlog's completion log — before redoing any work.`
-		: '';
 	const contextNote = isAuto
 		? renderPrompt('context-note-auto', {
 				reason: reason ?? 'first',
@@ -1092,7 +1086,6 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		isGoal: goalInfo !== undefined,
 		phase: goalInfo?.phase ?? '',
 		contextNote,
-		continuation,
 		category: String(state.category),
 		backlogNote: 'The backlog is accessible with the ralph_todo tool.',
 		goalBlock: goalInfo ? goalBlock(goalInfo.goal) : '',
@@ -3156,9 +3149,8 @@ export default function (pi: ExtensionAPI) {
 	 * is copied into the new session (the old file recorded as a source: the
 	 * lineage, and a guard against a later double import), the loop state —
 	 * iteration count against maxIterations, category, pending decision — is
-	 * carried with the continuedFrom lineage, and the fresh iteration starts
-	 * in the new session with a continuation note pointing at the old
-	 * session's transcript.
+	 * carried with the continuedFrom lineage (shown in the status bar and
+	 * `/ralph status`, not in the iteration prompt).
 	 */
 	const rolloverNow = async (ctx: ExtensionCommandContext): Promise<void> => {
 		if (!state?.enabled) {
