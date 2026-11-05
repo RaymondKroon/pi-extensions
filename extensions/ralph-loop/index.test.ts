@@ -2525,8 +2525,43 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 		// Unknown numbers report the known numbers.
 		await expect(run({ action: 'complete', task: 'NOPE' })).rejects.toThrow(/no task NOPE \(tasks: 1, 2, 3, 4\)/);
 
-		// The file stays a valid ralph backlog after every mutation.
-		expect(file().listTasks()).toHaveLength(4);
+	// The file stays a valid ralph backlog after every mutation.
+	expect(file().listTasks()).toHaveLength(4);
+	});
+
+	test('ralph_todo checkpoint over the cap is stored whole but the result asks for a condensed re-recording', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await importTodo(fake, fakeCtx, 'import TODO.md');
+		const ralph = fake.commands.get('ralph')!;
+		await ralph.handler('start', fakeCtx.ctx);
+		const tool = fake.tools.get('ralph_todo') as {
+			execute: (
+				id: string,
+				params: Record<string, unknown>,
+				signal: unknown,
+				onUpdate: unknown,
+				ctx: unknown
+			) => Promise<{ content: Array<{ type: string; text: string }> }>;
+		};
+		const run = (params: Record<string, unknown>) => tool.execute('t', params, undefined, undefined, fakeCtx.ctx);
+		const file = () => readBacklog();
+
+		// Over the 600-char guideline: the stored note is not truncated, but the
+		// tool result asks for a condensed re-recording.
+		const long = 'w'.repeat(700);
+		const over = await run({ action: 'checkpoint', task: '2', note: long });
+		expect(over.content[0]!.text).toContain('Checkpoint recorded for task 2');
+		expect(over.content[0]!.text).toContain('Your checkpoint is 700 chars (guideline: 600)');
+		expect(over.content[0]!.text).toContain('re-record a condensed one');
+		expect(file().listTasks()[1]?.checkpoint).toBe(long);
+
+		// Under the cap: no feedback.
+		const under = await run({ action: 'checkpoint', task: '2', note: 'Next: the shell.' });
+		expect(under.content[0]!.text).toContain('Checkpoint recorded for task 2');
+		expect(under.content[0]!.text).not.toContain('guideline');
 	});
 
 	test('ralph_todo complete with a note records the completion log entry in the same call', async () => {
@@ -3343,11 +3378,33 @@ D 2
 		expect(prompt).toContain('You are executing the goal');
 		expect(prompt).toContain('keep the plan honest');
 		expect(prompt).toContain("add or adjust tasks to the plan's list");
+		expect(prompt).toContain('Never add a task whose only purpose is verifying work that is already complete and committed');
 		// The task workflow is the task prompt plus the goal context.
 		expect(prompt).toContain('action "next"');
 		expect(prompt).toContain('complete the task with a concise note');
 		expect(prompt).not.toContain('planning iteration');
 		expect(prompt).not.toContain('This is a re-evaluation iteration');
+	});
+
+	test('execution prompt: an over-cap goal checkpoint is injected truncated with the full-note pointer', async () => {
+		const note = `Checkpoint state. ${'word '.repeat(120)}tail-marker`;
+		const content = `# ralph v2
+
+G "Rewrite the app" open
+GB
+  - Port the routes.
+GC 1
+  ${note}
+
+T 1 - "Port the routes."
+`;
+		expect(note.length).toBeGreaterThan(600);
+		const { fake } = await startGoalLoop(content);
+		const prompt = fake.userMessages[0].text;
+		expect(prompt).toContain('Goal checkpoint (iteration 1):');
+		expect(prompt).toContain('… (full note via ralph_goal show)');
+		// The tail is out of the injected prompt; the full note stays on disk.
+		expect(prompt).not.toContain('tail-marker');
 	});
 
 	test('re-evaluation prompt: goal open, tasks exist, none open', async () => {
@@ -3580,6 +3637,22 @@ GE "All routes render."
 		goal = file().goal()!;
 		expect(goal.checkpoint).toBe('Plan reviewed; next: start execution.');
 		expect(goal.checkpointIteration).toBe(1);
+	});
+
+	test('checkpoint over the cap is stored whole but the result asks for a condensed re-recording', async () => {
+		const { run } = await startLoopWith(GOAL_OPEN);
+		const file = () => readBacklog();
+
+		const long = 'x'.repeat(650);
+		const over = await run({ action: 'checkpoint', note: long });
+		expect(over.content[0]!.text).toContain('Checkpoint recorded for the goal (iteration 1)');
+		expect(over.content[0]!.text).toContain('Your checkpoint is 650 chars (guideline: 600)');
+		expect(over.content[0]!.text).toContain('re-record a condensed one');
+		expect(file().goal()!.checkpoint).toBe(long);
+
+		// Under the cap: no feedback.
+		const under = await run({ action: 'checkpoint', note: 'Next: start execution.' });
+		expect(under.content[0]!.text).not.toContain('guideline');
 	});
 
 	test('complete requires an active goal loop, an open goal, no open tasks, and evidence', async () => {
@@ -5037,6 +5110,69 @@ describe('ralph-loop extension (cycle compaction and completion summaries)', () 
 		expect(summary?.message.content).toContain('Checkpoints in this loop:');
 		expect(summary?.message.content).toContain('2. Task two: checkpoint (iteration 1): Half done; next step: finish the tests.');
 	});
+
+	test('cycle: checkpoints on done tasks stay out of the summary (the completion log supersedes them)', async () => {
+		const doneTaskCheckpointed = `# ralph v2
+
+T 1 - "Task one"
+C 1 1
+  Stale checkpoint recorded before the task was completed.
+D 1
+L 1 1 2026-09-04
+  Implemented task one; changed a.ts; bun test passed.
+
+T 2 - "Task two"
+C 2 1
+  Half done; next step: finish the tests.
+
+T 3 - "Task three"
+`;
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(autoFile(), doneTaskCheckpointed);
+		fakeCtx.usagePercent.value = 90;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(summary?.message.content).toContain('Checkpoints in this loop:');
+		expect(summary?.message.content).toContain('2. Task two: checkpoint (iteration 1): Half done; next step: finish the tests.');
+		expect(summary?.message.content).not.toContain('Stale checkpoint');
+	});
+
+	test('cycle: an over-cap open checkpoint is injected truncated with the full-note pointer', async () => {
+		const longNote = `Half done. ${'detail '.repeat(90)}tail-marker`;
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		await writeFile(
+			autoFile(),
+			`# ralph v2
+
+T 1 - "Task one"
+
+T 2 - "Task two"
+C 2 1
+  ${longNote}
+
+T 3 - "Task three"
+`
+		);
+		fakeCtx.usagePercent.value = 90;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const summary = fake.customMessages.find((m) => m.message.customType === 'ralph-loop-completion-summary');
+		expect(summary?.message.content).toContain('… (full note via ralph_todo)');
+		expect(summary?.message.content).not.toContain('tail-marker');
+	});
 });
 
 describe('ralph-loop extension (lazy tool activation)', () => {
@@ -5230,11 +5366,11 @@ GB
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		fakeCtx.customControl.factoryHook = undefined;
 		// The config view's factory returns a wrapper that delegates input to
-		// its SettingsList: navigate down to "Auto mode" (5th of 7 items, the
+		// its SettingsList: navigate down to "Auto mode" (7th of 10 items, the
 		// "Save to" scope row first) and press Enter to cycle off→on.
 		const view = created[0] as { handleInput: (data: string) => void };
 		expect(view).toBeDefined();
-		for (let i = 0; i < 5; i++) view.handleInput('\x1b[B');
+		for (let i = 0; i < 6; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r');
 
 		// The tool set changes at the switch — not at the later arming at the
@@ -6996,10 +7132,11 @@ describe('ralph-loop extension (global config store)', () => {
 		await startLoop(fake, fakeCtx);
 
 		const view = await openConfigUi(fake, fakeCtx);
-		// Rows: Save to, Start fresh context at, Maximum iterations, Compaction
+		// Rows: Save to, Start fresh context at, Maximum iterations, Checkpoint
+		// note guideline, Compaction
 		// mode, Auto-approve decisions, Auto mode, Cycle: task loop,
 		// Cycle: goal loop, Cycle: auto loop (last).
-		for (let i = 0; i < 6; i++) view.handleInput('\x1b[B');
+		for (let i = 0; i < 7; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r'); // active task policy task → budget
 		await flush();
 

@@ -127,6 +127,16 @@ Ralph decision workflow.
 - Checkpoints: task iterations checkpoint the task (existing); task-less
   iterations (planning/re-evaluation) checkpoint the goal via
   `ralph_goal checkpoint`.
+- **Checkpoint cap.** The config `checkpointCapChars` (default `600`, `0`
+  disables, in `/ralph config`) bounds the per-iteration cost of checkpoint
+  notes. Checkpoints are re-injected on later iterations, so over the cap the
+  checkpoint tool result asks the model to re-record a condensed one (the
+  stored note is never truncated — no destructive caps), and the injected
+  copies — the goal block of every goal-loop prompt and the progress summary
+  at cycles — are cut on a word boundary with a pointer to the full note
+  (`ralph_goal show`, `ralph_todo` task details, which stay uncapped on
+  demand). The progress summary also omits checkpoints on done tasks: the
+  completion log entry supersedes them.
 
 ## 6. Authorization and security
 

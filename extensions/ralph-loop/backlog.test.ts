@@ -5,7 +5,8 @@ import {
 	formatBacklog,
 	formatSearchResults,
 	formatTaskDetail,
-	isRalphBacklog
+	isRalphBacklog,
+	truncateCheckpoint
 } from './backlog.ts';
 
 // Numbers: 1, 2, 3, 4, 5 (the former sub-task is a flat task now).
@@ -1572,5 +1573,24 @@ describe('file persistence (open/save)', () => {
 		expect(marker.version).toBe(2);
 		expect(columns).not.toContain('title');
 		rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe('truncateCheckpoint', () => {
+	test('returns notes at or under the cap untouched', () => {
+		const note = 'Half done; next: tests.';
+		expect(truncateCheckpoint(note, 600, 'full note via ralph_todo')).toBe(note);
+		expect(truncateCheckpoint(note, note.length, 'full note via ralph_todo')).toBe(note);
+	});
+
+	test('cuts long notes at a word boundary with the full-note pointer', () => {
+		const note = 'alpha beta gamma delta epsilon zeta eta theta';
+		const cut = truncateCheckpoint(note, 15, 'full note via ralph_goal show');
+		expect(cut).toBe('alpha beta … (full note via ralph_goal show)');
+	});
+
+	test('cap 0 disables the cap', () => {
+		const note = 'x'.repeat(1000);
+		expect(truncateCheckpoint(note, 0, 'full note via ralph_todo')).toBe(note);
 	});
 });

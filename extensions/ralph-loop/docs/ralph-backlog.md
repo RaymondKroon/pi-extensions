@@ -57,7 +57,7 @@ and starts a fresh iteration. Under the `budget` policy (and in the auto
 loop), continue with the next open task.
 
 ### checkpoint
-Loop only. Records a checkpoint note (`note`) on the task. In the auto loop this is the in-task progress record: the finish-up turn checkpoints the in-progress task instead of rewriting its body, the fresh iteration's `next` shows the checkpoint, and completing the task clears it.
+Loop only. Records a checkpoint note (`note`) on the task. In the auto loop this is the in-task progress record: the finish-up turn checkpoints the in-progress task instead of rewriting its body, the fresh iteration's `next` shows the checkpoint, and completing the task clears it. The note is re-injected into every later iteration, so keep it to a few lines (changed paths, one-line verification status, failed approaches, single next step): over the `checkpointCapChars` guideline (default 600, 0 disables) the result asks you to re-record a condensed one, and the injected copies are truncated with a pointer to the full note. The full note is always shown by `next` and `list task <n>`.
 
 ### add
 Adds a task (`title`, optional `body` as markdown bullets) to a list given by
@@ -128,7 +128,12 @@ anywhere (no active loop needed).
 
 ### checkpoint
 Goal loop only. Replaces the single goal checkpoint — the durable state of
-task-less planning/re-evaluation iterations. Requires `note`.
+task-less planning/re-evaluation iterations. Requires `note`. The note is
+re-injected into every goal-loop prompt, so keep it to a few lines (changed
+paths, one-line verification status, failed approaches, single next step):
+over the `checkpointCapChars` guideline (default 600, 0 disables) the result
+asks you to re-record a condensed one, and the injected copy is truncated
+with a pointer to the full note (`show`).
 
 ### complete
 Goal loop only. Requires the goal `open` and no open tasks. `note` is the

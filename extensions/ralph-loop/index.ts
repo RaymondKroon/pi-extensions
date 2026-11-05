@@ -32,6 +32,7 @@ import {
 	formatTaskDetail,
 	isRalphBacklog,
 	NotRalphBacklogError,
+	truncateCheckpoint,
 	type CompletionEntry,
 	type Goal,
 	type GoalStatus
@@ -88,6 +89,7 @@ const autoTodoPath = (ctx: ExtensionContext): string =>
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
 const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
+const DEFAULT_CHECKPOINT_CAP_CHARS = 600;
 const DEFAULT_COMPACTION_MODE = true;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 /**
@@ -211,6 +213,13 @@ interface RalphConfig {
 	autoApproveDecisions: boolean;
 	maxIterations: number;
 	/**
+	 * Character guideline for checkpoint notes: over the cap, the checkpoint
+	 * tool result asks the model to re-record a condensed one, and the
+	 * injected checkpoints (goal block, progress summary) are truncated.
+	 * 0 disables the feedback and the injection cap.
+	 */
+	checkpointCapChars: number;
+	/**
 	 * Hide each finished iteration from the TUI at every cycle via an
 	 * extension-provided compaction (no LLM call).
 	 */
@@ -314,6 +323,8 @@ interface RalphState {
 	/** The TODO task number (from countTodoTasks) that taskIteration refers to. */
 	taskNumber?: number;
 	maxIterations: number;
+	/** Character guideline for checkpoint notes (from the loop's config; 0 disables feedback and injection caps). */
+	checkpointCapChars: number;
 	cycleQueued: boolean;
 	/** Why a fresh iteration is pending. Retained while a context checkpoint runs. */
 	cycleReason?: CycleReason;
@@ -436,6 +447,7 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.taskIteration === undefined || (typeof state.taskIteration === 'number' && state.taskIteration >= 1)) &&
 		(state.taskNumber === undefined || (typeof state.taskNumber === 'number' && state.taskNumber >= 1)) &&
 		(state.maxIterations === undefined || (typeof state.maxIterations === 'number' && state.maxIterations >= 1)) &&
+		(state.checkpointCapChars === undefined || isCheckpointCapChars(state.checkpointCapChars)) &&
 		typeof state.contextThreshold === 'number' &&
 		(state.autoApproveDecisions === undefined || typeof state.autoApproveDecisions === 'boolean') &&
 		typeof cycleQueued === 'boolean' &&
@@ -500,6 +512,7 @@ function normalizeState(state: RalphState): RalphState {
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+		checkpointCapChars: state.checkpointCapChars ?? DEFAULT_CHECKPOINT_CAP_CHARS,
 		baseline,
 		loopStart,
 		baselineTime: state.baselineTime ?? Date.now(),
@@ -519,6 +532,10 @@ function isContextThreshold(value: unknown): value is number {
 
 function isMaxIterations(value: unknown): value is number {
 	return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+}
+
+function isCheckpointCapChars(value: unknown): value is number {
+	return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 function isAutoMode(value: unknown): value is AutoMode {
@@ -541,6 +558,7 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
 		typeof config.autoApproveDecisions === 'boolean' &&
 		isMaxIterations(config.maxIterations) &&
+		isCheckpointCapChars(config.checkpointCapChars) &&
 		typeof config.compactionMode === 'boolean' &&
 		isAutoMode(config.autoMode) &&
 		isCycleOn(config.cycleOn) &&
@@ -551,8 +569,8 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 /** A saved config missing newer optional fields; normalizeConfig fills the defaults. */
 function isRalphConfigPartial(
 	value: unknown
-): value is Omit<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode' | 'cycleOn'> &
-	Partial<Pick<RalphConfig, 'maxIterations' | 'compactionMode' | 'autoMode' | 'cycleOn'>> {
+): value is Omit<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn'> &
+	Partial<Pick<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn'>> {
 	if (!value || typeof value !== 'object') return false;
 	const config = value as Partial<RalphConfig> & { rotateOn?: unknown };
 	return (
@@ -561,6 +579,7 @@ function isRalphConfigPartial(
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
 		typeof config.autoApproveDecisions === 'boolean' &&
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
+		(config.checkpointCapChars === undefined || isCheckpointCapChars(config.checkpointCapChars)) &&
 		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean') &&
 		(config.autoMode === undefined || normalizeAutoMode(config.autoMode) !== undefined) &&
 		(config.cycleOn === undefined || isCycleOn(config.cycleOn) || isLegacyCycleOn(config.cycleOn)) &&
@@ -588,6 +607,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 		return {
 			...rest,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+			checkpointCapChars: value.checkpointCapChars ?? DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
 			autoMode: normalizeAutoMode(value.autoMode) ?? DEFAULT_AUTO_MODE,
 			cycleOn: migrateCycleOn(value.cycleOn ?? legacyCycleOn),
@@ -599,6 +619,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: value.contextThreshold },
 			autoApproveDecisions: value.autoApproveDecisions,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
+			checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
 			autoMode: DEFAULT_AUTO_MODE,
 			cycleOn: { ...DEFAULT_CYCLE_ON },
@@ -612,6 +633,7 @@ function defaultConfig(): RalphConfig {
 		contextThresholds: {},
 		autoApproveDecisions: DEFAULT_AUTO_APPROVE_DECISIONS,
 		maxIterations: DEFAULT_MAX_ITERATIONS,
+		checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
 		autoMode: DEFAULT_AUTO_MODE,
 		cycleOn: { ...DEFAULT_CYCLE_ON },
@@ -898,8 +920,17 @@ function goalPhase(state: RalphState): { phase: GoalPhase; goal: Goal } | undefi
 	}
 }
 
+/**
+ * Write-time checkpoint bloat feedback: the note is stored as written (no
+ * destructive truncation of durable state), but the tool result asks for a
+ * condensed re-recording — the note is re-injected into every later iteration.
+ */
+function checkpointOverCapNote(length: number, cap: number): string {
+	return ` Your checkpoint is ${length} chars (guideline: ${cap}). Checkpoints are re-injected into every later iteration — re-record a condensed one (changed paths, one-line verification status, failed approaches, single next step). Don't move dropped detail into auto-loaded docs; non-re-derivable procedure/state goes in a project skill or on-demand file, and re-derivable evidence is dropped, not stored.`;
+}
+
 /** The goal contract shown to the model in every goal-loop prompt. */
-function goalBlock(goal: Goal): string {
+function goalBlock(goal: Goal, checkpointCapChars: number): string {
 	const lines = [`The goal (status: ${goal.status}):`];
 	if (goal.body) {
 		lines.push(goal.body.trim());
@@ -913,7 +944,9 @@ function goalBlock(goal: Goal): string {
 		}
 	}
 	if (goal.checkpoint) {
-		lines.push(`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${goal.checkpoint}`);
+		lines.push(
+			`Goal checkpoint (iteration ${goal.checkpointIteration ?? '?'}): ${truncateCheckpoint(goal.checkpoint, checkpointCapChars, 'full note via ralph_goal show')}`
+		);
 	}
 	return lines.join('\n');
 }
@@ -1088,7 +1121,7 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		contextNote,
 		category: String(state.category),
 		backlogNote: 'The backlog is accessible with the ralph_todo tool.',
-		goalBlock: goalInfo ? goalBlock(goalInfo.goal) : '',
+		goalBlock: goalInfo ? goalBlock(goalInfo.goal, state.checkpointCapChars) : '',
 		categoryScope,
 		closeStep,
 		decisionNote
@@ -1108,7 +1141,7 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
  * context — the model checks its own progress with the ralph_todo/ralph_goal
  * tools.
  */
-function completionSummary(backlog: Backlog, loopStart: LoopStartSnapshot, category?: string): string | undefined {
+function completionSummary(backlog: Backlog, loopStart: LoopStartSnapshot, category: string | undefined, checkpointCapChars: number): string | undefined {
 	const hasBaseline = loopStart.ralph;
 	const baselineDone = hasBaseline ? new Set(loopStart.doneIds ?? []) : undefined;
 	const baselineCheckpoints = hasBaseline ? (loopStart.taskCheckpoints ?? {}) : undefined;
@@ -1134,9 +1167,11 @@ function completionSummary(backlog: Backlog, loopStart: LoopStartSnapshot, categ
 			completionLines.push(`${number}. ${task.title}`);
 		}
 		const previousCheckpoint = baselineCheckpoints !== undefined ? (baselineCheckpoints[task.id] ?? null) : null;
-		if (task.checkpoint !== null && task.checkpoint !== previousCheckpoint) {
+		// A done task's completion log entry supersedes its checkpoint; the
+		// checkpoint only carries live state while the task is open.
+		if (!task.done && task.checkpoint !== null && task.checkpoint !== previousCheckpoint) {
 			checkpointLines.push(
-				`${number}. ${task.title}: checkpoint${task.checkpointIteration ? ` (iteration ${task.checkpointIteration})` : ''}: ${task.checkpoint}`
+				`${number}. ${task.title}: checkpoint${task.checkpointIteration ? ` (iteration ${task.checkpointIteration})` : ''}: ${truncateCheckpoint(task.checkpoint, checkpointCapChars, 'full note via ralph_todo')}`
 			);
 		}
 	});
@@ -1144,7 +1179,7 @@ function completionSummary(backlog: Backlog, loopStart: LoopStartSnapshot, categ
 	const goalCheckpoint = goal?.checkpoint ?? null;
 	if (goalCheckpoint !== null && goalCheckpoint !== baselineGoalCheckpoint) {
 		checkpointLines.push(
-			`Goal: checkpoint${goal?.checkpointIteration ? ` (iteration ${goal.checkpointIteration})` : ''}: ${goalCheckpoint}`
+			`Goal: checkpoint${goal?.checkpointIteration ? ` (iteration ${goal.checkpointIteration})` : ''}: ${truncateCheckpoint(goalCheckpoint, checkpointCapChars, 'full note via ralph_goal show')}`
 		);
 	}
 	if (completionLines.length === 0 && checkpointLines.length === 0) return undefined;
@@ -2634,10 +2669,15 @@ export default function (pi: ExtensionAPI) {
 						// without ending the iteration (the loop cycles at the
 						// context budget); in the task/goal loop it ends the
 						// iteration.
-						output =
+						const base =
 							state.mode === 'auto'
 								? `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Continue working.`
 								: `Checkpoint recorded for task ${number} (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						const cap = state.checkpointCapChars;
+						output =
+							cap > 0 && params.note.trim().length > cap
+								? `${base}${checkpointOverCapNote(params.note.trim().length, cap)}`
+								: base;
 						break;
 					}
 					case 'add': {
@@ -2868,7 +2908,12 @@ export default function (pi: ExtensionAPI) {
 						if (!goal) throw new Error(`no goal in ${todoPath}`);
 						backlog.setGoalCheckpoint(params.note.trim(), state.iteration);
 						mutated = true;
-						output = `Checkpoint recorded for the goal (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						const base = `Checkpoint recorded for the goal (iteration ${state.iteration}). Stop working now; a fresh iteration will continue from it.`;
+						const cap = state.checkpointCapChars;
+						output =
+							cap > 0 && params.note.trim().length > cap
+								? `${base}${checkpointOverCapNote(params.note.trim().length, cap)}`
+								: base;
 						break;
 					}
 					case 'complete': {
@@ -3056,7 +3101,7 @@ export default function (pi: ExtensionAPI) {
 				// progress with the ralph_todo/ralph_goal tools.
 				freshIterationPending = true;
 				updateStatus(ctx);
-				const completion = completionSummary(current, state.loopStart, next.category);
+				const completion = completionSummary(current, state.loopStart, next.category, state.checkpointCapChars);
 				const finishCycle = () => {
 					// A pause/stop/blocked decision that landed while the compaction
 					// ran must not start a new turn; the resume/stop flow continues.
@@ -3168,7 +3213,7 @@ export default function (pi: ExtensionAPI) {
 		// The completion summary diffs the carried loop-start snapshot against
 		// the on-disk backlog — computed here (old session) and re-sent in the
 		// new session, so the loop's progress so far travels with the loop.
-		const completion = completionSummary(current, state.loopStart, next.category);
+		const completion = completionSummary(current, state.loopStart, next.category, state.checkpointCapChars);
 		const previous = state;
 		const oldSessionId = ctx.sessionManager.getSessionId();
 		const oldSessionFile = ctx.sessionManager.getSessionFile();
@@ -3313,6 +3358,7 @@ export default function (pi: ExtensionAPI) {
 				taskIteration: 1,
 				taskNumber: currentTaskNumber(taskCount.current),
 				maxIterations: config.maxIterations,
+				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
 				autoApproveDecisions: config.autoApproveDecisions,
 				cycleQueued: false,
@@ -3457,6 +3503,7 @@ export default function (pi: ExtensionAPI) {
 				taskIteration: 1,
 				taskNumber: currentTaskNumber(taskCount.current),
 				maxIterations: config.maxIterations,
+				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
 				autoApproveDecisions: config.autoApproveDecisions,
 				cycleQueued: false,
@@ -3648,6 +3695,7 @@ export default function (pi: ExtensionAPI) {
 				contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: state.contextThreshold },
 				autoApproveDecisions: state.autoApproveDecisions,
 				maxIterations: state.maxIterations,
+				checkpointCapChars: state.checkpointCapChars,
 				compactionMode: DEFAULT_COMPACTION_MODE,
 				autoMode: DEFAULT_AUTO_MODE,
 				cycleOn: { ...DEFAULT_CYCLE_ON },
@@ -3713,6 +3761,7 @@ export default function (pi: ExtensionAPI) {
 					...state,
 					autoApproveDecisions: config.autoApproveDecisions,
 					maxIterations: config.maxIterations,
+					checkpointCapChars: config.checkpointCapChars,
 					contextThreshold: contextThresholdFor(config, ctx)
 				};
 			}
@@ -4430,9 +4479,11 @@ export default function (pi: ExtensionAPI) {
 		const displayValue = (id: string, cfg: RalphConfig): string =>
 			id === 'contextThreshold'
 				? contextThresholdLabel(contextThresholdFor(cfg, ctx))
-				: id === 'maxIterations'
-					? String(cfg.maxIterations)
-					: id === 'compactionMode'
+			: id === 'maxIterations'
+				? String(cfg.maxIterations)
+				: id === 'checkpointCapChars'
+					? String(cfg.checkpointCapChars)
+				: id === 'compactionMode'
 						? cfg.compactionMode
 							? 'enabled'
 							: 'disabled'
@@ -4458,6 +4509,8 @@ export default function (pi: ExtensionAPI) {
 					}
 				: id === 'maxIterations'
 					? { ...cfg, maxIterations: Number.parseInt(value, 10) }
+					: id === 'checkpointCapChars'
+						? { ...cfg, checkpointCapChars: Number.parseInt(value, 10) }
 					: id === 'compactionMode'
 						? { ...cfg, compactionMode: value === 'enabled' }
 					: id === 'autoMode'
@@ -4480,7 +4533,9 @@ export default function (pi: ExtensionAPI) {
 				? contextThresholdLabel(contextThresholdFor(next, ctx))
 				: id === 'maxIterations'
 					? `maximum iterations ${next.maxIterations}`
-					: id === 'compactionMode'
+					: id === 'checkpointCapChars'
+						? `checkpoint note guideline ${next.checkpointCapChars} chars`
+				: id === 'compactionMode'
 						? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
 				: id === 'autoMode'
 						? `auto mode ${next.autoMode}`
@@ -4547,8 +4602,29 @@ export default function (pi: ExtensionAPI) {
 						done
 					)
 			},
-			{
-				id: 'compactionMode',
+		{
+			id: 'checkpointCapChars',
+			label: 'Checkpoint note guideline',
+			description:
+				'Character guideline for checkpoint notes (re-injected into every later iteration). Over the cap, the checkpoint tool result asks the model to re-record a condensed one, and injected checkpoints are truncated with a pointer to the full note. 0 disables the feedback and the injection cap.',
+			currentValue: String(config.checkpointCapChars),
+			submenu: (currentValue, done) =>
+				numericSettingSubmenu(
+					'Checkpoint note guideline in characters (0 disables)',
+					currentValue,
+					(value) => {
+						const cap = Number(value.trim());
+						if (!isCheckpointCapChars(cap)) {
+							ctx.ui.notify('Checkpoint note guideline must be a whole number of 0 or more.', 'error');
+							return undefined;
+						}
+						return String(cap);
+					},
+					done
+				)
+		},
+		{
+			id: 'compactionMode',
 				label: 'Compaction mode',
 				description:
 					'Hide each finished iteration from the TUI when the loop cycles: an extension-provided compaction (no LLM call) cuts the session at the recording prompt and shows the completion summary in the compaction box. Off: finished iterations stay visible.',

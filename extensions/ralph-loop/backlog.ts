@@ -1674,6 +1674,19 @@ export function formatNextTask(backlog: Backlog, task: Task, category?: string):
 }
 
 /**
+ * Cap a checkpoint note for injection (goal block, progress summary): cut at
+ * the cap on a word boundary and point at the on-demand full note
+ * (ralph_todo task details, ralph_goal show). cap 0 disables the cap — the
+ * full note is always retrievable through the tools, so this only bounds the
+ * per-iteration context cost, never the stored state.
+ */
+export function truncateCheckpoint(text: string, cap: number, fullNoteHint: string): string {
+	if (cap <= 0 || text.length <= cap) return text;
+	const cut = text.slice(0, cap).replace(/\s+\S*$/, '');
+	return `${cut.trimEnd()} … (${fullNoteHint})`;
+}
+
+/**
  * Readable goal view for the ralph_goal "show" action: the goal's
  * status, body, completion evidence, and checkpoint.
  */

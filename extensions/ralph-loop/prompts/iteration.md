@@ -56,7 +56,7 @@ This is a re-evaluation iteration: the goal is open and every planned task is co
 
 {{decisionNote}}
 {{~else~}}
-You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks to the plan's list so the backlog always reflects the remaining work.
+You are executing the goal: keep the plan honest — when reality diverges from the plan, add or adjust tasks to the plan's list so the backlog always reflects the remaining work. Never add a task whose only purpose is verifying work that is already complete and committed — verification belongs in the task that made the change.
 
 - Call ralph_todo with action "next" to get the next open task{{categoryScope}}
 - Add focused tests and run every quality command required by the backlog.
