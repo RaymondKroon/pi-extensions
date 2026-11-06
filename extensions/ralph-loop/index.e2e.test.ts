@@ -928,6 +928,61 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	);
 
 	test(
+		'auto mode under cycleOn "task": a cleanly ended mid-task iteration cycles instead of idling',
+		{ timeout: 60000 },
+		async () => {
+			// Session 01a1b08f: the model committed part of a long task,
+			// checkpointed the rest, and stopped per the iteration prompt's
+			// closing step. With nothing completed and the context under budget,
+			// the loop must cycle (iteration-ended) instead of idling until the
+			// user types "continue".
+			endpoint = startMockEndpoint([
+				// Iteration 1: record the long task, do work (a real tool call),
+				// then stop cleanly mid-task.
+				toolCallResponder(
+					'ralph_todo',
+					{ action: 'add', title: 'Roll out the flat configuration to every language' },
+					'call_add'
+				),
+				toolCallResponder('bash', { command: 'echo ralph-e2e-work' }, 'call_bash'),
+				textResponder('Iteration complete: the first rollout step is committed; the rest is checkpointed.'),
+				// The iteration-ended finish-up turn.
+				textResponder('Finished up; remaining work recorded.'),
+				// The fresh iteration.
+				textResponder('Continuing from the recorded checkpoint.')
+			]);
+			const sess = await createRalphSession(endpoint.port, {
+				contextThresholds: { __default__: 0.9 },
+				autoApproveDecisions: false,
+				maxIterations: 10,
+				autoMode: 'on',
+				cycleOn: { tasks: 'task', goal: 'task', auto: 'task' }
+			});
+
+			await sess.prompt('/ralph start');
+
+			// Iteration 1 runs the auto loop prompt against the real pipeline.
+			await waitFor(() => endpoint!.requests.length >= 1, 'iteration 1 request');
+			expect(requestText(endpoint!.requests[0]!)).toContain('Run the Ralph auto loop');
+
+			// The iteration settles with a clean stop, no completion, and the
+			// context under budget: the extension must deliver the finish-up
+			// prompt as the next model request (request 3: add, bash, stop).
+			await waitFor(() => endpoint!.requests.length >= 4, 30000);
+			const finishRequest = endpoint!.requests[3]!;
+			expect(requestText(finishRequest)).toContain('The current Ralph iteration has ended');
+			expect(requestText(finishRequest)).toContain('Finish up now');
+
+			// The finish-up turn settles: a fresh iteration starts with the
+			// iteration-ended context note and a clean model context.
+			await waitFor(() => endpoint!.requests.length >= 5, 30000);
+			const freshRequest = endpoint!.requests[4]!;
+			expect(requestText(freshRequest)).toContain('Run the Ralph auto loop');
+			expect(requestText(freshRequest)).toContain('The previous iteration ended');
+			expect(requestText(freshRequest)).not.toContain('Iteration complete: the first rollout step');
+		});
+
+	test(
 		'ralph_cycle with reload: the cycle reloads the extensions at the boundary, after the context cut',
 		{ timeout: 60000 },
 		async () => {

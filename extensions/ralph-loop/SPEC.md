@@ -120,7 +120,9 @@ Ralph decision workflow.
   and the goal still open stops the loop with a clear notification. This
   includes the no-work case: a cleanly ended turn with open work tasks but
   no non-ralph tool call stops the loop instead of queueing an
-  `iteration-ended` cycle.
+  `iteration-ended` cycle. The auto loop stalls the same way: a cleanly
+  ended turn with open work tasks but no non-ralph tool call stops it
+  instead of queueing an `iteration-ended` cycle.
 - The loop stops when the goal is `done` in the file.
 - The model is read-only on the goal body; it may only change goal
   state through `ralph_goal` with its enforced preconditions.
@@ -342,15 +344,25 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   per mode in `/ralph config`, captured into `RalphState` at loop start.
   Legacy single values migrate: `"task"`/`"budget"` → all modes, `"default"`
   (or missing) → the built-ins. `"task"`: cycle after every completed
-  task (goal: also on plan growth, and — goal only — when the iteration
-  ends cleanly with open work tasks remaining, so a never-completing task
-  cannot dead-end the loop). `"budget"`: work task after task; cycle
+  task (goal: also on plan growth). `"budget"`: work task after task; cycle
   only at the context budget — plus, for the goal loop, on a **phase change**
   (planning → execution → re-evaluation) so a finished plan with headroom
-  reaches the re-evaluation prompt instead of stalling. Stop conditions are
+  reaches the re-evaluation prompt instead of stalling. **Clean iteration
+  end:** a clean `stop` at the end of the iteration without a completed
+  task, with open work tasks remaining, also cycles (`iteration-ended`) —
+  for the goal loop under `"task"` (a never-completing task, "run until
+  stopped"), and for the auto loop under either policy (a task that does
+  not fit in one iteration: the model commits verified work, checkpoints
+  the remainder, and stops per the iteration prompt's closing step —
+  session 01a1b08f, where such a stop idled the loop until the user typed
+  "continue"). It requires the run to have made at least one **non-ralph**
+  tool call (actual work); a no-work stop stalls the loop with a clear
+  notice instead of spinning. An errored or truncated run does not cycle.
+  Stop conditions are
   policy-independent (task: empty backlog; goal: goal done; auto: never on an
   empty backlog). Under `"budget"` a completion that leaves open work sends a
-  continue nudge instead of cycling.
+  continue nudge instead of cycling (the same context continues — cheaper
+  than a fresh one).
 - **Recording turns.** Two, not four: `completed-task`/`plan-updated` (task
   policy) send the completion/plan recording prompt; `context-limit`/
   `phase-changed`/`iteration-ended` send one merged finish-up prompt (wrap

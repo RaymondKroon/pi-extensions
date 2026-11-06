@@ -6726,6 +6726,127 @@ T 1 - "Continuous re-test loop (run until stopped)"
 		expect(fake.userMessages).toHaveLength(iterationCount);
 	});
 
+	const AUTO_LONG_TASK = `# ralph v2
+
+T 1 - "Roll out the flat configuration to every language"
+`;
+
+	test('auto loop under cycleOn "task": a cleanly ended mid-task iteration with work cycles instead of idling', async () => {
+		await writeAutoConfig({ cycleOn: allCycle('task') });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), AUTO_LONG_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+		const iterationCount = fake.userMessages.length;
+		expect(iterationCount).toBe(1);
+
+		// The iteration runs: the model commits verified work on a task that does
+		// not fit in one iteration, checkpoints the remainder, and stops cleanly
+		// per the iteration prompt's closing step without completing the task
+		// (session 01a1b08f: the loop idled for hours instead of cycling).
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash', isError: false, result: { content: [{ type: 'text', text: 'ok' }] } });
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The ended iteration is a cycle boundary: the finish-up recording turn
+		// is queued instead of the loop idling for the user to type "continue".
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.at(-1)!.text).toContain('The current Ralph iteration has ended');
+		expect(fake.userMessages.at(-1)!.text).toContain('Finish up now');
+
+		// The recording turn settles; the fresh iteration starts with the
+		// iteration-ended context note (not the "first iteration" note).
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+		expect(fake.userMessages.at(-1)!.text).toContain('The previous iteration ended');
+		expect(fake.userMessages.at(-1)!.text).not.toContain('This is the first iteration');
+	});
+
+	test('auto loop under cycleOn "budget": a cleanly ended mid-task iteration with work cycles instead of idling', async () => {
+		await writeAutoConfig({ cycleOn: allCycle('budget') });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), AUTO_LONG_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		// No task completed (the continue nudge must not fire): the model stops
+		// mid-task with work done, under the context budget.
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash', isError: false, result: { content: [{ type: 'text', text: 'ok' }] } });
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(fake.userMessages.at(-1)!.text).toContain('The current Ralph iteration has ended');
+
+		// The recording turn settles; the fresh iteration starts.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+		expect(fake.userMessages.at(-1)!.text).toContain('The previous iteration ended');
+	});
+
+	test('auto loop under cycleOn "budget": a completion with open work still gets the continue nudge, not the cycle', async () => {
+		await writeAutoConfig({ cycleOn: allCycle('budget') });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			autoFile(),
+			'# ralph v2\n\nT 1 - "First half"\n\nT 2 - "Second half"\n'
+		);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+
+		// The model completes task 1 (work + ralph_todo complete) and stops
+		// cleanly with task 2 still open: the budget loop must continue in the
+		// same context instead of cycling.
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash', isError: false, result: { content: [{ type: 'text', text: 'ok' }] } });
+		const todo = autoTool(fake);
+		await todo.execute('t', { action: 'complete', task: '1' }, undefined, undefined, fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		expect(fake.userMessages.at(-1)!.text).toContain('Continue the loop');
+		expect(fake.userMessages.at(-1)!.text).not.toContain('Finish up now');
+	});
+
+	test('auto loop under cycleOn "task": a cleanly ended iteration that did no work stops instead of cycling', async () => {
+		await writeAutoConfig({ cycleOn: allCycle('task') });
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(autoFile(), AUTO_LONG_TASK);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+		const iterationCount = fake.userMessages.length;
+
+		// The model stops cleanly without a single tool call: cycling would only
+		// start another empty iteration, so the loop stops with a clear notice
+		// instead of spinning.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// The stopped auto loop falls back to the armed auto mode word.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: auto');
+		expect(fake.userMessages).toHaveLength(iterationCount);
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('without doing any work');
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('re-arm the loop');
+	});
+
 	test('D1: update rewrites a planned task in the task loop (title and body)', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);

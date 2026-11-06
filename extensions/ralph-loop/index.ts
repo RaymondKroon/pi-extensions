@@ -4385,32 +4385,49 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Goal mode under "task": the model ended the iteration cleanly
-			// (committed and stopped per the iteration prompt) without completing a
-			// task or growing the plan — e.g. a deliberately never-completing task
-			// ("re-test loop, run until stopped"). The other triggers (completion,
-			// plan growth, context budget) never fire for a permanent task, so
-			// without this cycle the loop would idle forever. Queue a cycle
-			// so the goal keeps iterating. Only a clean 'stop' qualifies: an
-			// errored or truncated run is left for the user to inspect.
-			// A turn that made no work tool calls at all is a stall, not a
-			// permanent task: cycling it just starts another empty iteration
+			// A budget-cycling loop must not idle after a completion — start the
+			// next open work task instead of waiting for the user to type
+			// "continue" (wins over the iteration-ended cycle below: the same
+			// context continues instead of paying for a fresh one).
+			if (
+				state.cycleOn === 'budget' &&
+				hasCompletedTodoItem(state.baseline, current, countCategory(state)) &&
+				openWorkTaskCount(current, countCategory(state)) > 0
+			) {
+					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('continue-loop', {})}`, { deliverAs: 'followUp' });
+				return;
+			}
+
+			// A clean 'stop' at the end of the iteration without a completed task:
+			// goal mode under "task" (a deliberately never-completing task, e.g.
+			// "re-test loop, run until stopped") or an auto loop whose task does
+			// not fit in one iteration — the model commits verified work,
+			// checkpoints the remainder, and stops per the iteration prompt's
+			// closing step (session 01a1b08f: after each partial commit of a long
+			// rollout task the loop idled until the user typed "continue"). The
+			// other triggers (completion, plan growth, context budget) never fire
+			// for such an iteration, so without this cycle the loop would idle.
+			// Queue a cycle so the loop keeps iterating. Only a clean 'stop'
+			// qualifies: an errored or truncated run is left for the user to
+			// inspect.
+			// A turn that made no work tool calls at all is a stall, not an
+			// unfinishable task: cycling it just starts another empty iteration
 			// (session 01a0c340: a confused model stopped after every iteration
 			// without calling a single tool, and the loop cycled 20+ times in
 			// four minutes), so stop with a clear notice instead of spinning.
 			// Verified acceptable by the user in session 01a0c35a (the loop
 			// stopped at the first empty execution iteration — no nudge wanted).
 			if (
-				state.mode === 'goal' &&
-				state.cycleOn === 'task' &&
 				lastAssistantStopReason === 'stop' &&
-				goalStatus(current) === 'open' &&
-				openWorkTaskCount(current, countCategory(state)) > 0
+				openWorkTaskCount(current, countCategory(state)) > 0 &&
+				(state.mode === 'goal' ? state.cycleOn === 'task' && goalStatus(current) === 'open' : state.mode === 'auto')
 			) {
 				if (!runSawWorkToolCall) {
 					stopLoop(
 						ctx,
-						'Ralph goal loop stopped: the iteration ended without doing any work (no tool calls, no task completed, no new tasks added). The model may be stuck — inspect the last turn, then give it direction with a message and /ralph start, or start a fresh session.'
+						state.mode === 'goal'
+						? 'Ralph goal loop stopped: the iteration ended without doing any work (no tool calls, no task completed, no new tasks added). The model may be stuck — inspect the last turn, then give it direction with a message and /ralph start, or start a fresh session.'
+						: 'Ralph auto loop stopped: the iteration ended without doing any work (no tool calls, no task completed, no new tasks added). The model may be stuck — inspect the last turn, then re-arm the loop by adding or completing a todo with ralph_todo, or start a fresh session.'
 					);
 					return;
 				}
@@ -4419,18 +4436,6 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				queueCycle(ctx, 'iteration-ended');
-				return;
-			}
-
-			// A budget-cycling loop must not idle after a completion — start the
-			// next open work task instead of waiting for the user to type
-			// "continue".
-			if (
-				state.cycleOn === 'budget' &&
-				hasCompletedTodoItem(state.baseline, current, countCategory(state)) &&
-				openWorkTaskCount(current, countCategory(state)) > 0
-			) {
-					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('continue-loop', {})}`, { deliverAs: 'followUp' });
 				return;
 			}
 
