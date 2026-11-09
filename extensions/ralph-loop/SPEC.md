@@ -372,6 +372,20 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   mid-task `contextCheckpointPrompt` is kept only for task-less goal
   iterations (planning/re-evaluation checkpoint the goal via
   `ralph_goal checkpoint`) and Markdown backlogs.
+- **Finish-up watchdog.** The finish-up recording prompt stops the model by
+  instruction only, and a goal-driven model can keep working past it (session
+  01a1bfcf: ~6 minutes of diagnostics after the mid-turn steer — the user had
+  to abort and ask "did you see the finish up message?"). The watchdog counts
+  non-ralph (work) tool calls after the recording prompt is delivered: within
+  the configured `finishUpWorkToolLimit` (default 6, `/ralph config`) the
+  model may commit and check state; the exhausted allowance steers one
+  reminder (`prompts/finish-up-reminder.md`); one further work tool call aborts
+  the run, and the settle delivers the recording prompt as a fresh run (the
+  abort suppresses pi's queued continuations, so the prompt is not re-queued at
+  abort time — the same two-step semantics as the loop-escape enforcement:
+  intercept, then force). The watchdog is gated on the live state
+  (`cycleQueued` + `cycleCheckpointing`), re-opens whenever a recording prompt
+  is (re-)sent, and stays silent on a run the user already aborted.
 - **Auto-loop checkpoint handoff.** Auto loops started with the checkpoint
   handoff (`RalphState.checkpointHandoff`, set at loop start) record the
   in-progress task's progress in its checkpoint field instead of rewriting

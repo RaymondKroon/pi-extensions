@@ -90,6 +90,13 @@ const DEFAULT_CONTEXT_THRESHOLD = 0.5;
 const DEFAULT_AUTO_APPROVE_DECISIONS = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_CHECKPOINT_CAP_CHARS = 600;
+/**
+ * Finish-up watchdog: the work tool calls a model may still make after the
+ * finish-up recording prompt is delivered before Ralph reminds it to stop
+ * working; one further work tool call after the reminder aborts the run so
+ * the settle delivers the recording prompt as a fresh run.
+ */
+const DEFAULT_FINISH_UP_WORK_TOOL_LIMIT = 6;
 const DEFAULT_COMPACTION_MODE = true;
 const DEFAULT_MODEL_CONFIG_KEY = '__default__';
 /**
@@ -224,6 +231,14 @@ interface RalphConfig {
 	 * extension-provided compaction (no LLM call).
 	 */
 	compactionMode: boolean;
+	/**
+	 * Finish-up watchdog: the non-ralph (work) tool calls a model may still
+	 * make after the finish-up recording prompt is delivered before Ralph
+	 * reminds it to stop working; one further work tool call after the
+	 * reminder aborts the run and the settle delivers the recording prompt as
+	 * a fresh run. 0 reminds on the first work tool call.
+	 */
+	finishUpWorkToolLimit: number;
 	/**
 	 * The auto loop (state in the per-session <session-id>.db in the global
 	 * agent directory, auto-created session category, ralph_todo tool, cycle
@@ -538,6 +553,10 @@ function isCheckpointCapChars(value: unknown): value is number {
 	return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
+function isFinishUpWorkToolLimit(value: unknown): value is number {
+	return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
 function isAutoMode(value: unknown): value is AutoMode {
 	return value === 'off' || value === 'on';
 }
@@ -560,6 +579,7 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		isMaxIterations(config.maxIterations) &&
 		isCheckpointCapChars(config.checkpointCapChars) &&
 		typeof config.compactionMode === 'boolean' &&
+		isFinishUpWorkToolLimit(config.finishUpWorkToolLimit) &&
 		isAutoMode(config.autoMode) &&
 		isCycleOn(config.cycleOn) &&
 		isRolloverConfig(config.rollover)
@@ -569,8 +589,8 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 /** A saved config missing newer optional fields; normalizeConfig fills the defaults. */
 function isRalphConfigPartial(
 	value: unknown
-): value is Omit<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn'> &
-	Partial<Pick<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn'>> {
+): value is Omit<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn' | 'finishUpWorkToolLimit'> &
+	Partial<Pick<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn' | 'finishUpWorkToolLimit'>> {
 	if (!value || typeof value !== 'object') return false;
 	const config = value as Partial<RalphConfig> & { rotateOn?: unknown };
 	return (
@@ -581,6 +601,7 @@ function isRalphConfigPartial(
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
 		(config.checkpointCapChars === undefined || isCheckpointCapChars(config.checkpointCapChars)) &&
 		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean') &&
+		(config.finishUpWorkToolLimit === undefined || isFinishUpWorkToolLimit(config.finishUpWorkToolLimit)) &&
 		(config.autoMode === undefined || normalizeAutoMode(config.autoMode) !== undefined) &&
 		(config.cycleOn === undefined || isCycleOn(config.cycleOn) || isLegacyCycleOn(config.cycleOn)) &&
 		// Configs saved before the cycle rename carry the per-mode policy under the old key.
@@ -609,6 +630,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			checkpointCapChars: value.checkpointCapChars ?? DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
+			finishUpWorkToolLimit: value.finishUpWorkToolLimit ?? DEFAULT_FINISH_UP_WORK_TOOL_LIMIT,
 			autoMode: normalizeAutoMode(value.autoMode) ?? DEFAULT_AUTO_MODE,
 			cycleOn: migrateCycleOn(value.cycleOn ?? legacyCycleOn),
 			rollover: migrateRollover(value.rollover)
@@ -621,6 +643,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
+			finishUpWorkToolLimit: DEFAULT_FINISH_UP_WORK_TOOL_LIMIT,
 			autoMode: DEFAULT_AUTO_MODE,
 			cycleOn: { ...DEFAULT_CYCLE_ON },
 			rollover: { ...DEFAULT_ROLLOVER }
@@ -635,6 +658,7 @@ function defaultConfig(): RalphConfig {
 		maxIterations: DEFAULT_MAX_ITERATIONS,
 		checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
+		finishUpWorkToolLimit: DEFAULT_FINISH_UP_WORK_TOOL_LIMIT,
 		autoMode: DEFAULT_AUTO_MODE,
 		cycleOn: { ...DEFAULT_CYCLE_ON },
 		rollover: { ...DEFAULT_ROLLOVER }
@@ -1988,6 +2012,29 @@ export default function (pi: ExtensionAPI) {
 	// semantic_loop, output_loop, output_semantic_loop): the settle's recovery
 	// turn renders the right prompt from it. Cleared with loopPoliceAbort.
 	let loopPoliceEvent: string | undefined;
+	// Finish-up watchdog: work tool calls the model may still make after the
+	// finish-up recording prompt was delivered (undefined: no recording turn
+	// was delivered). The prompt stops the model by instruction only, and a
+	// goal-driven model can keep working past it (session 01a1bfcf: six
+	// minutes of diagnostics after the steer — the user had to abort and ask
+	// "did you see the finish up message?"). Work calls within the allowance
+	// are fine (commit, status checks, ralph_todo is a ralph tool and never
+	// counts); once it is exhausted the model gets one reminder steer, and
+	// one further work tool call after that aborts the run so the settle
+	// delivers the recording prompt as a fresh run — the same two-step
+	// semantics as the loop-escape enforcement (intercept, then force).
+	let finishUpWorkCallsLeft: number | undefined;
+	// Work tool calls made when the finish-up window opened (for the reminder's
+	// count). Set together with finishUpWorkCallsLeft.
+	let finishUpWorkCallsAtStart = 0;
+	// The finish-up reminder was already delivered for the current recording
+	// turn; the next work tool call enforces the stop.
+	let finishUpReminded = false;
+	// Set when the extension itself aborts the run to enforce the finish-up:
+	// the settle must not treat that abort as a user Escape (which would pause
+	// the loop) — it delivers the recording prompt as a fresh run instead.
+	// Consumed at the settle, cleared at agent_start.
+	let finishUpAbort = false;
 
 	/** Refresh the cached task counter and goal state from a backlog. */
 	const refreshCounts = (backlog: Backlog, category?: string) => {
@@ -3539,6 +3586,12 @@ export default function (pi: ExtensionAPI) {
 		// running turn so the model stops at the next tool boundary instead of
 		// the turn running on until it settles on its own.
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
+		// The watchdog opens with the prompt: from here on the model may only
+		// make the configured work tool calls before being reminded, then
+		// forced.
+		finishUpWorkCallsLeft = config.finishUpWorkToolLimit;
+		finishUpWorkCallsAtStart = runWorkToolCallCount;
+		finishUpReminded = false;
 	};
 
 	const queueCycle = (
@@ -3968,6 +4021,11 @@ export default function (pi: ExtensionAPI) {
 		runWorkToolCallCount = 0;
 		runSawAssistantMessage = false;
 		runAbortedByUser = false;
+		finishUpReminded = false;
+		finishUpAbort = false;
+		// A recording prompt delivered before this run (followUp) opens its
+		// window against this run's fresh count.
+		finishUpWorkCallsAtStart = 0;
 		runSignal = (ctx as { signal?: AbortSignal }).signal;
 		turnStartedOverBudget = state ? (contextUsageFraction(ctx) ?? 0) >= state.contextThreshold : false;
 	});
@@ -3983,6 +4041,50 @@ export default function (pi: ExtensionAPI) {
 		if (toolName && !RALPH_TOOL_NAMES.includes(toolName)) {
 			runSawWorkToolCall = true;
 			runWorkToolCallCount++;
+			// Finish-up watchdog: the model must stop working once the
+			// recording prompt is delivered. Work calls within the allowance
+			// are fine (commit, status checks); the exhausted allowance sends
+			// one reminder steer, and one further work tool call after the
+			// reminder aborts the run so the settle starts the recording turn
+			// fresh — the finish-up must not depend on the stuck model's
+			// cooperation. An already-aborted run (user Escape or our own
+			// abort) is left alone: the settle handles it.
+			if (
+				finishUpWorkCallsLeft !== undefined &&
+				state?.enabled &&
+				state.cycleQueued &&
+				state.cycleCheckpointing &&
+				!runSignal?.aborted
+			) {
+				finishUpWorkCallsLeft--;
+				if (finishUpWorkCallsLeft > 0) {
+					// Still within the allowance.
+				} else if (!finishUpReminded) {
+					finishUpReminded = true;
+					pi.sendUserMessage(
+						`${automatedPrefix()}${renderPrompt('finish-up-reminder', {
+							count: runWorkToolCallCount - finishUpWorkCallsAtStart
+						})}`,
+						{ deliverAs: 'steer' }
+					);
+					ctx.ui.notify(
+						'Ralph: the model is still working after the finish-up instruction — reminded it to stop and record the state',
+						'info'
+					);
+				} else {
+					// The reminder did not stop it: enforce. The abort
+					// suppresses pi's queued continuations (user-Escape
+					// semantics), so the recording prompt is not re-queued
+					// here — the settle delivers it.
+					finishUpWorkCallsLeft = undefined;
+					finishUpAbort = true;
+					ctx.abort();
+					ctx.ui.notify(
+						'Ralph: the model ignored the finish-up reminder — aborting the turn and recording progress in a fresh recording turn',
+						'warning'
+					);
+				}
+			}
 		}
 		if ((ctx as { signal?: AbortSignal }).signal?.aborted) {
 			runAbortedByUser = true;
@@ -4122,6 +4224,10 @@ export default function (pi: ExtensionAPI) {
 			if (state.cycleQueued && state.cycleCheckpointing) {
 				// The progress-recording turn was interrupted: re-run it, carrying
 				// the user's extra info into the recorded state.
+				// The watchdog re-opens with the re-sent prompt.
+				finishUpWorkCallsLeft = config.finishUpWorkToolLimit;
+				finishUpWorkCallsAtStart = runWorkToolCallCount;
+				finishUpReminded = false;
 				return {
 					action: 'transform',
 							text: `${recordingPromptFor(state)}\n\n${renderPrompt('recording-extra-info', { extraInfo: event.text })}`
@@ -4204,6 +4310,19 @@ export default function (pi: ExtensionAPI) {
 				selfEscapeAbort = false;
 				sendRecordingPrompt(ctx);
 				return;
+			}
+			// Our own finish-up enforcement abort, not a user Escape: the
+			// recording prompt was lost with the aborted run, so deliver it
+			// here — the session is idle at settle, so it starts the
+			// recording turn.
+			if (finishUpAbort) {
+				finishUpAbort = false;
+				if (state.cycleQueued && state.cycleCheckpointing) {
+					sendRecordingPrompt(ctx);
+					return;
+				}
+				// No cycle pending (e.g. a stop landed meanwhile): fall
+				// through to the normal abort handling.
 			}
 			if (state.stopRequested) {
 				stopLoop(ctx, 'Ralph loop stopped after the current iteration');
@@ -4486,10 +4605,12 @@ export default function (pi: ExtensionAPI) {
 				? String(cfg.maxIterations)
 				: id === 'checkpointCapChars'
 					? String(cfg.checkpointCapChars)
-				: id === 'compactionMode'
-						? cfg.compactionMode
-							? 'enabled'
-							: 'disabled'
+			: id === 'compactionMode'
+					? cfg.compactionMode
+						? 'enabled'
+						: 'disabled'
+					: id === 'finishUpWorkToolLimit'
+						? String(cfg.finishUpWorkToolLimit)
 						: id === 'autoApproveDecisions'
 							? cfg.autoApproveDecisions
 								? 'enabled'
@@ -4514,9 +4635,11 @@ export default function (pi: ExtensionAPI) {
 					? { ...cfg, maxIterations: Number.parseInt(value, 10) }
 					: id === 'checkpointCapChars'
 						? { ...cfg, checkpointCapChars: Number.parseInt(value, 10) }
-					: id === 'compactionMode'
-						? { ...cfg, compactionMode: value === 'enabled' }
-					: id === 'autoMode'
+				: id === 'compactionMode'
+					? { ...cfg, compactionMode: value === 'enabled' }
+					: id === 'finishUpWorkToolLimit'
+						? { ...cfg, finishUpWorkToolLimit: Number.parseInt(value, 10) }
+						: id === 'autoMode'
 							? { ...cfg, autoMode: value as AutoMode }
 							: id === 'cycleOnTasks'
 								? { ...cfg, cycleOn: { ...cfg.cycleOn, tasks: value as CycleOnPolicy } }
@@ -4536,12 +4659,14 @@ export default function (pi: ExtensionAPI) {
 				? contextThresholdLabel(contextThresholdFor(next, ctx))
 				: id === 'maxIterations'
 					? `maximum iterations ${next.maxIterations}`
-					: id === 'checkpointCapChars'
-						? `checkpoint note guideline ${next.checkpointCapChars} chars`
-				: id === 'compactionMode'
+				: id === 'checkpointCapChars'
+					? `checkpoint note guideline ${next.checkpointCapChars} chars`
+					: id === 'compactionMode'
 						? `compaction mode ${next.compactionMode ? 'enabled' : 'disabled'}`
-				: id === 'autoMode'
-						? `auto mode ${next.autoMode}`
+						: id === 'finishUpWorkToolLimit'
+							? `finish-up work call limit ${next.finishUpWorkToolLimit}`
+							: id === 'autoMode'
+								? `auto mode ${next.autoMode}`
 					: id === 'cycleOnTasks'
 						? `cycle (task loop) ${next.cycleOn.tasks}`
 					: id === 'cycleOnGoal'
@@ -4633,6 +4758,27 @@ export default function (pi: ExtensionAPI) {
 					'Hide each finished iteration from the TUI when the loop cycles: an extension-provided compaction (no LLM call) cuts the session at the recording prompt and shows the completion summary in the compaction box. Off: finished iterations stay visible.',
 				currentValue: config.compactionMode ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
+			},
+			{
+				id: 'finishUpWorkToolLimit',
+				label: 'Finish-up: work call limit',
+				description:
+					'Finish-up watchdog: the work tool calls the model may still make after the finish-up recording prompt (commit, status checks — ralph_todo never counts) before Ralph reminds it to stop working; one further work tool call after the reminder aborts the turn and the progress is recorded in a fresh recording turn. 0 reminds on the first work tool call.',
+				currentValue: String(config.finishUpWorkToolLimit),
+				submenu: (currentValue, done) =>
+					numericSettingSubmenu(
+						'Finish-up work call limit (whole number of 0 or more)',
+						currentValue,
+						(value) => {
+							const limit = Number(value.trim());
+							if (!isFinishUpWorkToolLimit(limit)) {
+								ctx.ui.notify('The finish-up work call limit must be a whole number of 0 or more.', 'error');
+								return undefined;
+							}
+							return String(limit);
+						},
+						done
+					)
 			},
 			{
 				id: 'autoApproveDecisions',

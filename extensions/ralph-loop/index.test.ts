@@ -5371,11 +5371,11 @@ GB
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		fakeCtx.customControl.factoryHook = undefined;
 		// The config view's factory returns a wrapper that delegates input to
-		// its SettingsList: navigate down to "Auto mode" (7th of 10 items, the
+		// its SettingsList: navigate down to "Auto mode" (8th of 14 items, the
 		// "Save to" scope row first) and press Enter to cycle off→on.
 		const view = created[0] as { handleInput: (data: string) => void };
 		expect(view).toBeDefined();
-		for (let i = 0; i < 6; i++) view.handleInput('\x1b[B');
+		for (let i = 0; i < 7; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r');
 
 		// The tool set changes at the switch — not at the later arming at the
@@ -7260,9 +7260,9 @@ describe('ralph-loop extension (global config store)', () => {
 		const view = await openConfigUi(fake, fakeCtx);
 		// Rows: Save to, Start fresh context at, Maximum iterations, Checkpoint
 		// note guideline, Compaction
-		// mode, Auto-approve decisions, Auto mode, Cycle: task loop,
-		// Cycle: goal loop, Cycle: auto loop (last).
-		for (let i = 0; i < 7; i++) view.handleInput('\x1b[B');
+		// mode, Finish-up: work call limit, Auto-approve decisions, Auto mode,
+		// Cycle: task loop, Cycle: goal loop, Cycle: auto loop.
+		for (let i = 0; i < 8; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r'); // active task policy task → budget
 		await flush();
 
@@ -7632,5 +7632,164 @@ describe('ralph-loop extension (ralph_cycle tool)', () => {
 		// /ralph status names the phase.
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('finishing up before the requested fresh iteration');
+	});
+});
+
+describe('ralph-loop extension (finish-up watchdog)', () => {
+	beforeEach(async () => {
+		await writeFile(autoFile(), RALPH_V1);
+	});
+
+	/** Fire count non-ralph tool calls (work) at the end of the current run. */
+	const workCalls = async (fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx, count: number) => {
+		for (let i = 0; i < count; i++) {
+			await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash' });
+		}
+	};
+
+	/** Start the loop and steer the finish-up into the running turn at the context budget. */
+	const steerFinishUp = async (fake: ReturnType<typeof createFakePi>, fakeCtx: FakeCtx) => {
+		await startLoop(fake, fakeCtx);
+		// The long turn that crosses the budget is a live run (its own abort
+		// signal, like pi's per-run signal).
+		fakeCtx.newRun();
+		await fake.fire('agent_start', fakeCtx.ctx);
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('message_update', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
+		expect(fake.userMessages.at(-1)?.options).toEqual({ deliverAs: 'steer' });
+	};
+
+	test('work calls within the allowance after the mid-turn steer do not remind', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await steerFinishUp(fake, fakeCtx);
+		const steered = fake.userMessages.length;
+
+		// The allowance (finishUpWorkToolLimit default 6) covers the commit
+		// and status checks a compliant finish-up makes: no reminder, no
+		// abort.
+		await workCalls(fake, fakeCtx, 5);
+		expect(fake.userMessages.length).toBe(steered);
+		expect(fakeCtx.abortCalls.value).toBe(0);
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+	});
+
+	test('the exhausted allowance sends one reminder steer and no second one', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await steerFinishUp(fake, fakeCtx);
+		const steered = fake.userMessages.length;
+
+		// The allowance (6) is exhausted on the 6th work call: one reminder
+		// steer with the work-call count since the finish-up, plus an info
+		// notification.
+		await workCalls(fake, fakeCtx, 6);
+		const reminder = fake.userMessages.at(-1)!;
+		expect(reminder.text).toContain('Reminder: the finish-up instruction is still pending');
+		expect(reminder.text).toContain('6 work tool calls');
+		expect(reminder.options).toEqual({ deliverAs: 'steer' });
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('reminded it to stop and record the state');
+
+		// No further work calls for now: a second reminder must not be sent
+		// (the next work call enforces — covered by the abort test).
+		expect(fake.userMessages.length).toBe(steered + 1);
+	});
+
+	test('a work call after the reminder aborts the run, and the settle re-delivers the recording prompt without pausing', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await steerFinishUp(fake, fakeCtx);
+		const before = fake.userMessages.length;
+
+		await workCalls(fake, fakeCtx, 6); // allowance exhausted: reminder steer
+		await workCalls(fake, fakeCtx, 1); // enforcement abort
+		expect(fakeCtx.abortCalls.value).toBe(1);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain(
+			'aborting the turn and recording progress in a fresh recording turn'
+		);
+		// The recording prompt is NOT re-queued with the abort: the abort
+		// suppresses pi's queued continuations (user-Escape semantics), so
+		// the settle delivers it.
+		expect(fake.userMessages.length).toBe(before + 1);
+
+		// The aborted run settles: the loop must not pause — the recording
+		// prompt is delivered as a fresh run and the loop keeps cycling.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		const reDelivered = fake.userMessages.at(-1)!;
+		expect(reDelivered.text).toContain('Finish up now');
+		expect(reDelivered.options).toEqual({ deliverAs: 'followUp' });
+		// The recording turn is live: the context-limit cycle renders its
+		// state word as 'finishing' ('recording' is the task-completion and
+		// plan words).
+		expect(statusLine(fakeCtx.widgets)).toContain('finishing');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('paused');
+	});
+
+	test('ralph tools never count against the allowance', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await steerFinishUp(fake, fakeCtx);
+		const steered = fake.userMessages.length;
+
+		// A compliant finish-up calls ralph_todo (and other ralph tools) as
+		// many times as it needs: none of them advances the watchdog.
+		for (let i = 0; i < 10; i++) {
+			await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'ralph_todo' });
+		}
+		expect(fake.userMessages.length).toBe(steered);
+		expect(fakeCtx.abortCalls.value).toBe(0);
+	});
+
+	test('the watchdog is silent outside a recording turn', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+		const iteration = fake.userMessages.length;
+
+		// A normal iteration works tool after tool: no cycle is queued, so
+		// the watchdog must not remind or abort.
+		await workCalls(fake, fakeCtx, 20);
+		expect(fake.userMessages.length).toBe(iteration);
+		expect(fakeCtx.abortCalls.value).toBe(0);
+	});
+
+	test('the watchdog respects a user Escape during the recording turn', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await steerFinishUp(fake, fakeCtx);
+		const steered = fake.userMessages.length;
+
+		// The user presses Escape while the model keeps working: the run's
+		// abort signal fires, and the watchdog must not add its own reminder
+		// or enforcement abort to the dying run — the settle pauses the loop
+		// like any user abort.
+		await workCalls(fake, fakeCtx, 6); // reminder steer
+		fakeCtx.abortRun();
+		await workCalls(fake, fakeCtx, 1);
+		expect(fakeCtx.abortCalls.value).toBe(0);
+		expect(fake.userMessages.length).toBe(steered + 1);
+
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.userMessages.length).toBe(steered + 1);
+		expect(statusLine(fakeCtx.widgets)).toContain('paused');
 	});
 });
