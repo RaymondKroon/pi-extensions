@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initTheme } from '@earendil-works/pi-coding-agent';
@@ -4634,7 +4635,7 @@ D 1
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('is not a ralph-format backlog');
 	});
 
-	test('refuses a missing backlog target', async () => {
+	test('creates the backlog when missing', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -4642,7 +4643,11 @@ D 1
 
 		await setGoal(fake, fakeCtx, 'set-goal GOAL.md');
 
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('No backlog at');
+		expect(existsSync(autoFile())).toBe(true);
+		const backlog = readBacklog();
+		expect(backlog.goal()?.status).toBe('open');
+		expect(backlog.goal()?.body).toBe('Port the complete app\n\nPort the app from the source to the target.\n\n- Criterion one holds.\n- Criterion two holds.');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Set the goal in');
 	});
 
 	test('refuses paths outside the project', async () => {

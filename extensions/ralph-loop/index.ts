@@ -1424,9 +1424,10 @@ interface SetGoalOutcome {
 
 /**
  * Set the single goal of a ralph-format backlog from a goal file. The target
- * backlog is the active loop's backlog, else the session's ralph file. An
- * existing goal must be open (a claimed or done goal must be resolved first);
- * setting replaces the goal's body.
+ * backlog is the active loop's backlog, else the session's ralph file (the
+ * backlog is created when missing, like `pi --ralph-goal`). An existing goal
+ * must be open (a claimed or done goal must be resolved first); setting
+ * replaces the goal's body.
  */
 async function setGoalFromFile(
 	cwd: string,
@@ -1458,13 +1459,10 @@ async function setGoalFromFile(
 		backlog = Backlog.open(todoPath);
 	} catch (error) {
 		if (isMissingFileError(error)) {
-			return {
-				ok: false,
-				level: 'error',
-				message: `No backlog at ${outName} — create it first with ralph_todo action "init"`
-			};
+			backlog = Backlog.empty();
+		} else {
+			return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
 		}
-		return { ok: false, level: 'error', message: `${outName} is not a ralph-format backlog` };
 	}
 	const existing = backlog.goal();
 	if (existing && existing.status !== 'open') {
