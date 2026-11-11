@@ -1974,6 +1974,12 @@ export default function (pi: ExtensionAPI) {
 	// reported usage has not caught up yet); suppresses the mid-turn checkpoint
 	// steer for that turn so a cycle cannot immediately re-trigger itself.
 	let turnStartedOverBudget = false;
+	// Set when a cycle was queued with its recording prompt deferred (record:
+	// false — an over-budget settle while blocked/aborted/paused, where a
+	// followUp prompt would leak into a decision discussion or be suppressed
+	// by the abort). Cleared the moment the prompt is actually delivered
+	// (sendRecordingPrompt, or the resume input handler's transform).
+	let recordingDeferred = false;
 	// Stop reason of the last assistant message of the current run; distinguishes
 	// a recording turn that finished from one the user aborted (Escape) — an
 	// aborted recording turn must not count as recorded progress.
@@ -2300,6 +2306,10 @@ export default function (pi: ExtensionAPI) {
 		freshIterationPending = false;
 		loopEscapePending = false;
 		deferredFreshIteration = undefined;
+		// The loop is over: a deferred (record: false) finish-up prompt never
+		// runs now, and the deferral must not leak into a later loop's
+		// ralph_resolve_decision steer.
+		recordingDeferred = false;
 		// A force stop can land while a cycle compaction is in flight; the
 		// pending ralph summary must not hijack a later, unrelated compaction
 		// (e.g. the user's own /compact).
@@ -2417,6 +2427,12 @@ export default function (pi: ExtensionAPI) {
 			if (!resolution) throw new Error('resolution is required.');
 			persistState({ ...state, blocked: false, blockedItem: undefined });
 			updateStatus(ctx);
+			// A context-limit cycle was queued while blocked (an over-budget
+			// settle deferred its recording prompt): steer the recording into
+			// the now-unblocked running turn, like the mid-turn budget
+			// intercept, so the model records the checkpoint and stops instead
+			// of continuing the previously blocked work over budget.
+			if (recordingDeferred) sendRecordingPrompt(ctx, { midTurn: true });
 			ctx.ui.notify('Ralph decision resolved; continuing.', 'info');
 			return {
 				content: [
@@ -3591,6 +3607,7 @@ export default function (pi: ExtensionAPI) {
 		// running turn so the model stops at the next tool boundary instead of
 		// the turn running on until it settles on its own.
 		pi.sendUserMessage(prompt, { deliverAs: options?.midTurn ? 'steer' : 'followUp' });
+		recordingDeferred = false;
 		// The watchdog opens with the prompt: from here on the model may only
 		// make the configured work tool calls before being reminded, then
 		// forced.
@@ -3608,7 +3625,12 @@ export default function (pi: ExtensionAPI) {
 		// (or a cycle ran for another reason), so neither the enforcement nor
 		// the settle fallback may fire on top of it.
 		loopEscapePending = false;
-		if (!state?.enabled || state.cycleQueued || state.paused || state.blocked) return;
+		// A settle never starts new work while paused/blocked — except the
+		// deferred (record: false) context-limit queueing, which is durable
+		// state only: its recording prompt is delivered at the resolve
+		// (blocked) or resume (paused) point.
+		if (!state?.enabled || state.cycleQueued) return;
+		if ((state.paused || state.blocked) && options?.record !== false) return;
 
 		// For completed-task cycles, name the completed task(s) in the
 		// recording prompt instead of making the model re-read the backlog to
@@ -3639,7 +3661,13 @@ export default function (pi: ExtensionAPI) {
 		// first, and an abort suppresses pi's queued continuations (user-Escape
 		// semantics), so a followUp queued here would never be delivered
 		// (session 01a0c400) — the settle handler delivers it instead.
-		if (options?.record !== false) sendRecordingPrompt(ctx, options);
+		if (options?.record === false) {
+			// The prompt is delivered later, where it is safe: the resume input
+			// handler (paused) or ralph_resolve_decision (blocked).
+			recordingDeferred = true;
+			return;
+		}
+		sendRecordingPrompt(ctx, options);
 	};
 
 	// Dynamic tool loading (pi "defer_loading"): the four ralph tools stay
@@ -4242,6 +4270,9 @@ export default function (pi: ExtensionAPI) {
 				startFreshIteration(ctx, note);
 				return;
 			}
+			// The recording prompt was deferred by an over-budget settle while
+			// paused: it is delivered here, so the deferral is done.
+			recordingDeferred = false;
 			finishUpWorkCallsLeft = config.finishUpWorkToolLimit;
 			finishUpWorkCallsAtStart = runWorkToolCallCount;
 			finishUpReminded = false;
@@ -4289,7 +4320,30 @@ export default function (pi: ExtensionAPI) {
 		const hadHumanInput = humanInputSinceSettle;
 		humanInputSinceSettle = false;
 		freshIterationPending = false;
-		if (state?.blocked) return;
+		// The context budget must be checked BEFORE the blocked/aborted/paused
+		// early returns below: those guards exist so a settle never STARTS a
+		// new turn, but queueing a cycle is durable state only — the recording
+		// prompt is deferred (record: false) and delivered where it is safe
+		// (ralph_resolve_decision when the block lifts, the resume input
+		// handler when paused). Without this, a threshold crossed while
+		// blocked, or on a run the user Escapes, is invisible to every trigger
+		// (session 01a1bfcf: the goal loop crossed 70% inside a blocked
+		// decision window, and both over-budget runs were Escaped, so the
+		// context ran to 97% with no automated finish-up). A normal (unblocked,
+		// unpaused, clean-settle) run keeps the ordering below, where a
+		// completed-task/plan boundary must win over the proactive threshold.
+		const overBudget =
+			state?.enabled &&
+			!state.stopRequested &&
+			!state.cycleQueued &&
+			(contextUsageFraction(ctx) ?? 0) >= state.contextThreshold;
+		if (state?.blocked) {
+			if (overBudget) {
+				queueCycle(ctx, 'context-limit', { record: false });
+				ctx.ui.notify('Ralph: context is over budget — the finish-up cycle is queued and runs when the decision is resolved.', 'info');
+			}
+			return;
+		}
 		// An aborted run means the user pressed Escape: pause the loop
 		// immediately, always — even mid-cycle. Continuing (re-sending the
 		// recording prompt, queueing a cycle, or starting a fresh iteration)
@@ -4314,9 +4368,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		// A paused loop stays paused: settles must not queue cycles or fresh
-		// iterations (a typed message resumes the loop before its turn runs).
+		// iterations (a typed message resumes the loop before its turn runs) —
+		// except a queued finish-up, which is durable state only: the resume
+		// input handler re-runs the recording turn with the user's extra info.
 		if (state.paused) {
-			if (state.stopRequested) stopLoop(ctx, 'Ralph loop stopped');
+			if (state.stopRequested) {
+				stopLoop(ctx, 'Ralph loop stopped');
+			} else if (overBudget) {
+				queueCycle(ctx, 'context-limit', { record: false });
+				ctx.ui.notify('Ralph: context is over budget — the finish-up cycle is queued and runs when you resume.', 'info');
+			}
 			return;
 		}
 		if (userAborted) {
@@ -4375,6 +4436,14 @@ export default function (pi: ExtensionAPI) {
 			if (state.stopRequested) {
 				stopLoop(ctx, 'Ralph loop stopped after the current iteration');
 			} else {
+				// An over-budget context must not keep growing on resume: queue
+				// the finish-up (durable state, no prompt — an abort suppresses
+				// queued followUps). The resume input handler re-runs the
+				// recording turn with the user's extra info.
+				if (overBudget) {
+					queueCycle(ctx, 'context-limit', { record: false });
+					ctx.ui.notify('Ralph: context is over budget — the finish-up cycle is queued and runs when you resume.', 'info');
+				}
 				pauseLoop(ctx, 'Ralph loop paused (Escape) — type a message to resume it with extra info');
 			}
 			return;
@@ -4410,6 +4479,16 @@ export default function (pi: ExtensionAPI) {
 			// ignored: the fresh iteration would carry stopRequested over and the
 			// loop would auto-cycle forever.
 			if (state.cycleCheckpointing) {
+				// The recording prompt was deferred (record: false) and this
+				// turn's unblock did not deliver it — a goal-claim review
+				// withdrawn in a work turn: the loop runs on over budget.
+				// Re-deliver the prompt (the session is idle at settle) so the
+				// finish-up turn runs; consuming the cycle here would cut the
+				// context without the recording.
+				if (recordingDeferred) {
+					sendRecordingPrompt(ctx);
+					return;
+				}
 				if (state.stopRequested) {
 					stopLoop(ctx, 'Ralph loop stopped after recording progress');
 				} else if (state.reloadRequested) {

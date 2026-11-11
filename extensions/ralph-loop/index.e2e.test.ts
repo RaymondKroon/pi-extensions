@@ -686,7 +686,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 	test('pause and resume are operator commands even while a response is streaming', { timeout: 15000 }, async () => {
 		endpoint = startMockEndpoint([], (body) => lastUserText(body).includes('this message resumes it')
 			? textResponder('Resumed.')(body)
-			: textResponder('Finished the current turn.', { prompt_tokens: 9000, completion_tokens: 10 })(body), 500);
+			// Below the 20% threshold: an over-budget turn settling while paused
+			// queues the finish-up, and the resume runs the recording turn
+			// instead of continuing the iteration (the feature under test here
+			// is operator-command handling while streaming, not the budget).
+			: textResponder('Finished the current turn.', { prompt_tokens: 2000, completion_tokens: 10 })(body), 500);
 		const sess = await createRalphSession(endpoint.port, {
 			contextThresholds: { __default__: 0.2 },
 			dndMode: false,

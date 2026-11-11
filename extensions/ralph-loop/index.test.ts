@@ -1218,6 +1218,134 @@ D 3 2026-01-01T00:00:00Z
 		expect(statusLine(fakeCtx.widgets)).toContain('recording');
 	});
 
+	test('aborted over-budget run: Escape pauses the loop AND queues the finish-up cycle', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// The run crosses the 50% threshold and the user aborts it (Escape).
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// Paused — and the finish-up is queued as durable state, with no prompt:
+		// an abort suppresses queued followUps, so none may be sent here.
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
+		expect((fake.entries.filter((e) => e.customType === 'ralph-loop-state') as Array<{ data: Record<string, unknown> }>).at(-1)!.data).toMatchObject({
+			paused: true,
+			cycleQueued: true,
+			cycleReason: 'context-limit'
+		});
+		expect(fake.userMessages.length).toBe(1); // iteration prompt only
+		expect(fakeCtx.notifications.some((n) => n.message.includes('over budget'))).toBe(true);
+
+		// Resuming re-runs the recording turn (with the user's extra info), not
+		// the interrupted iteration — the context must not keep growing.
+		const transform = (await fake.fire('input', fakeCtx.ctx, {
+			text: 'finish the checkpoint',
+			source: 'interactive'
+		})) as { action: string; text: string } | undefined;
+		expect(transform?.action).toBe('transform');
+		expect(transform?.text).toContain('Finish up now');
+		expect(transform?.text).toContain('finish the checkpoint');
+
+		// The recording turn settles: the fresh iteration starts from the cut.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+	});
+
+	test('blocked settle over budget: the finish-up is queued and steered in when the decision resolves', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// The model asks a decision question; the turn terminates.
+		const ask = fake.tools.get('ralph_request_decision') as { execute: (id: string, p: unknown, s?: unknown, u?: unknown, c?: unknown) => Promise<unknown> };
+		await ask.execute('t', { question: 'Which approach?' }, undefined, undefined, fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting');
+
+		// The blocked turn settles while the context is over budget.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		// Still waiting for the decision — but the finish-up is queued as
+		// durable state, with no prompt: it must not leak into the decision
+		// discussion.
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting');
+		expect((fake.entries.filter((e) => e.customType === 'ralph-loop-state') as Array<{ data: Record<string, unknown> }>).at(-1)!.data).toMatchObject({
+			blocked: true,
+			cycleQueued: true,
+			cycleReason: 'context-limit'
+		});
+		expect(fake.userMessages.length).toBe(1); // iteration prompt only
+
+		// A later blocked settle must not queue a second cycle.
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting');
+
+		// The user's answer is transformed into the decision-clarification
+		// message; the recording prompt is not mixed in.
+		const transform = (await fake.fire('input', fakeCtx.ctx, {
+			text: 'approach B',
+			source: 'interactive'
+		})) as { action: string; text: string } | undefined;
+		expect(transform?.text).toContain('pending this decision');
+		expect(transform?.text).not.toContain('Finish up now');
+
+		// The model resolves the decision: the recording is steered into the
+		// now-unblocked running turn, like the mid-turn budget intercept.
+		const resolve = fake.tools.get('ralph_resolve_decision') as typeof ask;
+		await resolve.execute('t', { resolution: 'approach B' }, undefined, undefined, fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
+		expect(fake.userMessages.at(-1)?.options).toEqual({ deliverAs: 'steer' });
+
+		// The model records and stops; the fresh iteration starts from the cut.
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
+	});
+
+	test('paused settle over budget: the finish-up is queued, the loop stays paused', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+
+		await startLoop(fake, fakeCtx);
+
+		// Escape pauses the loop (below budget: nothing is queued).
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'aborted' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
+		expect(fake.userMessages.length).toBe(1);
+
+		// A settle lands while paused with the context over budget (e.g. a
+		// background run finishing): the finish-up is queued, no prompt, and the
+		// loop stays paused.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
+		expect((fake.entries.filter((e) => e.customType === 'ralph-loop-state') as Array<{ data: Record<string, unknown> }>).at(-1)!.data).toMatchObject({
+			paused: true,
+			cycleQueued: true,
+			cycleReason: 'context-limit'
+		});
+		expect(fake.userMessages.length).toBe(1);
+	});
+
 	test('aborted tool call: Escape during a tool call pauses the loop; a typed message resumes the iteration', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3362,7 +3490,10 @@ describe('ralph-loop extension (operator commands)', () => {
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('after the current turn');
 		await run('resume');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Wait for the current turn');
-		fakeCtx.usagePercent.value = 55;
+		// Below the context threshold: an over-budget paused settle now queues
+		// the finish-up instead (covered by the "paused settle over budget"
+		// test), which would turn the resume into the recording turn.
+		fakeCtx.usagePercent.value = 30;
 		await fake.fire('message_update', fakeCtx.ctx);
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
 		fakeCtx.idle.value = true;
@@ -3957,6 +4088,111 @@ GE "All routes render."
 
 		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
 		expect(readBacklog().goal()?.status).toBe('done');
+	});
+
+	test('DND goal review over budget: approving the goal does not leak the deferred finish-up into a later loop', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, dndMode: true, maxIterations: 10 }, null, '\t')}\n`
+		);
+		await writeFile(autoFile(), GOAL_OPEN_TASKS_DONE);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+
+		// Claim the goal: the loop blocks for the user's review.
+		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting (dnd');
+
+		// An over-budget settle while the claim review is pending queues the
+		// finish-up as deferred durable state (no prompt — the review is live).
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect((fake.entries.filter((e) => e.customType === 'ralph-loop-state') as Array<{ data: Record<string, unknown> }>).at(-1)!.data).toMatchObject({
+			blocked: true,
+			cycleQueued: true,
+			cycleReason: 'context-limit'
+		});
+
+		// The user approves the goal: the loop stops. The review goes through
+		// /ralph approve, never through ralph_resolve_decision, so the deferred
+		// recording prompt is orphaned by the stop — it must be cleared.
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
+		expect(readBacklog().goal()?.status).toBe('done');
+		expect(statusLine(fakeCtx.widgets)).not.toContain('waiting');
+
+		// A later task loop (DND off) must not inherit the stale deferral:
+		// resolving a normal decision must not steer a "Finish up now"
+		// recording into it.
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, maxIterations: 10 }, null, '\t')}\n`
+		);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'reload' });
+		await writeFile(autoFile(), RALPH_V1);
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+		const ask = fake.tools.get('ralph_request_decision') as GoalTool;
+		await ask.execute('t', { question: 'Which approach?' }, undefined, undefined, fakeCtx.ctx);
+		const messagesBefore = fake.userMessages.length;
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { resolution: 'approach B' }, undefined, undefined, fakeCtx.ctx);
+		expect(fake.userMessages.slice(messagesBefore).some((m) => m.text.includes('Finish up now'))).toBe(false);
+	});
+
+	test('withdraw of an over-budget claim review re-delivers the deferred finish-up instead of skipping the recording', async () => {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await writeFile(
+			join(dir, '.pi', 'ralph-loop.json'),
+			`${JSON.stringify({ contextThresholds: {}, dndMode: true, maxIterations: 10 }, null, '\t')}\n`
+		);
+		await writeFile(autoFile(), GOAL_OPEN_TASKS_DONE);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
+		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
+		const stateEntry = () => (fake.entries.filter((e) => e.customType === 'ralph-loop-state') as Array<{ data: Record<string, unknown> }>).at(-1)!.data;
+
+		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting (dnd');
+
+		// An over-budget settle while the claim review is pending queues the
+		// finish-up with its prompt deferred.
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(stateEntry()).toMatchObject({ blocked: true, cycleQueued: true, cycleReason: 'context-limit' });
+
+		// The user asks for changes; the model withdraws the claim in a work
+		// turn, unblocking the loop — the deferred prompt was not delivered.
+		const transform = (await fake.fire('input', fakeCtx.ctx, {
+			text: 'the verification is not run yet',
+			source: 'interactive'
+		})) as { action: string; text: string } | undefined;
+		expect(transform?.text).toContain('/ralph approve');
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await run({ action: 'withdraw', note: 'Verification not run yet.' });
+		expect(statusLine(fakeCtx.widgets)).not.toContain('waiting');
+
+		// The work turn settles with the deferred cycle still queued: the
+		// recording prompt is re-delivered instead of consuming the cycle
+		// (consuming it would cut the context without the finish-up).
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(fake.userMessages.at(-1)?.text).toContain('Record a checkpoint now');
+		expect(stateEntry()).toMatchObject({ cycleQueued: true, cycleCheckpointing: true });
+
+		// The recording turn settles into the fresh iteration from the cut.
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 2/10');
 	});
 
 	test('/ralph approve refuses an open goal', async () => {
