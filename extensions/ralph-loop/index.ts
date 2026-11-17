@@ -1961,6 +1961,11 @@ export default function (pi: ExtensionAPI) {
 	// doing work after the intercept) from an ignored one (it only talked back
 	// or kept thinking).
 	let runWorkToolCallCount = 0;
+	// Human input can make a model answer and stop instead of resuming work
+	// (session 01a1cb75). Give that stop one same-context continuation, not an
+	// iteration-ended cycle or a no-work stall. Keep this across agent_start:
+	// queued follow-ups can start another low-level run before the final settle.
+	let humanInputSinceSettle = false;
 	// The ralph-provided compaction pending for the in-flight cycle:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
@@ -4004,7 +4009,10 @@ export default function (pi: ExtensionAPI) {
 				'the context exactly once. If your earlier reasoning says an instruction was "resent" or ' +
 				'"periodically re-triggered", or that the user sent the same message multiple times, that is a ' +
 				'misperception — count the actual user messages before believing it. ' +
-				'Continue the current task from the tool results.'
+				'Continue the current task from the tool results. ' +
+				'A human question during the loop is not an iteration boundary: answer it, apply any new direction, ' +
+				'then resume the ongoing work in the same context. Do not finish up merely because you answered. ' +
+				'Honor a user request to stop or pause, and use ralph_request_decision if work needs a user decision.'
 		};
 	});
 
@@ -4240,9 +4248,14 @@ export default function (pi: ExtensionAPI) {
 				text: resumeWithExtraInfoPrompt(event.text)
 			};
 		}
+		if (!state.cycleQueued && !state.stopRequested) humanInputSinceSettle = true;
 	});
 
 	pi.on('agent_settled', async (_event, ctx) => {
+		// Consume even on abort/block/stop: old input must not grant a later
+		// run another continuation. Extension-injected nudges never re-arm it.
+		const hadHumanInput = humanInputSinceSettle;
+		humanInputSinceSettle = false;
 		freshIterationPending = false;
 		if (state?.blocked) return;
 		// An aborted run means the user pressed Escape: pause the loop
@@ -4512,6 +4525,21 @@ export default function (pi: ExtensionAPI) {
 				openWorkTaskCount(current, countCategory(state)) > 0
 			) {
 					pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('continue-loop', {})}`, { deliverAs: 'followUp' });
+				return;
+			}
+
+			// Some models resume naturally after answering a human question;
+			// others stop even if they used tools to research the answer. Neither
+			// a clean stop nor work calls prove that the iteration ended here.
+			// Real boundaries above still win; otherwise offer one continuation
+			// in this context. A subsequent empty run still uses the stall guard.
+			if (
+				hadHumanInput &&
+				lastAssistantStopReason === 'stop' &&
+				(openWorkTaskCount(current, countCategory(state)) > 0 ||
+					(state.mode === 'goal' && goalStatus(current) === 'open'))
+			) {
+				pi.sendUserMessage(`${automatedPrefix()}${renderPrompt('continue-after-input', {})}`, { deliverAs: 'followUp' });
 				return;
 			}
 

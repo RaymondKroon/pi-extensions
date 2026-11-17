@@ -363,6 +363,19 @@ task/goal/auto code paths to one loop with two orthogonal axes.
   empty backlog). Under `"budget"` a completion that leaves open work sends a
   continue nudge instead of cycling (the same context continues — cheaper
   than a fresh one).
+- **Human input is not an iteration boundary.** The stable loop guardrail
+  tells models to answer human questions, apply any new direction, and resume
+  work in the same context. Some models resume naturally; others answer and
+  stop (session 01a1cb75: Sol's answers about build speed and Linux packaging
+  triggered premature finish-ups). Non-extension input during an active,
+  unblocked iteration grants one same-context continuation at a clean settle
+  if work remains, before the `iteration-ended`/no-work-stall fallback. This
+  allowance survives low-level run starts (queued follow-ups drain before
+  settle), is consumed at every settle, and is not re-armed by the nudge.
+  Real boundaries (completion, plan/phase change, budget, requested cycle),
+  stops, aborts, errors and blocked decisions still win. Empty auto backlogs
+  do not invent work. Human input during recording does not grant a work
+  continuation; paused-loop resume and decision-reply handling are unchanged.
 - **Recording turns.** Two, not four: `completed-task`/`plan-updated` (task
   policy) send the completion/plan recording prompt; `context-limit`/
   `phase-changed`/`iteration-ended` send one merged finish-up prompt (wrap

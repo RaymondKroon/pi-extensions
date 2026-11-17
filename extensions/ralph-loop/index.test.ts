@@ -602,6 +602,8 @@ describe('ralph-loop extension', () => {
 		expect(result!.systemPrompt.startsWith('BASE\n\n')).toBe(true);
 		expect(result!.systemPrompt).toContain('no periodic re-trigger');
 		expect(result!.systemPrompt).toContain('misperception');
+		expect(result!.systemPrompt).toContain('answer it, apply any new direction');
+		expect(result!.systemPrompt).toContain('resume the ongoing work in the same context');
 	});
 
 	test('loop-police reasoning-loop detection instructs the model to cycle; other detections are ignored', async () => {
@@ -6735,6 +6737,134 @@ T 1 - "Continuous re-test loop (run until stopped)"
 
 T 1 - "Roll out the flat configuration to every language"
 `;
+
+	async function startHumanInputLoop(mode: 'auto' | 'goal' | 'tasks', policy: 'task' | 'budget') {
+		await writeConfig({ autoMode: mode === 'auto' ? 'on' : 'off', cycleOn: allCycle(policy) });
+		await writeFile(autoFile(), mode === 'goal' ? GOAL_PERMANENT_TASK : RALPH_V1);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler(mode === 'goal' ? 'start --goal' : 'start', fakeCtx.ctx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+		return { fake, fakeCtx };
+	}
+
+	for (const mode of ['auto', 'goal', 'tasks'] as const) {
+		for (const policy of ['task', 'budget'] as const) {
+			for (const research of [false, true]) {
+				test(`human question: ${mode}/${policy}, ${research ? 'with research tools' : 'answer only'} resumes in the same context`, async () => {
+					const { fake, fakeCtx } = await startHumanInputLoop(mode, policy);
+					// Work before the question made Sol's answer look like an ended
+					// iteration in session 01a1cb75. RPC and TUI input both count.
+					await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash' });
+					await fake.fire('input', fakeCtx.ctx, {
+						text: 'For Windows we do WiX? What do we do for Linux? AppImage?',
+						source: research ? 'rpc' : 'interactive',
+						streamingBehavior: 'steer'
+					});
+					if (research) await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'read' });
+					await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+					await fake.fire('agent_settled', fakeCtx.ctx);
+
+					expect(fake.userMessages).toHaveLength(2);
+					expect(fake.userMessages.at(-1)!.text).toContain('Continue the current Ralph iteration in the same context');
+					expect(fake.userMessages.at(-1)!.text).not.toContain('Finish up now');
+					expect(fake.userMessages.at(-1)!.options).toEqual({ deliverAs: 'followUp' });
+					expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+					expect((stateEntries(fake).at(-1)!.data as { cycleQueued: boolean }).cycleQueued).toBe(false);
+					expect(fakeCtx.compactCalls).toHaveLength(0);
+				});
+			}
+		}
+	}
+
+	test('human question: queued follow-up survives agent_start; a no-work answer gets only one nudge', async () => {
+		const { fake, fakeCtx } = await startHumanInputLoop('auto', 'budget');
+		await fake.fire('input', fakeCtx.ctx, {
+			text: 'Can the build be quicker?', source: 'interactive', streamingBehavior: 'followUp'
+		});
+		// Pi drains queued follow-ups into another low-level run before the
+		// final settle. Its agent_start must not forget the human input.
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)!.text).toContain('Continue the current Ralph iteration in the same context');
+
+		const nudge = fake.userMessages.at(-1)!.text;
+		await fake.fire('input', fakeCtx.ctx, { text: nudge, source: 'extension' });
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		// The nudge cannot re-arm itself and spin forever on a stuck model.
+		expect(fake.userMessages).toHaveLength(2);
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('without doing any work');
+	});
+
+	for (const boundary of ['context', 'completion', 'requested-cycle', 'abort', 'error', 'stop', 'decision', 'empty'] as const) {
+		test(`human question: ${boundary} takes precedence over the same-context nudge`, async () => {
+			const { fake, fakeCtx } = await startHumanInputLoop('auto', 'task');
+			await fake.fire('input', fakeCtx.ctx, { text: 'What about Linux?', source: 'interactive' });
+			await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+			if (boundary === 'context') fakeCtx.usagePercent.value = 55;
+			if (boundary === 'completion') {
+				await todoTool(fake).execute('t', { action: 'complete', task: '1', note: 'verified' }, undefined, undefined, fakeCtx.ctx);
+			}
+			if (boundary === 'requested-cycle') {
+				await (fake.tools.get('ralph_cycle') as Tool).execute('t', { note: 'Need a fresh approach' }, undefined, undefined, fakeCtx.ctx);
+			}
+			if (boundary === 'abort' || boundary === 'error') {
+				await fake.fire('message_end', fakeCtx.ctx, {
+					message: { role: 'assistant', stopReason: boundary === 'abort' ? 'aborted' : 'error' }
+				});
+			}
+			if (boundary === 'stop') await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+			if (boundary === 'decision') {
+				await (fake.tools.get('ralph_request_decision') as Tool).execute('t', { question: 'Which Linux format?' }, undefined, undefined, fakeCtx.ctx);
+			}
+			if (boundary === 'empty') await writeFile(autoFile(), '# ralph v2\n');
+			await fake.fire('agent_settled', fakeCtx.ctx);
+			expect(fake.userMessages.some((m) => m.text.includes('Continue the current Ralph iteration in the same context'))).toBe(false);
+			if (boundary === 'context' || boundary === 'completion' || boundary === 'requested-cycle') {
+				expect(fake.userMessages).toHaveLength(2);
+			} else {
+				expect(fake.userMessages).toHaveLength(1);
+			}
+		});
+	}
+
+	test('human question: natural resumption and task completion still take the normal cycle', async () => {
+		const { fake, fakeCtx } = await startHumanInputLoop('auto', 'task');
+		await fake.fire('input', fakeCtx.ctx, { text: 'What about Linux?', source: 'interactive' });
+		// Qwen-style behavior: answer and keep working without needing a nudge.
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash' });
+		await todoTool(fake).execute('t', { action: 'complete', task: '1', note: 'verified' }, undefined, undefined, fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)!.text).toContain('A Ralph TODO task was just completed');
+		expect(fake.userMessages).toHaveLength(2);
+
+		// The human-input allowance was consumed by that settle; it cannot leak
+		// through the recording turn into the fresh iteration.
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)!.message).toContain('without doing any work');
+		expect(fake.userMessages).toHaveLength(3);
+	});
+
+	test('extension input cannot turn an ordinary iteration end into a human-answer nudge', async () => {
+		const { fake, fakeCtx } = await startHumanInputLoop('auto', 'budget');
+		await fake.fire('input', fakeCtx.ctx, { text: 'An extension instruction', source: 'extension' });
+		await fake.fire('tool_execution_end', fakeCtx.ctx, { toolName: 'bash' });
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fake.userMessages.at(-1)!.text).toContain('The current Ralph iteration has ended');
+	});
 
 	test('auto loop under cycleOn "task": a cleanly ended mid-task iteration with work cycles instead of idling', async () => {
 		await writeAutoConfig({ cycleOn: allCycle('task') });
