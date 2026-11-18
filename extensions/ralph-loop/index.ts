@@ -5082,7 +5082,7 @@ export default function (pi: ExtensionAPI) {
 		// disk on every home round (a task-view round may have renamed or
 		// added lists).
 		let source: Backlog = initial;
-		await ctx.ui.custom((tui, theme, _keybindings, done) => {
+		await ctx.ui.custom((tui, theme, keybindings, done) => {
 			// The stage currently rendered. Swapping stages does not close
 			// the overlay, so the chat behind never flashes through.
 			let stage: RalphHome | TodosView | undefined;
@@ -5095,6 +5095,7 @@ export default function (pi: ExtensionAPI) {
 				showStage(
 					createTodosView({
 						backlog: source,
+						keybindings,
 						tui,
 						title,
 						category,
@@ -5117,6 +5118,7 @@ export default function (pi: ExtensionAPI) {
 				showStage(
 					createRalphHome({
 						backlog: source,
+						keybindings,
 						tui,
 						title,
 						theme,

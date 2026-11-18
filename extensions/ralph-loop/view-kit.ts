@@ -17,14 +17,9 @@
 // wrap, undo, kill ring): enter inserts a newline, Ctrl+S saves the
 // body back into the form, Esc returns to the read-only preview.
 
-import { Editor, Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
+import { Editor, getKeybindings, Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type KeybindingsManager, type TUI } from '@earendil-works/pi-tui';
 
-export const ARROW_UP = '\x1b[A';
-export const ARROW_DOWN = '\x1b[B';
-export const PAGE_UP = '\x1b[5~';
-export const PAGE_DOWN = '\x1b[6~';
-export const ESCAPE = '\x1b';
-export const ENTER_KEYS = ['\r', '\n'];
+export type RalphViewKeybindings = Pick<KeybindingsManager, 'matches'>;
 
 /** The subset of the pi theme the views need (fg/bold are stable API). */
 export interface RalphViewTheme {
@@ -254,6 +249,8 @@ export interface FormInit {
 }
 
 export interface ModeControllerOptions {
+	/** The host's configured navigation actions; standalone views use the TUI defaults. */
+	keybindings?: RalphViewKeybindings;
 	/** The host TUI (used to construct the built-in Editor for body editing). */
 	tui: TUI;
 	theme: RalphViewTheme;
@@ -285,6 +282,10 @@ export interface ModeController {
  * onSaveForm.
  */
 export function createModeController(options: ModeControllerOptions): ModeController {
+	const keybindings = options.keybindings ?? getKeybindings();
+	const confirms = (data: string) => keybindings.matches(data, 'tui.select.confirm') || data === '\n';
+	const nextField = (data: string) => keybindings.matches(data, 'tui.select.down') || keybindings.matches(data, 'tui.input.tab');
+	const previousField = (data: string) => keybindings.matches(data, 'tui.select.up') || matchesKey(data, Key.shift('tab'));
 	let mode: Mode = { kind: 'browse' };
 	// Theme for the built-in Editor used by the body editor. Autocomplete is
 	// never enabled, so the select-list functions are never called.
@@ -358,7 +359,7 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 	const handleEditorInput = (data: string): void => {
 		if (mode.kind !== 'editor') return;
 		const { form, editor } = mode;
-		if (data === ESCAPE) {
+		if (keybindings.matches(data, 'tui.select.cancel')) {
 			mode = form;
 			options.requestRender();
 			return;
@@ -371,7 +372,7 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 			options.requestRender();
 			return;
 		}
-		if (ENTER_KEYS.includes(data)) {
+		if (keybindings.matches(data, 'tui.input.submit') || data === '\n') {
 			editor.insertTextAtCursor('\n');
 			options.requestRender();
 			return;
@@ -382,12 +383,12 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 
 	const handleModeInput = (data: string): void => {
 		if (mode.kind === 'input' || mode.kind === 'reason') {
-			if (data === ESCAPE) {
+			if (keybindings.matches(data, 'tui.select.cancel')) {
 				mode = { kind: 'browse' };
 				options.requestRender();
 				return;
 			}
-			if (ENTER_KEYS.includes(data)) {
+			if (confirms(data)) {
 				const current = mode;
 				const value = current.input.getValue();
 				mode = { kind: 'browse' };
@@ -401,7 +402,7 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 		}
 		if (mode.kind === 'form') {
 			const form = mode;
-			if (data === ESCAPE || data === 'q') {
+			if (keybindings.matches(data, 'tui.select.cancel') || data === 'q') {
 				mode = { kind: 'browse' };
 				options.requestRender();
 				return;
@@ -424,15 +425,15 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 			if (!form.editing) {
 				// Read-only: navigate the fields; enter edits the focused one
 				// (opens the body editor or edits the title).
-				if (data === 'j' || data === ARROW_DOWN || data === '\t') {
+				if (data === 'j' || nextField(data)) {
 					move(1);
 					return;
 				}
-				if (data === 'k' || data === ARROW_UP || data === '\x1b[Z') {
+				if (data === 'k' || previousField(data)) {
 					move(-1);
 					return;
 				}
-				if (ENTER_KEYS.includes(data)) {
+				if (confirms(data)) {
 					if (onBody) openBodyEditor(form);
 					else form.editing = true;
 					options.requestRender();
@@ -444,16 +445,16 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 			// state).
 			const field = form.fields[form.focus];
 			if (!field) return;
-			if (ENTER_KEYS.includes(data)) {
+			if (confirms(data)) {
 				form.editing = false; // confirm the field, stay on it
 				options.requestRender();
 				return;
 			}
-			if (data === '\t' || data === ARROW_DOWN) {
+			if (nextField(data)) {
 				move(1);
 				return;
 			}
-			if (data === '\x1b[Z' || data === ARROW_UP) {
+			if (previousField(data)) {
 				move(-1);
 				return;
 			}
@@ -463,13 +464,13 @@ export function createModeController(options: ModeControllerOptions): ModeContro
 		}
 		if (mode.kind === 'confirm') {
 			const current = mode;
-			if (data === 'y' || ENTER_KEYS.includes(data)) {
+			if (data === 'y' || confirms(data)) {
 				mode = { kind: 'browse' };
 				options.requestRender();
 				current.onYes();
 				return;
 			}
-			if (data === 'n' || data === ESCAPE) {
+			if (data === 'n' || keybindings.matches(data, 'tui.select.cancel')) {
 				mode = { kind: 'browse' };
 				options.requestRender();
 				current.onNo();

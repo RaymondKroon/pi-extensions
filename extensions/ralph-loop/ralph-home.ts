@@ -16,25 +16,22 @@
 // trigger. Goal mutations flow through the host's mutate callback, the
 // same parse → mutate → render → write discipline as the todos view.
 
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
+import { getKeybindings, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
 import { Backlog, type Goal } from './backlog.ts';
 import {
-	ARROW_DOWN,
-	ARROW_UP,
 	createModeController,
 	dimmedTheme,
-	ESCAPE,
-	ENTER_KEYS,
 	layoutFooter,
-	PAGE_DOWN,
-	PAGE_UP,
 	renderModeBody,
 	type FormMode,
+	type RalphViewKeybindings,
 	type RalphViewTheme
 } from './view-kit.ts';
 
 export interface RalphHomeOptions {
 	backlog: Backlog;
+	/** Configured navigation actions from the host custom UI. */
+	keybindings?: RalphViewKeybindings;
 	/** The host TUI (used to construct the built-in Editor for body editing). */
 	tui: TUI;
 	/** Display name of the source (e.g. the backlog file path). */
@@ -114,6 +111,7 @@ const goalStatusStyle = (status: Goal['status']): { marker: string; color: 'acce
  * lists) only.
  */
 export function createRalphHome(options: RalphHomeOptions): RalphHome {
+	const keybindings = options.keybindings ?? getKeybindings();
 	let backlog = options.backlog;
 	let cursor = 0;
 	let scrollTop = 0;
@@ -285,6 +283,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 	// The popup modes (input, form, confirm) are owned by the shared view kit;
 	// the view persists goal form saves through saveGoalForm.
 	const modes = createModeController({
+		keybindings: options.keybindings,
 		tui: options.tui,
 		theme: options.theme,
 		requestRender: options.requestRender,
@@ -471,12 +470,12 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 		handleInput(data: string): void {
 			if (modes.handleInput(data)) return;
 			notice = undefined;
-			if (data === 'q' || data === ESCAPE) {
+			if (data === 'q' || keybindings.matches(data, 'tui.select.cancel')) {
 				options.onClose();
 				return;
 			}
 			let movedCursor = false;
-			if (data === 'j' || data === ARROW_DOWN) {
+			if (data === 'j' || keybindings.matches(data, 'tui.select.down')) {
 				const before = cursor;
 				cursor = Math.min(state.selectable.length - 1, cursor + 1);
 				if (cursor === before) {
@@ -486,7 +485,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 				} else {
 					movedCursor = true;
 				}
-			} else if (data === 'k' || data === ARROW_UP) {
+			} else if (data === 'k' || keybindings.matches(data, 'tui.select.up')) {
 				const before = cursor;
 				cursor = Math.max(0, cursor - 1);
 				if (cursor === before) {
@@ -503,10 +502,10 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 				cursor = 0;
 				scrollTop = 0;
 				movedCursor = true;
-			} else if (data === PAGE_DOWN) {
+			} else if (keybindings.matches(data, 'tui.select.pageDown')) {
 				const bh = bodyHeight();
 				if (bh !== undefined) scrollTop = Math.min(maxScroll(), scrollTop + bh - 1);
-			} else if (data === PAGE_UP) {
+			} else if (keybindings.matches(data, 'tui.select.pageUp')) {
 				const bh = bodyHeight();
 				if (bh !== undefined) scrollTop = Math.max(0, scrollTop - (bh - 1));
 			} else if (data === 'O') {
@@ -527,7 +526,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 						scrollTop = Math.min(maxScroll(), line);
 					}
 				}
-			} else if (ENTER_KEYS.includes(data)) {
+			} else if (keybindings.matches(data, 'tui.select.confirm') || data === '\n') {
 				const row = state.selectable[cursor];
 				if (!row) return;
 				if (row.kind === 'goal') {

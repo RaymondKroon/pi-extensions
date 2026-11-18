@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initTheme } from '@earendil-works/pi-coding-agent';
+import { KeybindingsManager, TUI_KEYBINDINGS } from '@earendil-works/pi-tui';
 import { Backlog } from './backlog.ts';
 import extension from './index.ts';
 
@@ -4095,6 +4096,117 @@ describe('ralph-loop extension (/ralph home view)', () => {
 		component.handleInput('q');
 		expect(closed).toBe('quit');
 	});
+
+	for (const [name, cancel] of [
+		['CSI-u Escape', '\x1b[27u'],
+		['configured Ctrl+X', '\x18']
+	] as const) {
+		test(`${name} backs out of task body → form → list → overview → closes`, async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), RALPH_V1);
+			await startLoop(fake, fakeCtx);
+			const original = renderFile();
+			await fake.commands.get('ralph')!.handler('', fakeCtx.ctx);
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS,
+				cancel === '\x18' ? { 'tui.select.cancel': 'ctrl+x' } : {});
+			let closes = 0;
+			const host = fakeCtx.customFactories[0]!(
+				{ terminal: { rows: 24 }, requestRender: () => {} }, fakeTheme, keybindings, () => { closes++; }
+			) as { render: (width: number) => string[]; handleInput: (data: string) => void };
+			const text = () => host.render(100).join('\n');
+			expect(text()).toContain('Ralph home');
+			if (cancel === '\x18') {
+				host.handleInput('\x1b[27u'); // Escape is no longer the configured cancel.
+				expect(closes).toBe(0);
+			}
+			host.handleInput('\r'); // open the (all) list
+			host.handleInput('e');
+			host.handleInput('\t');
+			host.handleInput('\r'); // edit body
+			expect(text()).toContain('esc: back to form');
+			host.handleInput('unsaved body');
+			host.handleInput(cancel);
+			expect(text()).toContain('enter: edit body');
+			expect(text()).not.toContain('unsaved body');
+			host.handleInput(cancel);
+			expect(text()).toContain('Ralph backlog');
+			expect(text()).not.toContain('ctrl+s: save');
+			host.handleInput(cancel);
+			expect(text()).toContain('Ralph home');
+			expect(closes).toBe(0);
+			host.handleInput(cancel);
+			expect(closes).toBe(1);
+			expect(renderFile()).toBe(original);
+			expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+		});
+	}
+
+	for (const keys of [
+		{
+			name: 'terminal-protocol navigation', bindings: {},
+			down: '\x1b[1;1B', up: '\x1bOA', tab: '\x1b[9u', enter: '\x1b[13u'
+		},
+		{
+			name: 'remapped navigation',
+			bindings: {
+				'tui.select.down': 'ctrl+n', 'tui.select.up': 'ctrl+p',
+				'tui.select.confirm': 'ctrl+f', 'tui.input.submit': 'ctrl+f', 'tui.input.tab': 'ctrl+t'
+			},
+			down: '\x0e', up: '\x10', tab: '\x14', enter: '\x06'
+		}
+	] as const) {
+		test(`${keys.name} works across overview, task list and edit fields`, async () => {
+			const fake = createFakePi();
+			extension(fake.pi as never);
+			const fakeCtx = createFakeCtx(dir);
+			await writeFile(autoFile(), '# ralph v2\n\nT 1 Alpha "First task"\nB 1\n  Original body\n\nT 2 Beta "Second task"\n');
+			await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+			await fake.commands.get('ralph')!.handler('', fakeCtx.ctx);
+			const host = fakeCtx.customFactories[0]!(
+				{ terminal: { rows: 24 }, requestRender: () => {} }, fakeTheme,
+				new KeybindingsManager(TUI_KEYBINDINGS, keys.bindings), () => {}
+			) as { render: (width: number) => string[]; handleInput: (data: string) => void };
+			const text = () => host.render(100).join('\n');
+			host.handleInput(keys.down);
+			expect(text()).toContain('> Alpha');
+			host.handleInput(keys.up);
+			expect(text()).toContain('> (all)');
+			host.handleInput(keys.enter);
+			expect(text()).toContain('Ralph backlog');
+			host.handleInput(keys.down);
+			expect(text()).toContain('> [ ] + 2 Second task');
+			host.handleInput(keys.up);
+			expect(text()).toContain('> [ ] + 1 First task');
+			host.handleInput('e');
+			host.handleInput(keys.down);
+			expect(text()).toContain('enter: edit body');
+			host.handleInput(keys.up);
+			expect(text()).toContain('jk/↑↓: field');
+			host.handleInput(keys.tab);
+			expect(text()).toContain('enter: edit body');
+			host.handleInput('\x1b[9;2u'); // Shift+Tab returns to Title.
+			expect(text()).toContain('jk/↑↓: field');
+			host.handleInput(keys.enter); // editing Title
+			host.handleInput('!');
+			host.handleInput(keys.down); // confirm Title and move to Body
+			expect(text()).toContain('enter: edit body');
+			host.handleInput(keys.up);
+			host.handleInput(keys.enter);
+			expect(text()).toContain('enter: confirm');
+			host.handleInput(keys.tab); // tab also leaves an actively edited field
+			host.handleInput(keys.enter); // body editor
+			expect(text()).toContain('esc: back to form');
+			host.handleInput(keys.enter); // newline, not submit/close
+			host.handleInput('Second line');
+			host.handleInput('\x13'); // save body
+			host.handleInput('\x13'); // save form
+			await flush();
+			expect(readBacklog().listTasks()[0]!.title).toBe('First task!');
+			expect(readBacklog().listTasks()[0]!.body).toBe('Original body\nSecond line');
+		});
+	}
 
 	test('opens the task view scoped to the list chosen in the home view', async () => {
 		const fake = createFakePi();

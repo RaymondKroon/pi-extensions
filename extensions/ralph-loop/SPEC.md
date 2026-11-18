@@ -87,7 +87,12 @@ Ralph decision workflow.
   locking is needed.
 - **GUI:** the popup machinery (popup box, form, confirm, input/reason,
   body editor, footer layout) is extracted from `todos-view.ts` into a
-  shared view kit. A new `ralph-home.ts` (home view) is built on the kit;
+  shared view kit. The home/list views and all popups use Pi's
+  `tui.select.*` and `tui.input.*` actions (injected host keybindings) for
+  arrows, paging, confirmation, Tab and cancellation, not raw terminal-byte
+  comparisons. Shift+Tab uses Pi's key parser; literal j/k shortcuts remain.
+  Modern terminal encodings and remapped navigation keys therefore work.
+  A new `ralph-home.ts` (home view) is built on the kit;
   `list-picker.ts` is deleted. `TodosView` (task list) is unchanged and
   gains no goal functionality.
 - TypeScript, bun runtime, `bun test`; no new dependencies.

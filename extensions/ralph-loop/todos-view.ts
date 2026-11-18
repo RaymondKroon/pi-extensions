@@ -20,19 +20,15 @@
 // home view; this view owns the browse rendering, scrolling, and the
 // task mutations the popups trigger.
 
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
+import { getKeybindings, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
 import { Backlog, type Task } from './backlog.ts';
 import {
-	ARROW_DOWN,
-	ARROW_UP,
 	createModeController,
 	dimmedTheme,
-	ESCAPE,
 	layoutFooter,
-	PAGE_DOWN,
-	PAGE_UP,
 	renderModeBody,
 	type FormMode,
+	type RalphViewKeybindings,
 	type RalphViewTheme
 } from './view-kit.ts';
 
@@ -59,6 +55,8 @@ type Row = TaskRow | DetailRow;
 
 export interface TodosViewOptions {
 	backlog: Backlog;
+	/** Configured navigation actions from the host custom UI. */
+	keybindings?: RalphViewKeybindings;
 	/** The host TUI (used to construct the built-in Editor for body editing). */
 	tui: TUI;
 	/** Display name of the source (e.g. the backlog file path). */
@@ -120,6 +118,7 @@ export interface TodosView {
  * creation and on reload; the cursor indexes the task rows only.
  */
 export function createTodosView(options: TodosViewOptions): TodosView {
+	const keybindings = options.keybindings ?? getKeybindings();
 	let backlog = options.backlog;
 	let cursor = 0;
 	let scrollTop = 0;
@@ -322,6 +321,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 	// The popup modes (input, reason, form, confirm, editor) are owned by the
 	// shared view kit; the view persists form saves through saveForm.
 	const modes = createModeController({
+		keybindings: options.keybindings,
 		tui: options.tui,
 		theme: options.theme,
 		requestRender: options.requestRender,
@@ -523,12 +523,12 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 				options.onClose();
 				return;
 			}
-			if (data === ESCAPE) {
+			if (keybindings.matches(data, 'tui.select.cancel')) {
 				(options.onBack ?? options.onClose)();
 				return;
 			}
 			let movedCursor = false;
-			if (data === 'j' || data === ARROW_DOWN) {
+			if (data === 'j' || keybindings.matches(data, 'tui.select.down')) {
 				const before = cursor;
 				cursor = Math.min(state.tasks.length - 1, cursor + 1);
 				if (cursor === before) {
@@ -538,7 +538,7 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 				} else {
 					movedCursor = true;
 				}
-			} else if (data === 'k' || data === ARROW_UP) {
+			} else if (data === 'k' || keybindings.matches(data, 'tui.select.up')) {
 				const before = cursor;
 				cursor = Math.max(0, cursor - 1);
 				if (cursor === before) {
@@ -566,10 +566,10 @@ export function createTodosView(options: TodosViewOptions): TodosView {
 					}
 				}
 				movedCursor = true;
-			} else if (data === PAGE_DOWN) {
+			} else if (keybindings.matches(data, 'tui.select.pageDown')) {
 				const bh = bodyHeight();
 				if (bh !== undefined) scrollTop = Math.min(maxScroll(), scrollTop + bh - 1);
-			} else if (data === PAGE_UP) {
+			} else if (keybindings.matches(data, 'tui.select.pageUp')) {
 				const bh = bodyHeight();
 				if (bh !== undefined) scrollTop = Math.max(0, scrollTop - (bh - 1));
 			} else if (data === ' ') {
