@@ -206,7 +206,7 @@ describe("summary op (chat strip status)", () => {
 			JSON.stringify({
 				defaults: {
 					autoMode: "on",
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 50,
 					compactionMode: false,
 					cycleOn: { auto: "budget", tasks: "task", goal: "budget" },
@@ -217,7 +217,7 @@ describe("summary op (chat strip status)", () => {
 		const result = await request("summary", { sessionId: SESSION_ID });
 		expect(result.config).toEqual({
 			autoMode: "on",
-			autoApproveDecisions: false,
+			awayMode: false,
 			maxIterations: 50,
 			compactionMode: false,
 			cycleOn: { auto: "budget", tasks: "task", goal: "budget" },

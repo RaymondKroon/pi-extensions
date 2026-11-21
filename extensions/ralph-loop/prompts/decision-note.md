@@ -1,8 +1,14 @@
 ---
-description: Decision-tool note appended to every iteration prompt — when to pause for a user decision, and how auto-approval changes that.
+description: Decision guidance appended to each iteration prompt, including the higher bar for asking in Away mode.
 example_input: |
   {
-    "autoApprove": false
+    "awayMode": false
   }
 ---
-If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, call the ralph_request_decision tool with one precise question. {{#if autoApprove~}}Decision auto-approval is enabled: the tool will not pause Ralph. Treat this as delegated approval to select a safe resolution and then continue the blocked work. Do not call ralph_resolve_decision.{{~else~}}It pauses Ralph in this session and presents the question to the user. After the user answers, discuss any remaining ambiguity with them. When the decision is clear, then call ralph_resolve_decision with a concise resolution and continue the blocked work.{{~/if}}
+{{#if awayMode}}
+Away mode is on. Before asking the user, reread their instructions and check the relevant code, tests, and project conventions. Prefer the interpretation best supported by that evidence. For a low-cost, reversible choice, state your assumption briefly and keep going. Do not ask for reassurance or routine preferences.
+Ask only if an unresolved choice materially changes the outcome and there is no reasonable way to proceed without the user's input. Use ralph_request_decision with one precise question and three context lines: `Checked:` what you checked, `Recommendation:` what you would choose, and `Risk:` what could go wrong without an answer. Do not ask in chat instead of using the tool.
+{{else}}
+If work is blocked or needs a product, security, legal, privacy, migration, source-behaviour, or live-integration decision, call ralph_request_decision with one precise question and the evidence or options.
+{{/if}}
+A decision request pauses Ralph when accepted. Once the user answers and the decision is clear, call ralph_resolve_decision with a concise resolution and continue the blocked work. Goal approval is separate and always requires the user.

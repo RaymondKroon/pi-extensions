@@ -490,10 +490,16 @@ async function configSources(context, cwd) {
 	if (isPlainObject(dir)) {
 		branch = (await gitBranch(context, cwd)) ?? DEFAULT_BRANCH_KEY;
 		const candidate = dir[branch] ?? dir[DEFAULT_BRANCH_KEY];
-		if (isPlainObject(candidate)) dirConfig = candidate;
+		if (isPlainObject(candidate)) dirConfig = migrateAwayMode(candidate);
 	}
-	const defaultsConfig = isPlainObject(store?.defaults) ? store.defaults : null;
+	const defaultsConfig = isPlainObject(store?.defaults) ? migrateAwayMode(store.defaults) : null;
 	return { dir: dirConfig, defaults: defaultsConfig, branch };
+}
+
+function migrateAwayMode(config) {
+	const { autoApproveDecisions, ...rest } = config;
+	if (rest.awayMode === undefined && typeof autoApproveDecisions === "boolean") rest.awayMode = autoApproveDecisions;
+	return rest;
 }
 
 async function configForDir(context, cwd) {
@@ -523,7 +529,7 @@ function validateConfig(value) {
 	if (!isPlainObject(value.contextThresholds) || !Object.values(value.contextThresholds).every(isContextThreshold)) {
 		throw new Error("invalid contextThresholds (per-model numbers between 10% and 100%)");
 	}
-	if (typeof value.autoApproveDecisions !== "boolean") throw new Error("invalid autoApproveDecisions");
+	if (typeof value.awayMode !== "boolean") throw new Error("invalid awayMode");
 	if (typeof value.maxIterations !== "number" || !Number.isInteger(value.maxIterations) || value.maxIterations < 1) {
 		throw new Error("invalid maxIterations (positive whole number)");
 	}

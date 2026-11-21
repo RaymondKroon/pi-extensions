@@ -739,7 +739,7 @@ class PiWebRalphPanel extends HTMLElement {
 			const rows = el("dl", "rows");
 			rows.append(row("Source", source));
 			if (typeof config.autoMode === "string") rows.append(row("Auto mode", config.autoMode));
-			if (typeof config.autoApproveDecisions === "boolean") rows.append(row("Auto-approve decisions", config.autoApproveDecisions ? "on" : "off"));
+			if (typeof config.awayMode === "boolean") rows.append(row("Away mode", config.awayMode ? "on" : "off"));
 			if (typeof config.maxIterations === "number") rows.append(row("Max iterations", String(config.maxIterations)));
 			if (typeof config.compactionMode === "boolean") rows.append(row("Compaction", config.compactionMode ? "on" : "off"));
 			if (config.cycleOn && typeof config.cycleOn === "object") {
@@ -919,7 +919,7 @@ class PiWebRalphPanel extends HTMLElement {
 		// The session's active model key (provider/modelId), like the TUI's
 		// modelConfigKey; the default-model key when the session has none.
 		const modelKey = status?.session?.modelKey ?? DEFAULT_MODEL_CONFIG_KEY;
-		const builtIn = { autoMode: "off", autoApproveDecisions: false, maxIterations: 10, compactionMode: true, cycleOn: { tasks: "task", goal: "task", auto: "budget" } };
+		const builtIn = { autoMode: "off", awayMode: false, maxIterations: 10, compactionMode: true, cycleOn: { tasks: "task", goal: "task", auto: "budget" } };
 		// The row values for a source config (the directory's entry or the
 		// global defaults), with built-in defaults for fields a saved config
 		// predates — the same fallbacks the TUI's normalizeConfig applies.
@@ -932,7 +932,7 @@ class PiWebRalphPanel extends HTMLElement {
 				contextThreshold: String(Number((threshold * 100).toFixed(10))),
 				maxIterations: String(cfg.maxIterations ?? builtIn.maxIterations),
 				compactionMode: (cfg.compactionMode ?? builtIn.compactionMode) === true,
-				autoApproveDecisions: (cfg.autoApproveDecisions ?? builtIn.autoApproveDecisions) === true,
+				awayMode: (cfg.awayMode ?? builtIn.awayMode) === true,
 				autoMode: (cfg.autoMode ?? builtIn.autoMode) === "on",
 				cycleOnTasks: cycleOn.tasks,
 				cycleOnGoal: cycleOn.goal,
@@ -972,7 +972,7 @@ class PiWebRalphPanel extends HTMLElement {
 						Number.isInteger(Number(value.trim())) && Number(value.trim()) >= 1 ? undefined : "Maximum iterations must be a positive whole number.",
 				},
 				{ name: "compactionMode", label: "Compaction mode", type: "checkbox", value: displayValues(config).compactionMode },
-				{ name: "autoApproveDecisions", label: "Auto-approve decisions", type: "checkbox", value: displayValues(config).autoApproveDecisions },
+				{ name: "awayMode", label: "Away mode", type: "checkbox", value: displayValues(config).awayMode },
 				{ name: "autoMode", label: "Auto mode", type: "checkbox", value: displayValues(config).autoMode },
 				{ name: "cycleOnTasks", label: "Cycle: task loop", type: "select", options: ["task", "budget"], value: displayValues(config).cycleOnTasks },
 				{ name: "cycleOnGoal", label: "Cycle: goal loop", type: "select", options: ["task", "budget"], value: displayValues(config).cycleOnGoal },
@@ -989,7 +989,7 @@ class PiWebRalphPanel extends HTMLElement {
 					scope: isDefaults ? "defaults" : "directory",
 					config: {
 						contextThresholds,
-						autoApproveDecisions: values.autoApproveDecisions === true,
+						awayMode: values.awayMode === true,
 						maxIterations: Number(values.maxIterations.trim()),
 						compactionMode: values.compactionMode === true,
 						autoMode: values.autoMode === true ? "on" : "off",

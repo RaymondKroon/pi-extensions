@@ -395,7 +395,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -447,7 +447,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -490,7 +490,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -542,7 +542,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -590,7 +590,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10,
 				compactionMode: true
 			});
@@ -665,7 +665,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -705,7 +705,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -778,20 +778,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 					'ralph_goal',
 					{ action: 'complete', note: 'All acceptance criteria verified: bun test passes (5 suites).' },
 					'call_complete'
-				),
-				// The user approves in chat; the input is transformed into the decision context.
-				toolCallResponder(
-					'ralph_resolve_decision',
-					{ resolution: 'User approved completion of the goal.' },
-					'call_resolve'
-				),
-				// Approved: confirm the claim -> goal done.
-				toolCallResponder('ralph_goal', { action: 'confirm' }, 'call_confirm'),
-				textResponder('Goal confirmed; the loop should stop.')
+				)
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10
 			});
 
@@ -849,21 +840,11 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			await waitFor(() => endpoint!.requests.length >= 11, 30000);
 			expect(requestText(endpoint!.requests[10]!)).toContain('This is a re-evaluation iteration');
 
-			// The loop is paused at the approval gate: the user's chat reply is
-			// transformed into the pending-decision context for the model. Wait for
-			// the claim turn to fully settle first — prompting a still-streaming
-			// session throws.
 			await sess.waitForIdle();
-			await sess.prompt('Approved. The evidence is solid.');
-			const approvalRequest = await waitForRequestContaining('Ralph is paused in this session pending this decision');
-			expect(approvalRequest).toContain('Approve completion of the goal');
-			expect(approvalRequest).toContain('The user replied:');
-
-			// After the decision is resolved and the goal confirmed, the goal is
-			// done in the file and the loop stops: no further model request is
-			// triggered (no fresh iteration, no recording turn).
-			await waitFor(() => endpoint!.requests.length >= 14, 30000);
+			expect(Backlog.open(todoPath).goal()?.status).toBe('claimed');
 			const countAtEnd = endpoint!.requests.length;
+			// Explicit user approval stops the loop without any more model requests.
+			await sess.prompt('/ralph approve');
 			await new Promise((r) => setTimeout(r, 2000));
 			expect(endpoint!.requests.length).toBe(countAtEnd);
 
@@ -895,7 +876,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10,
 				autoMode: 'on'
 			});
@@ -953,7 +934,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10,
 				autoMode: 'on',
 				cycleOn: { tasks: 'task', goal: 'task', auto: 'task' }
@@ -1001,7 +982,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				// Bind the reload action like pi's interactive mode does, so the
@@ -1082,7 +1063,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1158,7 +1139,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1222,7 +1203,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1268,7 +1249,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1303,7 +1284,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1336,7 +1317,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1363,7 +1344,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1395,7 +1376,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10
 				},
 				undefined,

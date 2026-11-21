@@ -87,7 +87,7 @@ const AUTO_TODO_DIR = 'ralph';
 const autoTodoPath = (ctx: ExtensionContext): string =>
 	join(getAgentDir(), AUTO_TODO_DIR, `${ctx.sessionManager.getSessionId()}.db`);
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
-const DEFAULT_AUTO_APPROVE_DECISIONS = false;
+const DEFAULT_AWAY_MODE = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_CHECKPOINT_CAP_CHARS = 600;
 /**
@@ -217,7 +217,7 @@ interface RalphConfig {
 	 * existing projects working until a model receives an explicit setting.
 	 */
 	contextThresholds: Record<string, number>;
-	autoApproveDecisions: boolean;
+	awayMode: boolean;
 	maxIterations: number;
 	/**
 	 * Character guideline for checkpoint notes: over the cap, the checkpoint
@@ -258,7 +258,8 @@ interface RalphConfig {
 
 interface LegacyRalphConfig {
 	contextThreshold: number;
-	autoApproveDecisions: boolean;
+	awayMode?: boolean;
+	autoApproveDecisions?: boolean;
 	maxIterations?: number;
 }
 
@@ -318,7 +319,7 @@ function isCarriedSelection(value: unknown): value is CarriedSelection {
 interface RalphState {
 	/** The active model's threshold, retained for this Ralph session. */
 	contextThreshold: number;
-	autoApproveDecisions: boolean;
+	awayMode: boolean;
 	enabled: boolean;
 	/** Loop policy: the finite task backlog, the single goal, or the auto loop. */
 	mode: 'tasks' | 'goal' | 'auto';
@@ -430,6 +431,7 @@ function isLoopStartSnapshot(value: unknown): value is LoopStartSnapshot {
 
 /** State fields persisted under older names (pre cycle rename, pre compact snapshots). */
 type LegacyRalphStateFields = {
+	autoApproveDecisions?: boolean;
 	rotateOn?: 'task' | 'budget';
 	rotationQueued?: boolean;
 	rotationReason?: CycleReason;
@@ -464,7 +466,7 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.maxIterations === undefined || (typeof state.maxIterations === 'number' && state.maxIterations >= 1)) &&
 		(state.checkpointCapChars === undefined || isCheckpointCapChars(state.checkpointCapChars)) &&
 		typeof state.contextThreshold === 'number' &&
-		(state.autoApproveDecisions === undefined || typeof state.autoApproveDecisions === 'boolean') &&
+		(state.awayMode === undefined || typeof state.awayMode === 'boolean') &&
 		typeof cycleQueued === 'boolean' &&
 		(cycleReason === undefined ||
 			cycleReason === 'completed-task' ||
@@ -494,9 +496,10 @@ function isRalphState(value: unknown): value is RalphState {
 /** Keep sessions created before graceful stopping/blocking/configuration/compact snapshots was added compatible. */
 function normalizeState(state: RalphState): RalphState {
 	const mode = state.mode ?? 'tasks';
-	// Strip the old rotation field names and the legacy full-text backlog
+	// Strip renamed settings, old rotation fields, and full-text backlog
 	// snapshots so they are not re-persisted.
 	const {
+		autoApproveDecisions: legacyAutoApprove,
 		rotateOn: legacyCycleOn,
 		rotationQueued: legacyCycleQueued,
 		rotationReason: legacyCycleReason,
@@ -523,7 +526,7 @@ function normalizeState(state: RalphState): RalphState {
 		...rest,
 		mode,
 		cycleOn: state.cycleOn ?? legacyCycleOn ?? (mode === 'auto' ? 'budget' : 'task'),
-		autoApproveDecisions: state.autoApproveDecisions ?? DEFAULT_AUTO_APPROVE_DECISIONS,
+		awayMode: state.awayMode ?? (typeof legacyAutoApprove === 'boolean' ? legacyAutoApprove : DEFAULT_AWAY_MODE),
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
@@ -575,7 +578,7 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		!!config.contextThresholds &&
 		typeof config.contextThresholds === 'object' &&
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
-		typeof config.autoApproveDecisions === 'boolean' &&
+		typeof config.awayMode === 'boolean' &&
 		isMaxIterations(config.maxIterations) &&
 		isCheckpointCapChars(config.checkpointCapChars) &&
 		typeof config.compactionMode === 'boolean' &&
@@ -589,15 +592,15 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 /** A saved config missing newer optional fields; normalizeConfig fills the defaults. */
 function isRalphConfigPartial(
 	value: unknown
-): value is Omit<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn' | 'finishUpWorkToolLimit'> &
-	Partial<Pick<RalphConfig, 'maxIterations' | 'checkpointCapChars' | 'compactionMode' | 'autoMode' | 'cycleOn' | 'finishUpWorkToolLimit'>> {
+): value is Pick<RalphConfig, 'contextThresholds'> & Partial<RalphConfig> & { rotateOn?: unknown; autoApproveDecisions?: boolean } {
 	if (!value || typeof value !== 'object') return false;
-	const config = value as Partial<RalphConfig> & { rotateOn?: unknown };
+	const config = value as Partial<RalphConfig> & { rotateOn?: unknown; autoApproveDecisions?: unknown };
 	return (
 		!!config.contextThresholds &&
 		typeof config.contextThresholds === 'object' &&
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
-		typeof config.autoApproveDecisions === 'boolean' &&
+		(config.awayMode === undefined || typeof config.awayMode === 'boolean') &&
+		(config.autoApproveDecisions === undefined || typeof config.autoApproveDecisions === 'boolean') &&
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
 		(config.checkpointCapChars === undefined || isCheckpointCapChars(config.checkpointCapChars)) &&
 		(config.compactionMode === undefined || typeof config.compactionMode === 'boolean') &&
@@ -616,7 +619,8 @@ function isLegacyRalphConfig(value: unknown): value is LegacyRalphConfig {
 	const config = value as Partial<LegacyRalphConfig>;
 	return (
 		isContextThreshold(config.contextThreshold) &&
-		typeof config.autoApproveDecisions === 'boolean' &&
+		(config.awayMode === undefined || typeof config.awayMode === 'boolean') &&
+		(config.autoApproveDecisions === undefined || typeof config.autoApproveDecisions === 'boolean') &&
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations))
 	);
 }
@@ -624,9 +628,10 @@ function isLegacyRalphConfig(value: unknown): value is LegacyRalphConfig {
 function normalizeConfig(value: unknown): RalphConfig | undefined {
 	if (isRalphConfig(value)) return value;
 	if (isRalphConfigPartial(value)) {
-		const { rotateOn: legacyCycleOn, ...rest } = value as (typeof value) & { rotateOn?: unknown };
+		const { rotateOn: legacyCycleOn, autoApproveDecisions: legacyAutoApprove, ...rest } = value;
 		return {
 			...rest,
+			awayMode: value.awayMode ?? legacyAutoApprove ?? DEFAULT_AWAY_MODE,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			checkpointCapChars: value.checkpointCapChars ?? DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
@@ -639,7 +644,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 	if (isLegacyRalphConfig(value)) {
 		return {
 			contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: value.contextThreshold },
-			autoApproveDecisions: value.autoApproveDecisions,
+			awayMode: value.awayMode ?? value.autoApproveDecisions ?? DEFAULT_AWAY_MODE,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
@@ -654,7 +659,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 function defaultConfig(): RalphConfig {
 	return {
 		contextThresholds: {},
-		autoApproveDecisions: DEFAULT_AUTO_APPROVE_DECISIONS,
+		awayMode: DEFAULT_AWAY_MODE,
 		maxIterations: DEFAULT_MAX_ITERATIONS,
 		checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
@@ -1067,7 +1072,13 @@ function snapshotLoopStart(todo: string, category?: string): LoopStartSnapshot {
  * Keep the persistent editor widget to a short state reminder rather than
  * duplicating that potentially large content.
  */
-function decisionWidgetLines(): string[] {
+function decisionWidgetLines(goalReview: boolean): string[] {
+	if (goalReview) {
+		return [
+			'Ralph is paused — awaiting your goal review.',
+			'Use /ralph approve to accept the verified goal, or reply with what still needs work.'
+		];
+	}
 	return [
 		'Ralph is paused — awaiting your decision.',
 		'Review the decision request above, then reply below to continue.',
@@ -1092,7 +1103,7 @@ function formatDecisionMessage(question: string, context?: string): string {
 		'',
 		'---',
 		'',
-		'**Next step:** Reply below with your decision. Ralph will document it before continuing.'
+		'**Next step:** Reply below with your decision so Ralph can continue.'
 	].join('\n');
 }
 
@@ -1115,7 +1126,7 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
 	const isAuto = state.mode === 'auto';
-	const decisionNote = renderPrompt('decision-note', { autoApprove: state.autoApproveDecisions });
+	const decisionNote = renderPrompt('decision-note', { awayMode: state.awayMode });
 	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
 	const contextNote = isAuto
 		? renderPrompt('context-note-auto', {
@@ -1966,6 +1977,9 @@ export default function (pi: ExtensionAPI) {
 	// iteration-ended cycle or a no-work stall. Keep this across agent_start:
 	// queued follow-ups can start another low-level run before the final settle.
 	let humanInputSinceSettle = false;
+	// At most one reconsideration nudge per run; a real blocker must still be
+	// reportable even if the model cannot produce the requested explanation.
+	let awayDecisionNudged = false;
 	// The ralph-provided compaction pending for the in-flight cycle:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
@@ -2157,7 +2171,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const updateStatus = (ctx: ExtensionContext) => {
-		const autoApproveDecisions = state?.enabled ? state.autoApproveDecisions : config.autoApproveDecisions;
+		const awayMode = state?.enabled ? state.awayMode : config.awayMode;
 		const mode = state?.blocked
 			? 'waiting'
 			: state?.paused
@@ -2192,8 +2206,8 @@ export default function (pi: ExtensionAPI) {
 		// loop arms itself at the context budget), not off — and distinct from
 		// "on", which means a loop is actually running.
 		const idleState = label === 'Ralph' ? (config.autoMode === 'on' ? 'auto' : 'off') : 'off';
-		// Non-default modifiers, compact: (auto-approve) and/or (compaction).
-		const modifiers = [autoApproveDecisions ? 'auto-approve' : undefined, config.compactionMode ? 'compaction' : undefined]
+		// Non-default modifiers, compact: (away) and/or (compaction).
+		const modifiers = [awayMode ? 'away' : undefined, config.compactionMode ? 'compaction' : undefined]
 			.filter((part): part is string => part !== undefined)
 			.join(', ');
 		const modifierSuffix = modifiers ? ` (${modifiers})` : '';
@@ -2213,7 +2227,7 @@ export default function (pi: ExtensionAPI) {
 			? `${label}: ${idleState}${modifierSuffix}${contSuffix}${cycleSuffix}${idleContext}`
 			: `${label}: ${mode}${modifierSuffix}${contSuffix}${cycleSuffix} · iteration ${state.iteration}/${state.maxIterations}${state.category ? ` · category: ${state.category}` : ''}${taskCount ? ` · task: ${taskCount.current}/${taskCount.total}${taskCount.done ? ' (done)' : ''} (iteration ${state.taskIteration})` : ''}${state.mode === 'goal' && goalState ? ` · goal: ${goalState}` : ''} · context: ${contextUsageLabel(ctx, state.contextThreshold)}`;
 
-		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines() : undefined);
+		ctx.ui.setWidget('ralph-decision', state?.enabled && state.blocked ? decisionWidgetLines(state.mode === 'goal' && goalState === 'claimed') : undefined);
 		// Persistent reminder with the explicit options while paused; the status
 		// bar alone does not say how to resume or stop. A typed message resumes
 		// the loop and is extra info for it.
@@ -2296,7 +2310,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(message, 'info');
 	};
 
-	const blockLoop = (ctx: ExtensionContext, question: string) => {
+	const blockLoop = (ctx: ExtensionContext, question: string, goalReview = false) => {
 		if (!state?.enabled) return;
 		persistState({
 			...state,
@@ -2311,7 +2325,13 @@ export default function (pi: ExtensionAPI) {
 			blockedItem: question
 		});
 		updateStatus(ctx);
-		ctx.ui.notify('Ralph is paused — reply below and we’ll decide it together.', 'info');
+		ctx.ui.notify(goalReview
+			? 'Ralph is paused — use /ralph approve to accept the goal, or reply with what still needs work.'
+			: 'Ralph is paused — reply below and we’ll decide it together.', 'info');
+	};
+
+	const awaitGoalReview = (ctx: ExtensionContext, evidence?: string) => {
+		blockLoop(ctx, `Approve completion of the goal?${evidence ? `\nEvidence: ${evidence}` : ''}`, true);
 	};
 
 	pi.registerTool({
@@ -2327,15 +2347,20 @@ export default function (pi: ExtensionAPI) {
 			const question = params.question.trim();
 			if (!question) throw new Error('A decision question is required.');
 			const detail = params.context?.trim();
-			if (state.autoApproveDecisions) {
+			if (state.mode === 'goal' && goalState === 'claimed') {
+				throw new Error('The claimed goal is already awaiting user review. Only the user can run /ralph approve.');
+			}
+			const hasRationale = ['Checked', 'Recommendation', 'Risk'].every((label) =>
+				new RegExp(`^${label}:[ \\t]*\\S[^\\r\\n]*`, 'im').test(detail ?? '')
+			);
+			if (state.awayMode && !state.blocked && !awayDecisionNudged && !hasRationale) {
+				awayDecisionNudged = true;
 				return {
-					content: [
-						{
-							type: 'text',
-							text: `Decision auto-approved. Choose a safe resolution, document it in versioned documentation with approver “auto-approved”, rationale, and evidence, then continue the blocked work.\n\nQuestion: ${question}${detail ? `\nEvidence/options: ${detail}` : ''}`
-						}
-					],
-					details: { question, context: detail, autoApproved: true }
+					content: [{
+						type: 'text',
+						text: 'Away mode: Ralph has not paused or asked the user. Reread the user’s instructions and check the relevant project evidence. Use a reasonable reversible assumption if possible. If you still cannot proceed, call this tool again with one precise question and three context lines: Checked: what you checked; Recommendation: what you would choose; Risk: what could go wrong without an answer.'
+					}],
+					details: { reconsider: true }
 				};
 			}
 			const pendingDecision = detail ? `${question}\nEvidence/options: ${detail}` : question;
@@ -2351,7 +2376,11 @@ export default function (pi: ExtensionAPI) {
 				return new Markdown('> Ralph is preparing the decision request…', 0, 0, getMarkdownTheme());
 			}
 
-			const details = result.details as { question?: unknown; context?: unknown } | undefined;
+			const details = result.details as { question?: unknown; context?: unknown; reconsider?: boolean } | undefined;
+			if (details?.reconsider) {
+				const message = result.content[0];
+				if (message?.type === 'text') return new Markdown(message.text, 0, 0, getMarkdownTheme());
+			}
 			const question = typeof details?.question === 'string' ? details.question : 'Please review the pending question.';
 			const context = typeof details?.context === 'string' ? details.context : undefined;
 			return new Markdown(formatDecisionMessage(question, context), 0, 0, getMarkdownTheme());
@@ -2368,6 +2397,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state?.enabled) throw new Error('Ralph is not active.');
 			if (!state.blocked) throw new Error('Ralph has no pending decision to resolve.');
+			if (state.mode === 'goal' && goalState === 'claimed') {
+				throw new Error('Goal review cannot be resolved here. Only the user can run /ralph approve; use ralph_goal withdraw if changes are needed.');
+			}
 			const resolution = params.resolution.trim();
 			if (!resolution) throw new Error('resolution is required.');
 			persistState({ ...state, blocked: false, blockedItem: undefined });
@@ -2909,13 +2941,12 @@ export default function (pi: ExtensionAPI) {
 		name: 'ralph_goal',
 		label: 'Ralph goal',
 		description:
-			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else the session\'s ralph file). The goal is the user\'s contract of the goal loop: its body is read-only; change only its state via this tool. Actions: show (anywhere), checkpoint, complete, confirm, withdraw (the last four require the active goal loop). complete requires a full verification run of every verification command required by the goal and the backlog, with evidence; never claim an unverified completion. After the user answers a completion approval: approved → record the decision, call ralph_resolve_decision, then confirm; rejected → withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
+			`Read/update the single goal of the Ralph backlog (active loop\'s backlog, else the session\'s ralph file). The goal is the user\'s contract of the goal loop: its body is read-only; change only its state via this tool. Actions: show (anywhere), checkpoint, complete, withdraw (the last three require the active goal loop). complete requires a full verification run of every verification command required by the goal and the backlog, with evidence; never claim an unverified completion. The claim pauses for review. Only the user can accept it with /ralph approve. If the user rejects it, withdraw with what is missing. Read ${REFERENCE_DOC} for per-action details.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal('show'),
 				Type.Literal('checkpoint'),
 				Type.Literal('complete'),
-				Type.Literal('confirm'),
 				Type.Literal('withdraw')
 			]),
 			note: Type.Optional(
@@ -2933,13 +2964,7 @@ export default function (pi: ExtensionAPI) {
 				const goal = backlog.goal();
 
 				let mutated = false;
-				let terminated = false;
 				let output: string;
-				// Keep the cached status-line state in sync with a goal mutation before
-				// the loop reacts to it (e.g. the blocked approval gate).
-				const syncGoalState = () => {
-					if (state?.enabled && state.todoPath === todoPath) goalState = backlog.goal()?.status;
-				};
 				switch (params.action) {
 					case 'show': {
 						if (!goal) {
@@ -2980,36 +3005,9 @@ export default function (pi: ExtensionAPI) {
 						if (open > 0) {
 							throw new Error(`cannot complete the goal: ${open} task${open === 1 ? '' : 's'} still open`);
 						}
-						const evidence = params.note.trim();
-						backlog.claimGoal(evidence);
+						backlog.claimGoal(params.note);
 						mutated = true;
-						syncGoalState();
-						if (state.autoApproveDecisions) {
-							// Delegated approval, consistent with the decision semantics:
-							// the claim is confirmed immediately.
-							backlog.confirmGoal();
-							syncGoalState();
-							output = `The goal is done (approver: auto-approved). Stop working now; the loop records the completion.`;
-							break;
-						}
-						// User approval gate: the goal stays claimed and the loop pauses
-						// until the user answers (the ralph_request_decision pattern).
-						const question = `Approve completion of the goal?`;
-						blockLoop(ctx, `${question}\nEvidence: ${evidence}`);
-						terminated = true;
-						output = `The goal is claimed (evidence recorded) and the loop is paused pending the user's approval.\n\nAfter the user answers:\n- Approved: record the decision, the user as approver, rationale, and evidence in the appropriate versioned documentation, then call ralph_resolve_decision, and then call ralph_goal with action "confirm".\n- Rejected: call ralph_goal with action "withdraw" and a note describing what is missing, then continue working on the remaining work.`;
-						break;
-					}
-					case 'confirm': {
-						if (!state?.enabled) throw new Error('confirm requires an active Ralph loop (start one with /ralph start).');
-						if (state.mode !== 'goal') {
-							throw new Error('confirm requires an active goal loop (start one with /ralph start --goal).');
-						}
-						if (!goal) throw new Error(`no goal in ${todoPath}`);
-						backlog.confirmGoal();
-						mutated = true;
-						syncGoalState();
-						output = `The goal is done (approved). Stop working now; the loop records the completion.`;
+						output = `The goal is claimed and Ralph is paused. Verification evidence:\n${params.note.trim()}\n\nOnly the user can accept the goal, with /ralph approve. If the user replies with changes needed, call ralph_goal with action "withdraw" and a note describing what is missing.`;
 						break;
 					}
 					case 'withdraw': {
@@ -3021,10 +3019,11 @@ export default function (pi: ExtensionAPI) {
 						if (!goal) throw new Error(`no goal in ${todoPath}`);
 						backlog.withdrawGoal(params.note.trim());
 						mutated = true;
-						syncGoalState();
 						output = `The goal is open again; the withdrawal note is its checkpoint. Continue working on the remaining work.`;
 						break;
 					}
+					default:
+						throw new Error('Only the user can approve a claimed goal with /ralph approve.');
 				}
 
 				if (mutated) {
@@ -3033,14 +3032,21 @@ export default function (pi: ExtensionAPI) {
 					} catch (error) {
 						throw new Error(`could not write ${todoPath}: ${error instanceof Error ? error.message : String(error)}`);
 					}
-					// The status widget captures its label when updateStatus runs; refresh
-					// it so the new goal state is visible without waiting for the settle.
-					if (state?.enabled) updateStatus(ctx);
+					if (state?.enabled && state.todoPath === todoPath) {
+						goalState = backlog.goal()?.status;
+						if (params.action === 'complete') awaitGoalReview(ctx, backlog.goal()?.evidence);
+						else {
+							if (params.action === 'withdraw' && state.blocked) {
+								persistState({ ...state, blocked: false, blockedItem: undefined, paused: false });
+							}
+							updateStatus(ctx);
+						}
+					}
 				}
 				return {
 					content: [{ type: 'text', text: output }],
 					details: { action: params.action },
-					...(terminated ? { terminate: true } : {})
+					...(params.action === 'complete' ? { terminate: true } : {})
 				};
 			});
 		},
@@ -3410,7 +3416,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
-				autoApproveDecisions: config.autoApproveDecisions,
+				awayMode: config.awayMode,
 				cycleQueued: false,
 				cycleReason: undefined,
 				cycleCheckpointing: false,
@@ -3555,7 +3561,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
-				autoApproveDecisions: config.autoApproveDecisions,
+				awayMode: config.awayMode,
 				cycleQueued: false,
 				cycleReason: undefined,
 				cycleCheckpointing: false,
@@ -3571,7 +3577,8 @@ export default function (pi: ExtensionAPI) {
 			syncToolActivation();
 			updateStatus(ctx);
 			compactionGateNotified = false;
-			pi.sendUserMessage(iterationPrompt(next));
+			if (goal && goalState === 'claimed') awaitGoalReview(ctx, backlog.goal()?.evidence);
+			else pi.sendUserMessage(iterationPrompt(next));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(
@@ -3749,7 +3756,7 @@ export default function (pi: ExtensionAPI) {
 		if (state && !hasSessionConfig) {
 			config = {
 				contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: state.contextThreshold },
-				autoApproveDecisions: state.autoApproveDecisions,
+				awayMode: state.awayMode,
 				maxIterations: state.maxIterations,
 				checkpointCapChars: state.checkpointCapChars,
 				compactionMode: DEFAULT_COMPACTION_MODE,
@@ -3815,7 +3822,7 @@ export default function (pi: ExtensionAPI) {
 			if (state?.enabled) {
 				state = {
 					...state,
-					autoApproveDecisions: config.autoApproveDecisions,
+					awayMode: config.awayMode,
 					maxIterations: config.maxIterations,
 					checkpointCapChars: config.checkpointCapChars,
 					contextThreshold: contextThresholdFor(config, ctx)
@@ -3833,6 +3840,9 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				refreshCounts(current, countCategory(state));
+				if (state.mode === 'goal' && goalState === 'claimed' && !state.blocked) {
+					awaitGoalReview(ctx, current.goal()?.evidence);
+				}
 				// Re-sync the per-task counter after a reload in case the TODO moved on.
 				if (state.taskNumber !== undefined && state.taskNumber !== taskCount.current) {
 					state = { ...state, taskNumber: currentTaskNumber(taskCount.current), taskIteration: 1 };
@@ -4021,6 +4031,7 @@ export default function (pi: ExtensionAPI) {
 	// not caught up with the fresh (filtered) context yet.
 	pi.on('agent_start', (_event, ctx) => {
 		lastCtx = ctx;
+		awayDecisionNudged = false;
 		selfEscapeAbort = false;
 		loopPoliceAbort = false;
 		loopPoliceEvent = undefined;
@@ -4216,6 +4227,12 @@ export default function (pi: ExtensionAPI) {
 		if (!state?.enabled || event.source === 'extension') return;
 
 		if (state.blocked) {
+			if (state.mode === 'goal' && goalState === 'claimed') {
+				return {
+					action: 'transform',
+					text: `Ralph is paused for goal review:\n${state.blockedItem ?? 'Approve completion of the goal?'}\n\nThe user replied:\n${event.text}\n\nOnly the user can accept the goal with /ralph approve. If they want changes, call ralph_goal with action "withdraw" and a note describing what is missing, then resume work. Otherwise answer any questions about the claim and remind the user how to approve. Do not resume implementation while the claim is pending.`
+				};
+			}
 			const question = state.blockedItem ?? 'the pending Ralph decision';
 			return {
 				action: 'transform',
@@ -4639,8 +4656,8 @@ export default function (pi: ExtensionAPI) {
 						: 'disabled'
 					: id === 'finishUpWorkToolLimit'
 						? String(cfg.finishUpWorkToolLimit)
-						: id === 'autoApproveDecisions'
-							? cfg.autoApproveDecisions
+						: id === 'awayMode'
+							? cfg.awayMode
 								? 'enabled'
 								: 'disabled'
 						: id === 'autoMode'
@@ -4681,7 +4698,7 @@ export default function (pi: ExtensionAPI) {
 							? { ...cfg, rollover: { ...cfg.rollover, maxMB: Number.parseInt(value, 10) } }
 							: id === 'rolloverMaxMessages'
 								? { ...cfg, rollover: { ...cfg.rollover, maxMessages: Number.parseInt(value, 10) } }
-								: { ...cfg, autoApproveDecisions: value === 'enabled' };
+								: { ...cfg, awayMode: value === 'enabled' };
 		const savedDescription = (id: string, next: RalphConfig): string =>
 			id === 'contextThreshold'
 				? contextThresholdLabel(contextThresholdFor(next, ctx))
@@ -4707,7 +4724,7 @@ export default function (pi: ExtensionAPI) {
 								? `rollover file limit ${next.rollover.maxMB}MB`
 								: id === 'rolloverMaxMessages'
 									? `rollover message limit ${next.rollover.maxMessages}`
-									: `auto-approve decisions ${next.autoApproveDecisions ? 'enabled' : 'disabled'}`;
+									: `away mode ${next.awayMode ? 'enabled' : 'disabled'}`;
 
 		const items: SettingItem[] = [
 			{
@@ -4809,10 +4826,10 @@ export default function (pi: ExtensionAPI) {
 					)
 			},
 			{
-				id: 'autoApproveDecisions',
-				label: 'Auto-approve decisions',
-				description: 'Continue after a decision request without pausing for your reply; Ralph records the approver as auto-approved.',
-				currentValue: config.autoApproveDecisions ? 'enabled' : 'disabled',
+				id: 'awayMode',
+				label: 'Away mode',
+				description: 'Tell Ralph to infer intent and keep going on reversible choices. It still pauses for genuine blockers and goal approval.',
+				currentValue: config.awayMode ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
 			},
 			{
@@ -4934,7 +4951,7 @@ export default function (pi: ExtensionAPI) {
 							persistState({
 								...state,
 								cycleOn,
-								autoApproveDecisions: next.autoApproveDecisions,
+								awayMode: next.awayMode,
 								maxIterations: next.maxIterations,
 								contextThreshold: contextThresholdFor(next, ctx)
 							});
@@ -5159,7 +5176,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand('ralph', {
-		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|new|import|set-goal|stop|reload|status|config]',
+		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|new|import|set-goal|approve|stop|reload|status|config]',
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
 			const options: AutocompleteItem[] = [
 				{
@@ -5171,10 +5188,11 @@ export default function (pi: ExtensionAPI) {
 				{ value: 'rollover', label: 'rollover', description: 'Move the active loop to a new pi session without losing ralph state: the backlog is copied (old file recorded as a source), the loop state (iteration count against maxIterations, category, pending decision) is carried with a lineage note, and the fresh iteration starts in the new session. No argument schedules it for the end of the current iteration; --now rolls over immediately (idle only); --cancel unschedules. The automatic trigger (auto session rollover in /ralph config) does the same at a cycle boundary.' },
 				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },
 				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
-			{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
-			{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested cycle continues on the reloaded code.' },
+				{ value: 'approve', label: 'approve', description: 'Accept the claimed goal and its verification evidence. Only the user can approve a goal.' },
+				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
+				{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested cycle continues on the reloaded code.' },
 				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
-				{ value: 'config', label: 'config', description: 'Configure Ralph settings (fresh-context threshold, max iterations, compaction, decision approval, auto mode, cycle policy). The "Save to" row switches the scope: this directory (branch) or the global defaults (the general settings for directories without their own setting).' }
+				{ value: 'config', label: 'config', description: 'Configure Ralph settings (fresh-context threshold, max iterations, compaction, away mode, auto mode, cycle policy). The "Save to" row switches the scope: this directory (branch) or the global defaults (the general settings for directories without their own setting).' }
 			];
 			const matches = options.filter((option) => option.value.startsWith(prefix.toLowerCase()));
 			return matches.length > 0 ? matches : null;
@@ -5184,7 +5202,31 @@ export default function (pi: ExtensionAPI) {
 			if (!commandArgs) {
 				ctx.ui.notify('Usage: /ralph start [--category name] [--goal] (quote values containing spaces)', 'warning');
 				return;
-			}			const command = commandArgs[0]?.toLowerCase() ?? '';
+			}
+			const command = commandArgs[0]?.toLowerCase() ?? '';
+			if (command === 'approve') {
+				if (commandArgs.length !== 1 || !ctx.isIdle()) {
+					ctx.ui.notify('Use /ralph approve with no arguments after the current turn has finished.', 'warning');
+					return;
+				}
+				const todoPath = state?.enabled && state.mode === 'goal' ? state.todoPath : autoTodoPath(ctx);
+				try {
+					await withBacklogLock(todoPath, async () => {
+						const backlog = await loadTargetBacklog(todoPath, '/ralph approve');
+						if (backlog.goal()?.status !== 'claimed') throw new Error('there is no claimed goal to approve');
+						backlog.confirmGoal();
+						backlog.save(todoPath);
+						if (state?.enabled && state.todoPath === todoPath && state.mode === 'goal') {
+							stopLoop(ctx, 'Ralph goal loop stopped because the goal is complete (approved by you)');
+						} else {
+							ctx.ui.notify('Ralph goal is complete (approved by you)', 'info');
+						}
+					});
+				} catch (error) {
+					ctx.ui.notify(`Could not approve the Ralph goal: ${error instanceof Error ? error.message : String(error)}`, 'warning');
+				}
+				return;
+			}
 			if (command === 'stop') {
 				if (!state?.enabled) {
 					ctx.ui.notify('Ralph loop is already stopped', 'info');

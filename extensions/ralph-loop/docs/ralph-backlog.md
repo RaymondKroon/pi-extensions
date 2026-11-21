@@ -138,15 +138,23 @@ with a pointer to the full note (`show`).
 ### complete
 Goal loop only. Requires the goal `open` and no open tasks. `note` is the
 verification evidence. Claims the goal and pauses the loop for the user's
-approval, or goes straight to `done` when auto-approve decisions is enabled.
-
-### confirm
-Goal loop only. `claimed` → `done`. Call it only after the user approved the
-completion (and the decision is recorded).
+approval in every mode. Only the user can move `claimed` → `done` with
+`/ralph approve`; there is no model tool action for approval. To reject a
+claim, reply with what still needs work.
 
 ### withdraw
 Goal loop only. `claimed` → `open`. `note` describes what is missing and
 becomes the goal checkpoint.
+
+## Away mode
+
+Enable **Away mode** in `/ralph config` to have Ralph infer intent from the
+existing instructions and project evidence, and keep going on reversible
+assumptions. Genuine blockers still pause normally. Ralph gives an incomplete
+request one chance to reconsider before pausing: use `Checked:`, `Recommendation:`,
+and `Risk:` lines in the request's context. This does not change goal approval.
+Legacy `autoApproveDecisions` settings migrate to `awayMode` without retaining
+any auto-approval behavior.
 
 ## Auto mode
 

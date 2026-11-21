@@ -478,7 +478,7 @@ beforeEach(async () => {
 	await mkdir(join(dir, '.pi'), { recursive: true });
 	await writeFile(
 		join(dir, '.pi', 'ralph-loop.json'),
-		`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10 }, null, '\t')}\n`
+		`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10 }, null, '\t')}\n`
 	);
 });
 
@@ -531,7 +531,7 @@ describe('ralph-loop extension', () => {
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, cycleOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, cycleOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -544,7 +544,7 @@ describe('ralph-loop extension', () => {
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on', cycleOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on', cycleOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -558,7 +558,7 @@ describe('ralph-loop extension', () => {
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10 }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10 }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -648,7 +648,7 @@ describe('ralph-loop extension', () => {
 	test('loop-police reasoning-loop detection arms the auto loop and queues the escape cycle when no loop is active', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -680,7 +680,7 @@ describe('ralph-loop extension', () => {
 	test('loop-police detection does not re-arm the auto loop after an explicit stop', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1565,7 +1565,7 @@ D 3 2026-01-01T00:00:00Z
 	test('stops the loop when a context-limit cycle would exceed the maximum iterations', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 2 }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 2 }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1593,7 +1593,7 @@ D 3 2026-01-01T00:00:00Z
 	test('stops the loop when a task completes at the maximum iterations', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 1 }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 1 }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -2207,7 +2207,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 				join(dir, '.pi', 'ralph-loop.json'),
 				`${JSON.stringify({
 					contextThresholds: {},
-					autoApproveDecisions: false,
+					awayMode: false,
 					maxIterations: 10,
 					rollover: { enabled: true, maxMB: 50, maxMessages: 10 }
 				})}\n`
@@ -2338,7 +2338,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 					taskIteration: 1,
 					maxIterations: 20,
 					contextThreshold: 0.8,
-					autoApproveDecisions: false,
+					awayMode: false,
 					cycleQueued: false,
 					cycleCheckpointing: false,
 					stopRequested: false,
@@ -3218,7 +3218,7 @@ GB
 		expect(message).toMatch(ROLLOVER_PROGRESS_PATTERN);
 	});
 
-	test('goal status follows claim and confirm', async () => {
+	test('goal status follows claim and user approval', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3236,15 +3236,10 @@ GB
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is awaiting your decision');
 
-		// Approve: the user decision is resolved, then confirm flips the goal to done.
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
-		await run({ action: 'confirm' });
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
-		expect(statusLine(fakeCtx.widgets)).toContain('goal: done');
-		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('Ralph goal loop is active');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('· goal: done');
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('approved by you');
+		expect(readBacklog().goal()?.status).toBe('done');
 	});
 
 	test('goal status returns to open after a rejected completion', async () => {
@@ -3259,8 +3254,8 @@ GB
 
 		// Claim, then the user rejects: withdraw returns the goal to open.
 		await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { resolution: 'Goal rejected' }, undefined, undefined, fakeCtx.ctx);
+		const reply = await fake.fire('input', fakeCtx.ctx, { source: 'interactive', text: 'The new framework migration is missing.' });
+		expect(reply).toMatchObject({ action: 'transform', text: expect.stringContaining('action "withdraw"') });
 		await run({ action: 'withdraw', note: 'The new framework migration is missing.' });
 
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
@@ -3298,7 +3293,7 @@ GB
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({
 				contextThresholds: {},
-				autoApproveDecisions: false,
+				awayMode: false,
 				maxIterations: 10,
 				rollover: { enabled: true, maxMB: 50, maxMessages: 3000 }
 			})}\n`
@@ -3311,6 +3306,62 @@ GB
 		const message = fakeCtx.notifications.at(-1)?.message ?? '';
 		expect(message).toContain('Ralph loop is active');
 		expect(message).toMatch(/ · session: file \d+\.\dMB\/50MB · messages \d+\/3000$/);
+	});
+});
+
+describe('ralph-loop extension (Away mode)', () => {
+	async function start(awayMode: boolean) {
+		await writeFile(join(dir, '.pi', 'ralph-loop.json'), JSON.stringify({ contextThresholds: {}, awayMode }));
+		await writeFile(autoFile(), RALPH_V1);
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+		const tool = fake.tools.get('ralph_request_decision') as GoalTool & { description: string };
+		return {
+			fake, fakeCtx, tool,
+			ask: (context?: string) => tool.execute('t', { question: 'May the API change?', context }, undefined, undefined, fakeCtx.ctx)
+		};
+	}
+
+	test('raises the bar before asking without changing the tool definition', async () => {
+		const normal = await start(false);
+		expect(normal.fake.userMessages.at(-1)?.text).not.toContain('Away mode is on');
+		expect((await normal.ask()).terminate).toBe(true);
+		const away = await start(true);
+		expect(away.fake.userMessages.at(-1)?.text).toContain('For a low-cost, reversible choice');
+		expect(away.tool.description).toBe(normal.tool.description);
+		expect(away.fake.activeTools).toEqual(normal.fake.activeTools);
+	});
+
+	test('an incomplete request gets one nudge, then the model can still ask', async () => {
+		const { ask, fake, fakeCtx } = await start(true);
+		const first = await ask('Checked: the API tests.');
+		expect(first.terminate).toBeUndefined();
+		expect(first.content[0]!.text).toContain('Ralph has not paused or asked the user');
+		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
+		expect(fake.userMessages).toHaveLength(1);
+
+		expect((await ask()).terminate).toBe(true);
+		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { resolution: 'Keep it compatible.' }, undefined, undefined, fakeCtx.ctx);
+		await fake.fire('agent_start', fakeCtx.ctx);
+		expect((await ask()).terminate).toBeUndefined();
+	});
+
+	test('a genuine blocker with context pauses immediately and can be resolved', async () => {
+		const { ask, fake, fakeCtx } = await start(true);
+		const result = await ask('Checked: tests and public docs.\nRecommendation: keep the old API.\nRisk: breaking callers requires authorization.');
+		expect(result.terminate).toBe(true);
+		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
+		const reply = await fake.fire('input', fakeCtx.ctx, { source: 'interactive', text: 'Keep the old API.' });
+		expect(reply).toMatchObject({ action: 'transform', text: expect.stringContaining('Keep the old API.') });
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await resolve.execute('t', { resolution: 'Keep the old API.' }, undefined, undefined, fakeCtx.ctx);
+		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
 	});
 });
 
@@ -3695,15 +3746,14 @@ GE "All routes render."
 	});
 
 	test('complete claims the goal, blocks the loop, and terminates the turn', async () => {
-		const { fake, fakeCtx, run } = await startLoopWith(GOAL_OPEN_TASKS_DONE);
+		const { fakeCtx, run } = await startLoopWith(GOAL_OPEN_TASKS_DONE);
 
 		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
 		// The turn terminates so the model cannot act before the user answers.
 		expect(result.terminate).toBe(true);
-		// The result instructs the after-answer procedure for both outcomes.
 		expect(result.content[0]!.text).toContain('claimed');
-		expect(result.content[0]!.text).toContain('ralph_resolve_decision');
-		expect(result.content[0]!.text).toContain('ralph_goal with action "confirm"');
+		expect(result.content[0]!.text).toContain('/ralph approve');
+		expect(result.content[0]!.text).toContain('All criteria verified: bun test green.');
 		expect(result.content[0]!.text).toContain('ralph_goal with action "withdraw"');
 
 		// The goal is claimed (not done) with the evidence in the file.
@@ -3718,7 +3768,7 @@ GE "All routes render."
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('paused');
 	});
 
-	test('complete goes straight to done when auto-approve decisions is enabled', async () => {
+	test('a legacy auto-approval config uses Away mode but cannot approve a goal', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3731,44 +3781,31 @@ GE "All routes render."
 		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
 		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
 
-		// Delegated approval: the claim is confirmed immediately, no block, no
-		// terminated turn.
+		expect(fake.userMessages.at(-1)?.text).toContain('Away mode is on');
 		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
-		expect(result.terminate).toBeUndefined();
-		expect(result.content[0]!.text).toContain('The goal is done (approver: auto-approved)');
-
+		expect(result.terminate).toBe(true);
+		expect(result.content[0]!.text).toContain('/ralph approve');
+		await expect(run({ action: 'confirm' })).rejects.toThrow(/Only the user/);
+		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
+		await expect(resolve.execute('t', { resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx)).rejects.toThrow(/Only the user/);
 		const goal = readBacklog().goal()!;
-		expect(goal.status).toBe('done');
+		expect(goal.status).toBe('claimed');
 		expect(goal.evidence).toBe('All criteria verified: bun test green.');
-		expect(statusLine(fakeCtx.widgets)).not.toContain('waiting');
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting (away');
 	});
 
-	test('confirm requires an active goal loop and a claimed goal', async () => {
-		const fake = createFakePi();
-		extension(fake.pi as never);
-		const fakeCtx = createFakeCtx(dir);
-		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
-		await writeFile(autoFile(), GOAL_CLAIMED);
-		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
-
-		// No loop at all.
-		await expect(run({ action: 'confirm' })).rejects.toThrow(/active Ralph loop/);
-
-		// A task-mode loop is not a goal loop.
-		const taskLoop = await startLoopWith(GOAL_CLAIMED_WITH_TASK, 'tasks');
-		await expect(taskLoop.run({ action: 'confirm' })).rejects.toThrow(/active goal loop/);
-
-		// An open goal cannot be confirmed.
-		const open = await startLoopWith(GOAL_OPEN);
-		await expect(open.run({ action: 'confirm' })).rejects.toThrow(/confirm requires claimed/);
+	test('/ralph approve refuses an open goal', async () => {
+		const { fake, fakeCtx } = await startLoopWith(GOAL_OPEN);
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('no claimed goal');
+		expect(readBacklog().goal()?.status).toBe('open');
 	});
 
-	test('confirm marks a claimed goal done, keeping its evidence', async () => {
-		const { run } = await startLoopWith(GOAL_CLAIMED);
-
-		const result = await run({ action: 'confirm' });
-		expect(result.terminate).toBeUndefined();
-		expect(result.content[0]!.text).toContain('The goal is done (approved)');
+	test('/ralph approve marks a claimed goal done even if the loop was stopped', async () => {
+		const { fake, fakeCtx } = await startLoopWith(GOAL_CLAIMED);
+		expect(fake.userMessages).toHaveLength(0);
+		await fake.commands.get('ralph')!.handler('stop', fakeCtx.ctx);
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
 
 		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('done');
@@ -3871,7 +3908,7 @@ T 2 - "Port the state."
 		};
 	}
 
-	test('agent_settled stops the goal loop after the approved completion', async () => {
+	test('the goal loop waits after settling and stops on user approval', async () => {
 		const { fake, fakeCtx, run } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
 
 		// The re-evaluation iteration verifies the goal and claims it: the loop
@@ -3885,18 +3922,8 @@ T 2 - "Port the state."
 		await flush();
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
-		// The user approves; the model records the decision and resolves it.
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute(
-			't',
-			{ resolution: 'Goal approved' },
-			undefined,
-			undefined,
-			fakeCtx.ctx
-		);
-
-		// The model confirms the goal; the settle stops the loop on the done goal.
-		await run({ action: 'confirm' });
+		// The user approves directly; no model call grants approval.
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
@@ -3904,28 +3931,20 @@ T 2 - "Port the state."
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
 	});
 
-	test('agent_settled stops the goal loop after a completion with multi-line evidence', async () => {
+	test('user approval stops the loop and preserves multi-line evidence', async () => {
 		const { fake, fakeCtx, run } = await startGoalLoopWith(GOAL_OPEN_TASKS_DONE);
 
-		// Multi-line evidence, like a real verification note: the settle must
-		// diff the backlog by rows, not by re-parsing its own render — the
-		// rendered GE record is a multi-line quoted string the text parser
-		// cannot close (session 01a0d9e6: "line 13: unterminated quoted
-		// string" killed the settle and left the loop dangling on a done goal).
-		const result = await run({
-			action: 'complete',
-			note: 'All criteria verified:\n1. Pure JS: no dependencies.\n2. Duration 54 s: ffprobe PASS.\n3. Audio: no clipping.'
-		});
+		const evidence = 'All criteria verified:\n1. Pure JS: no dependencies.\n2. Duration 54 s: ffprobe PASS.\n3. Audio: no clipping.';
+		const result = await run({ action: 'complete', note: evidence });
 		expect(result.terminate).toBe(true);
 
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { resolution: 'Goal approved' }, undefined, undefined, fakeCtx.ctx);
-		await run({ action: 'confirm' });
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): off');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('goal is complete');
+		expect(readBacklog().goal()?.evidence).toBe(evidence);
 		for (const notification of fakeCtx.notifications) {
 			expect(notification.message).not.toContain('could not read');
 		}
@@ -4035,16 +4054,8 @@ T 2 - "Port the state."
 		// a fresh iteration.
 		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): waiting');
 
-		// The user approves; the model resolves the decision and confirms the goal.
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute(
-			't',
-			{ resolution: 'Goal approved' },
-			undefined,
-			undefined,
-			fakeCtx.ctx
-		);
-		await run({ action: 'confirm' });
+		// The user approves the claim.
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
@@ -4550,6 +4561,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			'rollover',
 			'import',
 			'set-goal',
+			'approve',
 			'stop',
 			'reload',
 			'status',
@@ -4848,7 +4860,7 @@ describe('ralph-loop extension (cycle compaction and completion summaries)', () 
 		// Compaction mode defaults to on; state it explicitly for clarity.
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: true }, null, '\t')}\n`
 		);
 	});
 
@@ -5090,7 +5102,7 @@ describe('ralph-loop extension (cycle compaction and completion summaries)', () 
 	test('cycle: compaction mode disabled skips the compaction and sends the fresh iteration directly', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: false }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: false }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -5361,7 +5373,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify(
-				{ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'on', ...extra },
+				{ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: true, autoMode: 'on', ...extra },
 				null,
 				'\t'
 			)}\n`
@@ -5789,7 +5801,7 @@ GB
 				taskIteration: 1,
 				maxIterations: 10,
 				contextThreshold: 0.5,
-				autoApproveDecisions: false,
+				awayMode: false,
 				cycleQueued: false,
 				cycleCheckpointing: false,
 				stopRequested: false,
@@ -6476,7 +6488,7 @@ M list "Plan"
 	const writeConfig = (extra: Record<string, unknown> = {}) =>
 		writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, ...extra }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, ...extra }, null, '\t')}\n`
 		);
 
 	/** The per-mode cycle policy with one value for all modes. */
@@ -7192,7 +7204,7 @@ T 1 - "Roll out the flat configuration to every language"
 describe('ralph-loop extension (global config store)', () => {
 	const storePath = () => join(agentDir, 'ralph', 'config.json');
 	const fullConfig = (extra: Record<string, unknown> = {}) =>
-		({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, compactionMode: true, autoMode: 'off', cycleOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
+		({ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: true, autoMode: 'off', cycleOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
 
 	const writeStore = (store: { defaults?: Record<string, unknown>; dirs?: Record<string, unknown> }) =>
 		writeFile(storePath(), `${JSON.stringify(store, null, '\t')}\n`);
@@ -7502,7 +7514,7 @@ describe('ralph-loop extension (global config store)', () => {
 		const view = await openConfigUi(fake, fakeCtx);
 		// Rows: Save to, Start fresh context at, Maximum iterations, Checkpoint
 		// note guideline, Compaction
-		// mode, Finish-up: work call limit, Auto-approve decisions, Auto mode,
+		// mode, Finish-up: work call limit, Away mode, Auto mode,
 		// Cycle: task loop, Cycle: goal loop, Cycle: auto loop.
 		for (let i = 0; i < 8; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r'); // active task policy task → budget
@@ -7757,7 +7769,7 @@ describe('ralph-loop extension (ralph_cycle tool)', () => {
 	test('arms the auto loop and cycles when auto mode is on and the session backlog has open tasks', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		await writeFile(autoFile(), '# ralph v2\n\nM list "General"\n\nT 1 General "Task one"\n');
 		const fake = createFakePi();
@@ -7785,7 +7797,7 @@ describe('ralph-loop extension (ralph_cycle tool)', () => {
 	test('arms the auto loop even when the session backlog has no open tasks: the note carries the reason', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, autoApproveDecisions: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		// No session backlog at all: the cycle note is what the fresh
 		// iteration moves on.

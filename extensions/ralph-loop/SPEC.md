@@ -36,7 +36,7 @@ repository; the pi core is untouched.
 - `/ralph set-goal <file>`: set the backlog's goal from a file (the file's
   content is the goal; a leading H1 heading marker is stripped). Targets the active loop's backlog or the session's ralph file;
   replaces an open goal, refuses claimed/done goals.
-- A `ralph_goal` tool: `show`, `checkpoint`, `complete`, `confirm`,
+- A `ralph_goal` tool: `show`, `checkpoint`, `complete`,
   `withdraw` — separate from `ralph_todo`.
 - User approval gate for goal completion, reusing the existing decision
   workflow (`blockLoop` / `ralph_request_decision` pattern).
@@ -100,7 +100,7 @@ Ralph decision workflow.
 ## 5. Domain and lifecycle rules
 
 - Goal state machine: `open` → (claim: requires **no open tasks** + evidence
-  note) → `claimed` → (confirm) → `done`; `claimed` → (withdraw: note
+  note) → `claimed` → (user `/ralph approve`) → `done`; `claimed` → (withdraw: note
   becomes the goal checkpoint) → `open`. Invalid transitions throw.
 - **Planning vs re-evaluation** (both are "goal open, no open tasks"): zero
   tasks in the backlog = planning iteration; tasks exist but none open =
@@ -147,15 +147,14 @@ Ralph decision workflow.
 
 ## 6. Authorization and security
 
-- Goal completion requires **user approval** by default: `ralph_goal
-  complete` claims the goal, blocks the loop with the question and evidence,
-  and terminates the turn (the `ralph_request_decision` pattern). After the
-  user answers, the model records the decision per the existing protocol and
-  calls `ralph_resolve_decision`, then `ralph_goal confirm` (approved) or
-  `ralph_goal withdraw` (rejected, with what is missing).
-- With the existing `autoApproveDecisions` config enabled, `complete` goes
-  straight to `done` with approver "auto-approved" (delegated approval,
-  consistent with the existing decision semantics). No new config flag.
+- Goal completion always requires **user approval**: `ralph_goal complete`
+  claims the goal, blocks the loop with the evidence, and terminates the turn.
+  The user can accept the claim with `/ralph approve` or reply with what is
+  missing so the model can call `ralph_goal withdraw`. No model tool can approve.
+- Away mode raises the bar for asking work questions: infer intent from the
+  user’s instructions and project evidence, and proceed on reversible
+  assumptions. A genuine blocker still pauses and asks the user. It has no
+  effect on goal approval.
 - No secrets or credentials may appear in goal evidence, checkpoints, or
   completion log entries.
 
@@ -170,8 +169,8 @@ Ralph decision workflow.
    repository; the loop stops only after verified, approved completion.
 2. **Claim and approval.** All criteria pass; the model runs full
    verification, calls `ralph_goal complete` with evidence. Acceptance: the
-   loop pauses with the question and evidence; approving ends the loop with
-   the goal `done` and a decision record; rejecting returns the goal to
+   loop pauses with the evidence; `/ralph approve` ends the loop with
+   the goal `done`; rejecting returns the goal to
    `open` with the rejection as the next step and the loop continues.
 3. **GUI.** User runs bare `/ralph`. Acceptance: the home view shows the
    goal (status-colored, expandable) and the lists with counts; `A`
