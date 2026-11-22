@@ -683,6 +683,29 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 		}
 	);
 
+	test('pause and resume are operator commands even while a response is streaming', { timeout: 15000 }, async () => {
+		endpoint = startMockEndpoint([], (body) => lastUserText(body).includes('this message resumes it')
+			? textResponder('Resumed.')(body)
+			: textResponder('Finished the current turn.', { prompt_tokens: 9000, completion_tokens: 10 })(body), 500);
+		const sess = await createRalphSession(endpoint.port, {
+			contextThresholds: { __default__: 0.2 },
+			awayMode: false,
+			maxIterations: 10
+		});
+
+		await sess.prompt('/ralph start');
+		await waitFor(() => endpoint!.requests.length >= 1, 'streaming request', 5000);
+		await sess.prompt('/ralph pause');
+		await sess.waitForIdle();
+		expect(endpoint.requests).toHaveLength(1);
+
+		await sess.prompt('/ralph resume Keep the current API.');
+		await waitFor(() => endpoint!.requests.length >= 2, 'resume request');
+		const text = lastUserText(endpoint.requests[1]!.body);
+		expect(text).toContain('this message resumes it');
+		expect(text).toContain('Keep the current API.');
+	});
+
 	test(
 		'escape: aborting an over-budget turn pauses the loop; a typed message resumes it',
 		{ timeout: 60000 },

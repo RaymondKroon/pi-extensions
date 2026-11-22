@@ -73,14 +73,14 @@ type SqliteDb = {
 	close: () => void;
 };
 
-function createSqlite(path?: string): SqliteDb {
+function createSqlite(path?: string, readOnly = false): SqliteDb {
 	const require = createRequire(import.meta.url);
 	try {
-		const mod = require('node:sqlite') as { DatabaseSync: new (path?: string) => SqliteDb };
-		return new mod.DatabaseSync(path ?? ':memory:');
+		const mod = require('node:sqlite') as { DatabaseSync: new (path: string, options: { readOnly: boolean }) => SqliteDb };
+		return new mod.DatabaseSync(path ?? ':memory:', { readOnly });
 	} catch {
-		const mod = require('bun:sqlite') as { Database: new (path: string) => SqliteDb };
-		return new mod.Database(path ?? ':memory:');
+		const mod = require('bun:sqlite') as { Database: new (path: string, options: { readonly: boolean }) => SqliteDb };
+		return new mod.Database(path ?? ':memory:', { readonly: readOnly });
 	}
 }
 
@@ -622,9 +622,9 @@ export class Backlog {
 	 * found under the legacy .ralph name is moved to the .db name. Throws
 	 * ENOENT when neither the path nor its sibling exists and
 	 * NotRalphBacklogError when the file holds neither a ralph SQLite
-	 * database nor ralph text.
+	 * database nor ralph text. Previews can opt out of any on-disk migration.
 	 */
-	static open(path: string): Backlog {
+	static open(path: string, { readOnly = false } = {}): Backlog {
 		let file = path;
 		let bytes: Buffer;
 		try {
@@ -641,7 +641,7 @@ export class Backlog {
 		if (isSqliteFile(bytes)) {
 			let fileDb: SqliteDb;
 			try {
-				fileDb = createSqlite(file);
+				fileDb = createSqlite(file, readOnly);
 			} catch (error) {
 				throw new NotRalphBacklogError(path, `corrupt SQLite file (${error instanceof Error ? error.message : String(error)})`);
 			}
@@ -661,7 +661,7 @@ export class Backlog {
 					throw new NotRalphBacklogError(path, `unsupported ralph schema version ${marker.version}`);
 				}
 				const backlog = Backlog.copyIntoMemory(fileDb);
-				if (file.endsWith('.ralph') || marker.version < RALPH_SCHEMA_VERSION) {
+				if (!readOnly && (file.endsWith('.ralph') || marker.version < RALPH_SCHEMA_VERSION)) {
 					// A SQLite database under the legacy text name is moved to
 					// the .db name; an older-schema database is re-saved in
 					// place (the copy drops the legacy goal title). Best
@@ -691,6 +691,7 @@ export class Backlog {
 			throw new NotRalphBacklogError(path);
 		}
 		const backlog = Backlog.parse(text);
+		if (readOnly) return backlog;
 		// Auto-migrate the legacy text file to SQLite: the database is written
 		// to the .db name (the extension marks the format), verified by
 		// reopening, and the text file is removed. Best effort: on any failure

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { visibleWidth, type TUI } from '@earendil-works/pi-tui';
 import { Backlog } from './backlog.ts';
 import { createRalphHome, type RalphHomeOptions } from './ralph-home.ts';
+import { RALPH_COMMANDS } from './ralph-commands.ts';
 import type { RalphViewTheme } from './view-kit.ts';
 
 const SAMPLE = `# ralph v2
@@ -102,6 +103,38 @@ function createHomeWith(options: Partial<RalphHomeOptions>) {
 
 // Mutations go through an async mutate callback; let the rebuild land.
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('home command help', () => {
+	test('lists all commands without executing them and returns to the same Home selection', () => {
+		const { view, lines, opened, closed } = createHome();
+		expect(lines().join('\n')).toContain('?: Help');
+		view.handleInput('j');
+		const selection = view.cursor();
+		view.handleInput('?');
+		expect(view.mode()).toBe('help');
+		const help = lines(120).join('\n');
+		expect(help).toContain('Ralph commands');
+		for (const command of RALPH_COMMANDS) expect(help).toContain(`/ralph ${command.usage}`);
+		view.handleInput('\r');
+		expect(opened).toHaveLength(0);
+		view.handleInput('\u001b');
+		expect(view.mode()).toBe('browse');
+		expect(view.cursor()).toBe(selection);
+		expect(closed()).toBe(false);
+	});
+
+	test('scrolls to the last commands within a fixed-height overlay', () => {
+		const { view, lines } = createHomeWith({ height: () => 8 });
+		view.handleInput('?');
+		expect(lines(64)).toHaveLength(8);
+		expect(lines(64).join('\n')).not.toContain('/ralph config');
+		for (let i = 0; i < 20; i++) view.handleInput('\u001b[6~');
+		const rendered = lines(64);
+		expect(rendered.join('\n')).toContain('/ralph config');
+		expect(rendered.at(-1)).toContain('Esc: back');
+		for (const line of rendered) expect(visibleWidth(line)).toBeLessThanOrEqual(64);
+	});
+});
 
 describe('home view rendering', () => {
 	test('renders the goal row, list rows with counts, and footer', () => {

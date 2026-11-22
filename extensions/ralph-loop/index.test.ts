@@ -1297,7 +1297,7 @@ D 3 2026-01-01T00:00:00Z
 		// /ralph status names the paused state AND the rollover-limit progress.
 		await fake.commands.get('ralph')!.handler('status', fakeCtx.ctx);
 		const pausedStatus = fakeCtx.notifications.at(-1)?.message ?? '';
-		expect(pausedStatus).toContain('Ralph loop is paused — type a message to resume it with extra info');
+		expect(pausedStatus).toContain('Ralph loop is paused — /ralph resume or type a message to continue');
 		expect(pausedStatus).toMatch(ROLLOVER_PROGRESS_PATTERN);
 
 		// The user types a message: it resumes the loop as extra info — no
@@ -3309,6 +3309,146 @@ GB
 	});
 });
 
+describe('ralph-loop extension (operator commands)', () => {
+	const CLAIMED = '# ralph v2\n\nG "Example goal" claimed\nGB\n  Ship the patch.\nGE "All checks passed."\n';
+
+	async function setup() {
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
+		return { fake, fakeCtx, run: (args: string) => fake.commands.get('ralph')!.handler(args, fakeCtx.ctx) };
+	}
+
+	test('away changes only the session, persists through reload, and updates model guidance', async () => {
+		const { fake, fakeCtx, run } = await setup();
+		const dirConfig = join(dir, '.pi', 'ralph-loop.json');
+		const oldConfig = await readFile(dirConfig, 'utf8');
+		await run('away');
+		expect(statusLine(fakeCtx.widgets)).toContain('away');
+		expect(fake.userMessages).toHaveLength(0);
+		expect(await readFile(dirConfig, 'utf8')).toBe(oldConfig);
+		expect(existsSync(join(agentDir, 'ralph', 'config.json'))).toBe(false);
+
+		await writeFile(autoFile(), RALPH_V1);
+		fakeCtx.branchEntries.push(...fake.entries);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'reload' });
+		await run('start');
+		expect(fake.userMessages.at(-1)?.text).toContain('Away mode is on');
+		await run('away invalid');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph away');
+		expect(statusLine(fakeCtx.widgets)).toContain('away');
+		await run('away off');
+		const prompt = await fake.fire('before_agent_start', fakeCtx.ctx, { systemPrompt: 'Base' });
+		expect(prompt).toMatchObject({ systemPrompt: expect.stringContaining('The user set Away mode off for this session') });
+		expect(statusLine(fakeCtx.widgets)).not.toContain('away');
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('pause lets the active turn finish without cycling; resume keeps the iteration and preserves the note', async () => {
+		const { fake, fakeCtx, run } = await setup();
+		await writeFile(autoFile(), RALPH_V1);
+		await run('start');
+		fakeCtx.idle.value = false;
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await run('pause');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('after the current turn');
+		await run('resume');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Wait for the current turn');
+		fakeCtx.usagePercent.value = 55;
+		await fake.fire('message_update', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'stop' } });
+		fakeCtx.idle.value = true;
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		expect(fake.userMessages).toHaveLength(1);
+		expect(fakeCtx.abortCalls.value).toBe(0);
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: paused');
+		await run('resume Keep "the old API".');
+		expect(fake.userMessages.at(-1)?.text).toContain('Keep "the old API".');
+		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph: on');
+	});
+
+	test('a paused recording cycle stays paused on reload and resumes recording with the note', async () => {
+		const { fake, fakeCtx, run } = await setup();
+		await writeFile(autoFile(), RALPH_V1);
+		await run('start');
+		const cycle = fake.tools.get('ralph_cycle') as GoalTool;
+		await cycle.execute('t', { note: 'Need fresh context' }, undefined, undefined, fakeCtx.ctx);
+		await run('pause');
+		const before = fake.userMessages.length;
+		fakeCtx.branchEntries.push(...fake.entries);
+		await fake.fire('session_start', fakeCtx.ctx, { reason: 'reload' });
+		expect(fake.userMessages).toHaveLength(before);
+		await run('resume Keep the existing implementation.');
+		expect(fake.userMessages.at(-1)?.text).toContain('Finish up now');
+		expect(fake.userMessages.at(-1)?.text).toContain('Keep the existing implementation.');
+	});
+
+	test('review shows a normal pending decision; away and resume do not clear it', async () => {
+		const { fake, fakeCtx, run } = await setup();
+		await writeFile(autoFile(), RALPH_V1);
+		await run('start');
+		const ask = fake.tools.get('ralph_request_decision') as GoalTool;
+		await ask.execute('t', { question: 'May the API change?', context: 'Clients still rely on it.' }, undefined, undefined, fakeCtx.ctx);
+		await run('away on');
+		await run('resume ignore this');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('does not clear it');
+		await run('review');
+		const review = fakeCtx.notifications.at(-1)?.message;
+		expect(review).toContain('May the API change?');
+		expect(review).toContain('Clients still rely on it.');
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting (away');
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('review and reject a claimed goal without model interpretation', async () => {
+		const { fake, fakeCtx, run } = await setup();
+		await writeFile(autoFile(), CLAIMED);
+		await run('start --goal');
+		await run('review');
+		const review = fakeCtx.notifications.at(-1)?.message;
+		expect(review).toContain('All checks passed.');
+		expect(review).toContain('/ralph approve or /ralph reject');
+		await run('resume');
+		await run('reject');
+		expect(fake.userMessages).toHaveLength(0);
+		expect(readBacklog().goal()?.status).toBe('claimed');
+		await run('reject Windows coverage is missing.');
+		const goal = readBacklog().goal();
+		expect(goal).toMatchObject({ status: 'open', evidence: null, checkpoint: 'Windows coverage is missing.' });
+		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
+		expect(fake.userMessages).toHaveLength(1);
+		expect(fake.userMessages.at(-1)?.text).toContain('Windows coverage is missing.');
+		await run('review');
+		expect(fakeCtx.notifications.at(-1)?.message).toBe('Nothing is waiting for your review.');
+	});
+
+	test('reject restarts a stopped goal loop with the feedback in its checkpoint', async () => {
+		const { fake, run } = await setup();
+		await writeFile(autoFile(), CLAIMED);
+		await run('reject Add a Linux check.');
+		expect(readBacklog().goal()).toMatchObject({ status: 'open', checkpoint: 'Add a Linux check.' });
+		expect(fake.userMessages).toHaveLength(1);
+		expect(fake.userMessages[0]?.text).toContain('Add a Linux check.');
+	});
+
+	test('next and review do not create or migrate a backlog or trigger a turn', async () => {
+		const { fake, fakeCtx, run } = await setup();
+		await run('next');
+		await run('review');
+		expect(existsSync(autoFile())).toBe(false);
+		const source = '# ralph v2\n\nT 1 - "Findings: Context only"\n\nT 2 - "First task"\nC 2 1\n  Add a regression.\n';
+		await writeFile(autoFile(), source);
+		await run('next');
+		const preview = fakeCtx.notifications.at(-1)?.message;
+		expect(preview).toContain('Next task: 2 First task');
+		expect(preview).toContain('Add a regression.');
+		expect(await readFile(autoFile(), 'utf8')).toBe(source);
+		expect(fake.userMessages).toHaveLength(0);
+	});
+});
+
 describe('ralph-loop extension (Away mode)', () => {
 	async function start(awayMode: boolean) {
 		await writeFile(join(dir, '.pi', 'ralph-loop.json'), JSON.stringify({ contextThresholds: {}, awayMode }));
@@ -4580,6 +4720,12 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			'import',
 			'set-goal',
 			'approve',
+			'reject',
+			'review',
+			'next',
+			'away',
+			'pause',
+			'resume',
 			'stop',
 			'reload',
 			'status',

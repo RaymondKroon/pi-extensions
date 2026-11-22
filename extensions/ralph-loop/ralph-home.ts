@@ -18,6 +18,7 @@
 
 import { getKeybindings, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from '@earendil-works/pi-tui';
 import { Backlog, type Goal } from './backlog.ts';
+import { RALPH_COMMANDS } from './ralph-commands.ts';
 import {
 	createModeController,
 	dimmedTheme,
@@ -71,7 +72,7 @@ export interface RalphHome {
 	cursor(): number;
 	/** Whether the goal row is expanded (test hook). */
 	expanded(): boolean;
-	/** Current input mode: browse | input | reason | form | confirm | editor (test hook). */
+	/** Current input mode: browse | help | input | reason | form | confirm | editor (test hook). */
 	mode(): string;
 }
 
@@ -116,6 +117,9 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 	let cursor = 0;
 	let scrollTop = 0;
 	let expanded = false;
+	let helpScroll: number | undefined;
+	let helpMaxScroll = 0;
+	let helpPageSize = 1;
 	// Transient feedback for the last mutation, cleared on the next key.
 	let notice: string | undefined;
 	// The host theme, swapped for a dimmed variant while a popup is open so
@@ -301,7 +305,7 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 	};
 
 	const footerSegments = (): string[] => {
-		const segments = ['jk: move', 'enter: open list'];
+		const segments = ['jk: move', 'enter: open list', '?: Help'];
 		const hasGoal = state.selectable.some((row) => row.kind === 'goal');
 		if (hasGoal) segments.push('O: goal detail');
 		if (options.mutate) {
@@ -459,16 +463,48 @@ export function createRalphHome(options: RalphHomeOptions): RalphHome {
 		return lines;
 	};
 
+	const renderHelp = (width: number): string[] => {
+		const header = truncateToWidth(theme.bold('Ralph commands'), width);
+		const footer = layoutFooter(['j/k: scroll', 'PgUp/PgDn: page', 'Esc: back'], width, (text) => theme.fg('dim', text));
+		const commands = [
+			...wrapTextWithAnsi('/ralph [file] — Open Ralph Home for the session or a backlog file.', width),
+			...RALPH_COMMANDS.flatMap(({ usage, description }) => wrapTextWithAnsi(`/ralph ${usage} — ${description}`, width))
+		];
+		const height = options.height?.();
+		helpPageSize = height === undefined ? commands.length : Math.max(1, height - 1 - footer.length);
+		helpMaxScroll = Math.max(0, commands.length - helpPageSize);
+		helpScroll = Math.min(helpScroll ?? 0, helpMaxScroll);
+		const body = commands.slice(helpScroll, helpScroll + helpPageSize);
+		while (body.length < helpPageSize) body.push('');
+		return [header, ...body, ...footer];
+	};
+
 	const view: RalphHome = {
 		cursor: () => cursor,
 		expanded: () => expanded,
-		mode: () => modes.mode().kind,
+		mode: () => helpScroll === undefined ? modes.mode().kind : 'help',
 		render(width: number): string[] {
+			if (helpScroll !== undefined) return renderHelp(width);
 			if (modes.mode().kind === 'browse') return browseLines(width);
 			return compositePopup(width, (maxHeight) => renderModeBody(width, modes.mode(), options.theme, maxHeight));
 		},
 		handleInput(data: string): void {
+			if (helpScroll !== undefined) {
+				if (data === 'q' || data === '?' || keybindings.matches(data, 'tui.select.cancel')) helpScroll = undefined;
+				else if (data === 'j' || keybindings.matches(data, 'tui.select.down')) helpScroll = Math.min(helpMaxScroll, helpScroll + 1);
+				else if (data === 'k' || keybindings.matches(data, 'tui.select.up')) helpScroll = Math.max(0, helpScroll - 1);
+				else if (keybindings.matches(data, 'tui.select.pageDown')) helpScroll = Math.min(helpMaxScroll, helpScroll + helpPageSize);
+				else if (keybindings.matches(data, 'tui.select.pageUp')) helpScroll = Math.max(0, helpScroll - helpPageSize);
+				else return;
+				options.requestRender();
+				return;
+			}
 			if (modes.handleInput(data)) return;
+			if (data === '?') {
+				helpScroll = 0;
+				options.requestRender();
+				return;
+			}
 			notice = undefined;
 			if (data === 'q' || keybindings.matches(data, 'tui.select.cancel')) {
 				options.onClose();

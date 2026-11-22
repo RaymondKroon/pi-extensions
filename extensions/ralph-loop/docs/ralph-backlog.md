@@ -146,6 +146,23 @@ claim, reply with what still needs work.
 Goal loop only. `claimed` → `open`. `note` describes what is missing and
 becomes the goal checkpoint.
 
+## Ralph commands
+
+Open Ralph Home with bare `/ralph` and press `?` for the full, read-only
+command list. Press `Esc` to return to Home.
+
+- `/ralph away [on | off]` toggles Away mode with no argument, or sets it
+  explicitly for this session. It survives reload but doesn't change the
+  defaults in `/ralph config` or clear a pending decision.
+- `/ralph pause` lets the current turn finish without starting another.
+  `/ralph resume [note]` continues the loop or its pending recording turn.
+  Resume does not bypass a decision or goal review.
+- `/ralph review` displays a pending decision or a claimed goal with evidence.
+- `/ralph reject <reason>` reopens a claimed goal, saves the reason as its
+  checkpoint, and continues the goal loop. Use `/ralph approve` to accept it.
+- `/ralph next` previews the next open task and checkpoint without starting
+  the loop.
+
 ## Away mode
 
 Enable **Away mode** in `/ralph config` to have Ralph infer intent from the

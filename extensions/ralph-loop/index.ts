@@ -40,9 +40,11 @@ import {
 import { createTodosView, type TodosView } from './todos-view.ts';
 import { renderPrompt } from './prompt-template.ts';
 import { createRalphHome, type RalphHome } from './ralph-home.ts';
+import { RALPH_COMMANDS, RALPH_COMMAND_SUMMARY } from './ralph-commands.ts';
 
 const STATE_TYPE = 'ralph-loop-state';
 const CONFIG_TYPE = 'ralph-loop-config';
+const AWAY_OVERRIDE_TYPE = 'ralph-away-override';
 const CONFIG_FILE_NAME = 'ralph-loop.json';
 /** The global config store file (in the ralph directory of pi's global agent directory): settings per directory and, for git repositories, per branch. */
 const GLOBAL_CONFIG_FILE_NAME = 'config.json';
@@ -883,6 +885,20 @@ function isBacklogFinished(backlog: Backlog, category?: string): boolean {
  * (durable findings go to the project documentation), but existing backlogs
  * may still contain them, so the skip stays for backward compatibility.
  */
+function nextTaskPreview(backlog: Backlog, sessionBacklog: boolean, scope?: string): string {
+	if (!sessionBacklog) {
+		const task = backlog.nextOpenTask(scope);
+		return task ? formatNextTask(backlog, task, scope) : `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
+	}
+	// Reference entries such as "Findings: " are not work items.
+	const open = backlog.listTasks(scope).filter((task) => !task.done);
+	const task = open.find((candidate) => !isReferenceTaskTitle(candidate.title));
+	if (task) return formatNextTask(backlog, task, scope);
+	return open.length > 0
+		? `No open work tasks remain (open reference entries, not work: ${open.map(({ title }) => title).join('; ')}).`
+		: 'No open work tasks remain.';
+}
+
 function isReferenceTaskTitle(title: string): boolean {
 	return title.startsWith('Findings: ');
 }
@@ -1934,6 +1950,8 @@ async function importRalphBacklog(
 export default function (pi: ExtensionAPI) {
 	let state: RalphState | undefined;
 	let config = defaultConfig();
+	let awayOverride: boolean | undefined;
+	const effectiveAwayMode = () => awayOverride ?? config.awayMode;
 	// True while the current directory resolves its settings from the global
 	// store's defaults section (no directory entry, no legacy project file):
 	// editing the global defaults then applies to this session as well.
@@ -1951,6 +1969,7 @@ export default function (pi: ExtensionAPI) {
 	// new turn starts streaming or settles, so the status bar visibly stays in the
 	// "starting" phase instead of flipping back to "on" within milliseconds.
 	let freshIterationPending = false;
+	let deferredFreshIteration: ((note?: string) => void) | undefined;
 	// Set when a turn begins already over budget (e.g. right after a cycle whose
 	// reported usage has not caught up yet); suppresses the mid-turn checkpoint
 	// steer for that turn so a cycle cannot immediately re-trigger itself.
@@ -2171,7 +2190,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const updateStatus = (ctx: ExtensionContext) => {
-		const awayMode = state?.enabled ? state.awayMode : config.awayMode;
+		const awayMode = state?.enabled ? state.awayMode : effectiveAwayMode();
 		const mode = state?.blocked
 			? 'waiting'
 			: state?.paused
@@ -2234,7 +2253,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget(
 			'ralph-paused',
 			state?.enabled && state.paused
-				? ['Ralph loop is paused — type a message to resume it with extra info · /ralph stop to stop']
+				? ['Ralph loop is paused — /ralph resume or type a message to continue · /ralph stop to stop']
 				: undefined
 		);
 		ctx.ui.setStatus('ralph-loop', undefined);
@@ -2283,6 +2302,7 @@ export default function (pi: ExtensionAPI) {
 		goalState = undefined;
 		freshIterationPending = false;
 		loopEscapePending = false;
+		deferredFreshIteration = undefined;
 		// A force stop can land while a cycle compaction is in flight; the
 		// pending ralph summary must not hijack a later, unrelated compaction
 		// (e.g. the user's own /compact).
@@ -2468,6 +2488,7 @@ export default function (pi: ExtensionAPI) {
 			if (!state) throw new Error('No active Ralph loop — start one with /ralph start.');
 			if (state.cycleQueued) throw new Error('A cycle is already pending. Stop working now — do not call ralph_cycle again; the progress-recording turn follows when this turn ends.');
 			if (state.stopRequested) throw new Error('The loop is stopping after the current iteration; stop working instead of cycling.');
+			if (state.paused || state.blocked) throw new Error('The Ralph loop is paused or waiting for the user. Do not start a fresh iteration.');
 			const lastIteration = state.iteration + 1 > state.maxIterations;
 			// The note and the reload flag ride on the state the cycle persists:
 			// queueCycle spreads the current state into its cycle entry.
@@ -2669,31 +2690,7 @@ export default function (pi: ExtensionAPI) {
 				const armedNote = armedNow ? ' The Ralph auto loop was started (iteration 1).' : '';
 				switch (params.action) {
 					case 'next': {
-						// On the session backlog, reference entries ("Goal: " /
-						// "Findings: ") are not work items: skip them so the
-						// iteration never stalls on one.
-						if (isSession) {
-							const open = backlog.listTasks(scope).filter((task) => !task.done);
-							const task = open.find((task) => !isReferenceTaskTitle(task.title));
-							if (!task) {
-								const references = open.filter((task) => isReferenceTaskTitle(task.title));
-								output =
-									references.length > 0
-										? `No open work tasks remain (open reference entries, not work: ${references
-													.map((reference) => reference.title)
-												.join('; ')}).`
-										: 'No open work tasks remain.';
-								break;
-							}
-							output = formatNextTask(backlog, task, scope);
-							break;
-						}
-						const task = backlog.nextOpenTask(scope);
-						if (!task) {
-							output = `No open tasks remain${scope ? ` in category "${scope}"` : ''}.`;
-							break;
-						}
-						output = formatNextTask(backlog, task, scope);
+						output = nextTaskPreview(backlog, isSession, scope);
 						break;
 					}
 					case 'list': {
@@ -3111,7 +3108,7 @@ export default function (pi: ExtensionAPI) {
 		return { current, next };
 	};
 
-	const startFreshIteration = (ctx: ExtensionContext) => {
+	const startFreshIteration = (ctx: ExtensionContext, resumeNote?: string) => {
 		void (async () => {
 			const prep = prepareNextIteration(ctx);
 			if (!prep || !state) return;
@@ -3158,10 +3155,12 @@ export default function (pi: ExtensionAPI) {
 				freshIterationPending = true;
 				updateStatus(ctx);
 				const completion = completionSummary(current, state.loopStart, next.category, state.checkpointCapChars);
-				const finishCycle = () => {
-					// A pause/stop/blocked decision that landed while the compaction
-					// ran must not start a new turn; the resume/stop flow continues.
-					if (!state?.enabled || state.paused || state.blocked) return;
+				const finishCycle = (note = resumeNote) => {
+					if (!state?.enabled || state.blocked) return;
+					if (state.paused) {
+						deferredFreshIteration = finishCycle;
+						return;
+					}
 					if (completion) {
 						pi.sendMessage(
 							{ customType: COMPLETION_SUMMARY_TYPE, content: completion, display: true },
@@ -3179,7 +3178,8 @@ export default function (pi: ExtensionAPI) {
 						},
 						{ triggerTurn: false, deliverAs: 'followUp' }
 					);
-					pi.sendUserMessage(iterationPrompt(next, reason), { deliverAs: 'followUp' });
+					const prompt = iterationPrompt(state, reason);
+					pi.sendUserMessage(note ? `${prompt}\n\n${resumeWithExtraInfoPrompt(note)}` : prompt, { deliverAs: 'followUp' });
 				};
 				if (!config.compactionMode) {
 					finishCycle();
@@ -3195,7 +3195,7 @@ export default function (pi: ExtensionAPI) {
 					anchorId: anchor?.id
 				};
 				ctx.compact({
-					onComplete: finishCycle,
+					onComplete: () => finishCycle(),
 					onError: (error) => {
 						// Clear the pending compaction: the hook only consumes it when
 						// pi actually runs the compaction, so a gate failure ("Nothing
@@ -3416,7 +3416,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
-				awayMode: config.awayMode,
+				awayMode: effectiveAwayMode(),
 				cycleQueued: false,
 				cycleReason: undefined,
 				cycleCheckpointing: false,
@@ -3561,7 +3561,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
-				awayMode: config.awayMode,
+				awayMode: effectiveAwayMode(),
 				cycleQueued: false,
 				cycleReason: undefined,
 				cycleCheckpointing: false,
@@ -3615,7 +3615,7 @@ export default function (pi: ExtensionAPI) {
 		// (or a cycle ran for another reason), so neither the enforcement nor
 		// the settle fallback may fire on top of it.
 		loopEscapePending = false;
-		if (!state?.enabled || state.cycleQueued) return;
+		if (!state?.enabled || state.cycleQueued || state.paused || state.blocked) return;
 
 		// For completed-task cycles, name the completed task(s) in the
 		// recording prompt instead of making the model re-read the backlog to
@@ -3699,6 +3699,8 @@ export default function (pi: ExtensionAPI) {
 		taskCount = undefined;
 		goalState = undefined;
 		freshIterationPending = false;
+		deferredFreshIteration = undefined;
+		awayOverride = undefined;
 		turnStartedOverBudget = false;
 		lastCtx = undefined;
 		loopEscapePending = false;
@@ -3728,6 +3730,7 @@ export default function (pi: ExtensionAPI) {
 					hasSessionConfig = true;
 				}
 			}
+			if (entry.customType === AWAY_OVERRIDE_TYPE && typeof entry.data === 'boolean') awayOverride = entry.data;
 			if (entry.customType === STATE_TYPE && isRalphState(entry.data)) {
 				lastStateData = entry.data;
 			}
@@ -3822,7 +3825,7 @@ export default function (pi: ExtensionAPI) {
 			if (state?.enabled) {
 				state = {
 					...state,
-					awayMode: config.awayMode,
+					awayMode: effectiveAwayMode(),
 					maxIterations: config.maxIterations,
 					checkpointCapChars: config.checkpointCapChars,
 					contextThreshold: contextThresholdFor(config, ctx)
@@ -3830,6 +3833,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (state?.enabled) {
+			if (awayOverride !== undefined) state = { ...state, awayMode: awayOverride };
 			try {
 				const current = Backlog.open(state.todoPath);
 				// Goal mode is done when the goal is done, not when the plan is
@@ -3908,14 +3912,14 @@ export default function (pi: ExtensionAPI) {
 		// extension code, and the context is cut before the first post-reload
 		// request, so the reload never re-sends the finished iteration's long
 		// context.
-		if (state?.enabled && state.cycleQueued && !state.cycleCheckpointing) {
+		if (state?.enabled && !state.paused && !state.blocked && state.cycleQueued && !state.cycleCheckpointing) {
 			startFreshIteration(ctx);
 		}
 		// The progress-recording turn was interrupted before it ran (the
 		// session quit or crashed mid-cycle — e.g. right after a loop-escape
 		// enforcement abort): re-run it so the queued cycle completes instead
 		// of sitting dead with a checkpoint pending.
-		if (state?.enabled && state.cycleQueued && state.cycleCheckpointing) {
+		if (state?.enabled && !state.paused && !state.blocked && state.cycleQueued && state.cycleCheckpointing) {
 			sendRecordingPrompt(ctx);
 		}
 		updateStatus(ctx);
@@ -4006,8 +4010,8 @@ export default function (pi: ExtensionAPI) {
 	// (same-model signature replay), so the confabulation re-appears in every
 	// later request and reinforces itself. A system-prompt guardrail sits at the
 	// top of every request for the whole run, which a one-off correction steer
-	// cannot be. The text is stable while the loop runs, so the prompt cache
-	// prefix only changes at loop start/stop.
+	// cannot be. Keep the prefix stable unless the loop starts/stops or the
+	// user explicitly changes the session's Away mode.
 	pi.on('before_agent_start', (event) => {
 		if (!state?.enabled) return;
 		return {
@@ -4022,7 +4026,8 @@ export default function (pi: ExtensionAPI) {
 				'Continue the current task from the tool results. ' +
 				'A human question during the loop is not an iteration boundary: answer it, apply any new direction, ' +
 				'then resume the ongoing work in the same context. Do not finish up merely because you answered. ' +
-				'Honor a user request to stop or pause, and use ralph_request_decision if work needs a user decision.'
+				'Honor a user request to stop or pause, and use ralph_request_decision if work needs a user decision.' +
+				(awayOverride === undefined ? '' : `\n\nThe user set Away mode ${awayOverride ? 'on' : 'off'} for this session. Follow this current decision guidance over earlier iteration prompts:\n${renderPrompt('decision-note', { awayMode: awayOverride })}`)
 		};
 	});
 
@@ -4071,6 +4076,7 @@ export default function (pi: ExtensionAPI) {
 			if (
 				finishUpWorkCallsLeft !== undefined &&
 				state?.enabled &&
+				!state.paused &&
 				state.cycleQueued &&
 				state.cycleCheckpointing &&
 				!runSignal?.aborted
@@ -4135,7 +4141,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!event || !LOOP_POLICE_REASONING_EVENTS.has(event)) return;
 		if (state?.enabled) {
-			if (state.cycleQueued || state.stopRequested) return;
+			if (state.cycleQueued || state.stopRequested || state.paused || state.blocked) return;
 			const ctx = lastCtx;
 			if (loopEscapePending && ctx) {
 				// The previous intercept was ignored and the model is looping
@@ -4223,6 +4229,34 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
+	// Shared by /ralph resume and ordinary input to the paused loop. A pending
+	// cycle resumes its recording/cut rather than silently skipping that work.
+	const resumePausedLoop = (ctx: ExtensionContext, note?: string): string | undefined => {
+		if (!state?.enabled || !state.paused || state.blocked) return;
+		persistState({ ...state, paused: false });
+		updateStatus(ctx);
+		if (deferredFreshIteration) {
+			const finish = deferredFreshIteration;
+			deferredFreshIteration = undefined;
+			finish(note);
+			return;
+		}
+		if (state.cycleQueued) {
+			if (!state.cycleCheckpointing) {
+				startFreshIteration(ctx, note);
+				return;
+			}
+			finishUpWorkCallsLeft = config.finishUpWorkToolLimit;
+			finishUpWorkCallsAtStart = runWorkToolCallCount;
+			finishUpReminded = false;
+			const prompt = recordingPromptFor(state);
+			return note ? `${prompt}\n\n${renderPrompt('recording-extra-info', { extraInfo: note })}` : prompt;
+		}
+		return note
+			? resumeWithExtraInfoPrompt(note)
+			: `${automatedPrefix()}The user resumed Ralph. Continue the current iteration from where it paused.`;
+	};
+
 	pi.on('input', (event, ctx) => {
 		if (!state?.enabled || event.source === 'extension') return;
 
@@ -4244,26 +4278,8 @@ export default function (pi: ExtensionAPI) {
 		// for the loop, not a side conversation. Extension commands (e.g.
 		// /ralph stop) never reach this handler.
 		if (state.paused) {
-			persistState({ ...state, paused: false });
-			updateStatus(ctx);
-			if (state.cycleQueued && state.cycleCheckpointing) {
-				// The progress-recording turn was interrupted: re-run it, carrying
-				// the user's extra info into the recorded state.
-				// The watchdog re-opens with the re-sent prompt.
-				finishUpWorkCallsLeft = config.finishUpWorkToolLimit;
-				finishUpWorkCallsAtStart = runWorkToolCallCount;
-				finishUpReminded = false;
-				return {
-					action: 'transform',
-							text: `${recordingPromptFor(state)}\n\n${renderPrompt('recording-extra-info', { extraInfo: event.text })}`
-				};
-			}
-			// No cycle was pending: continue the interrupted iteration with
-			// the user's extra info.
-			return {
-				action: 'transform',
-				text: resumeWithExtraInfoPrompt(event.text)
-			};
+			const text = resumePausedLoop(ctx, event.text);
+			return text === undefined ? { action: 'handled' } : { action: 'transform', text };
 		}
 		if (!state.cycleQueued && !state.stopRequested) humanInputSinceSettle = true;
 	});
@@ -4300,7 +4316,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		// A paused loop stays paused: settles must not queue cycles or fresh
 		// iterations (a typed message resumes the loop before its turn runs).
-		if (state.paused) return;
+		if (state.paused) {
+			if (state.stopRequested) stopLoop(ctx, 'Ralph loop stopped');
+			return;
+		}
 		if (userAborted) {
 			if (loopPoliceAbort) {
 				// loop-police truncated a looping stream and aborted the run
@@ -4951,7 +4970,7 @@ export default function (pi: ExtensionAPI) {
 							persistState({
 								...state,
 								cycleOn,
-								awayMode: next.awayMode,
+								awayMode: effectiveAwayMode(),
 								maxIterations: next.maxIterations,
 								contextThreshold: contextThresholdFor(next, ctx)
 							});
@@ -5176,34 +5195,126 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand('ralph', {
-		description: 'Ralph home and loop control: /ralph [file] opens the home view (TUI); subcommands: [start|new|import|set-goal|approve|stop|reload|status|config]',
+		description: `Ralph home and loop control: ${RALPH_COMMAND_SUMMARY}. Bare /ralph opens Ralph Home.`,
 		getArgumentCompletions: (prefix): AutocompleteItem[] | null => {
-			const options: AutocompleteItem[] = [
-				{
-					value: 'start',
-					label: 'start',
-					description: 'Runs on the session\'s ralph file (created when missing). Scope the backlog with --category <name>; start the goal loop with --goal (the backlog needs a goal) or pi --ralph-goal <goal-text | goal-file.md> at session start (pi --ralph-max-context <percent> and pi --ralph-cycle <task|budget> override its context threshold and cycle mode). Markdown TODOs must be imported first: /ralph import TODO.md.'
-				},
-				{ value: 'new', label: 'new', description: 'Start a new pi session with a clone of this session\'s ralph backlog (goal + open tasks; --all takes every task): /ralph new [--all]. Only the backlog data moves; start the loop in the new session with /ralph start. For an ACTIVE loop, prefer /ralph rollover — it also carries the loop state and keeps running.' },
-				{ value: 'rollover', label: 'rollover', description: 'Move the active loop to a new pi session without losing ralph state: the backlog is copied (old file recorded as a source), the loop state (iteration count against maxIterations, category, pending decision) is carried with a lineage note, and the fresh iteration starts in the new session. No argument schedules it for the end of the current iteration; --now rolls over immediately (idle only); --cancel unschedules. The automatic trigger (auto session rollover in /ralph config) does the same at a cycle boundary.' },
-				{ value: 'import', label: 'import', description: 'Import a backlog into the session\'s ralph file: a Markdown TODO (/ralph import <file.md> [--category name] [--force]) or a ralph-format source (a session id or .db/.ralph file) with --all (every task) or --goal (the goal only). Merges into an existing backlog; each source is imported once.' },
-				{ value: 'set-goal', label: 'set-goal', description: 'Set the backlog goal from a file: /ralph set-goal <goal.md>. The file\u2019s content is the goal (a leading H1 heading marker is stripped). Targets the active loop\u2019s backlog or the session\'s ralph file. Replaces an open goal; a claimed or done goal must be resolved first.' },
-				{ value: 'approve', label: 'approve', description: 'Accept the claimed goal and its verification evidence. Only the user can approve a goal.' },
-				{ value: 'stop', label: 'stop', description: 'Stop after the current iteration. --force stops immediately, aborting the current run and skipping the cycle/finish-up boundary.' },
-				{ value: 'reload', label: 'reload', description: 'Reload extensions, skills, prompts, themes, and context files (the same flow as /reload). The Ralph loop state is restored from the session; a pending model-requested cycle continues on the reloaded code.' },
-				{ value: 'status', label: 'status', description: 'Show the Ralph loop state.' },
-				{ value: 'config', label: 'config', description: 'Configure Ralph settings (fresh-context threshold, max iterations, compaction, away mode, auto mode, cycle policy). The "Save to" row switches the scope: this directory (branch) or the global defaults (the general settings for directories without their own setting).' }
-			];
-			const matches = options.filter((option) => option.value.startsWith(prefix.toLowerCase()));
+			const matches = RALPH_COMMANDS
+				.filter(({ value }) => value.startsWith(prefix.toLowerCase()))
+				.map(({ value, usage, description }) => ({ value, label: value, description: `${usage} — ${description}` }));
 			return matches.length > 0 ? matches : null;
 		},
 		handler: async (args, ctx) => {
-			const commandArgs = parseCommandArguments(args.trim());
+			// Notes and reasons are free text, not shell-like arguments. Preserve
+			// quotes and line breaks when forwarding the human's direction.
+			const freeText = /^(resume|reject)(?:\s+([\s\S]*))?$/i.exec(args.trim());
+			const commandArgs = freeText ? [freeText[1]!, freeText[2]?.trim() ?? ''] : parseCommandArguments(args.trim());
 			if (!commandArgs) {
-				ctx.ui.notify('Usage: /ralph start [--category name] [--goal] (quote values containing spaces)', 'warning');
+				ctx.ui.notify(`Usage: ${RALPH_COMMAND_SUMMARY} (quote paths containing spaces)`, 'warning');
 				return;
 			}
 			const command = commandArgs[0]?.toLowerCase() ?? '';
+			if (command === 'away') {
+				const value = commandArgs[1]?.toLowerCase();
+				if (commandArgs.length > 2 || (value !== undefined && value !== 'on' && value !== 'off')) {
+					ctx.ui.notify('Usage: /ralph away [on | off]', 'warning');
+					return;
+				}
+				awayOverride = value === undefined ? !effectiveAwayMode() : value === 'on';
+				pi.appendEntry(AWAY_OVERRIDE_TYPE, awayOverride);
+				if (state?.enabled) persistState({ ...state, awayMode: awayOverride });
+				updateStatus(ctx);
+				ctx.ui.notify(`Away mode ${awayOverride ? 'on' : 'off'} for this session.`, 'info');
+				return;
+			}
+			if (command === 'pause') {
+				if (commandArgs.length !== 1) {
+					ctx.ui.notify('Usage: /ralph pause', 'warning');
+				} else if (!state?.enabled) {
+					ctx.ui.notify('No active Ralph loop to pause.', 'info');
+				} else if (state.blocked) {
+					ctx.ui.notify('Ralph is already waiting for you. See /ralph review.', 'info');
+				} else if (state.paused || state.stopRequested) {
+					ctx.ui.notify(state.paused ? 'Ralph is already paused.' : 'Ralph is already stopping.', 'info');
+				} else {
+					pauseLoop(ctx, ctx.isIdle()
+						? 'Ralph paused. Use /ralph resume to continue.'
+						: 'Ralph will pause after the current turn. Use /ralph resume to continue.');
+				}
+				return;
+			}
+			if (command === 'resume') {
+				if (state?.enabled && state.blocked) {
+					ctx.ui.notify('Ralph is waiting for your input. See /ralph review; resume does not clear it.', 'info');
+				} else if (!state?.enabled || !state.paused) {
+					ctx.ui.notify('No paused Ralph loop to resume.', 'info');
+				} else if (!ctx.isIdle()) {
+					ctx.ui.notify('Wait for the current turn to finish, then use /ralph resume.', 'info');
+				} else {
+					const prompt = resumePausedLoop(ctx, commandArgs[1] || undefined);
+					if (prompt !== undefined) pi.sendUserMessage(prompt);
+				}
+				return;
+			}
+			if (command === 'review' || command === 'next') {
+				if (commandArgs.length !== 1) {
+					ctx.ui.notify(`Usage: /ralph ${command}`, 'warning');
+					return;
+				}
+				if (command === 'review' && state?.enabled && state.blocked && (state.mode !== 'goal' || goalState !== 'claimed')) {
+					ctx.ui.notify(`Ralph is waiting for your decision:\n\n${state.blockedItem ?? 'No question was recorded.'}`, 'info');
+					return;
+				}
+				const sessionPath = autoTodoPath(ctx);
+				const active = state?.enabled ? state : undefined;
+				const todoPath = active?.todoPath ?? sessionPath;
+				try {
+					const backlog = Backlog.open(todoPath, { readOnly: true });
+					const goal = backlog.goal();
+					const result = command === 'next'
+						? nextTaskPreview(backlog, todoPath === sessionPath, countCategory(active))
+						: goal?.status === 'claimed'
+							? `${formatGoal(goal)}\n\nUse /ralph approve or /ralph reject <reason>.`
+							: 'Nothing is waiting for your review.';
+					ctx.ui.notify(result, 'info');
+				} catch (error) {
+					if (isMissingFileError(error)) {
+						ctx.ui.notify(command === 'next' ? 'No Ralph backlog yet.' : 'Nothing is waiting for your review.', 'info');
+					} else {
+						ctx.ui.notify(`Could not read the Ralph backlog: ${error instanceof Error ? error.message : String(error)}`, 'warning');
+					}
+				}
+				return;
+			}
+			if (command === 'reject') {
+				const reason = commandArgs[1];
+				if (!reason || !ctx.isIdle()) {
+					ctx.ui.notify('Use /ralph reject <reason> after the current turn has finished.', 'warning');
+					return;
+				}
+				if (state?.enabled && state.mode !== 'goal') {
+					ctx.ui.notify('Stop the current Ralph loop before rejecting a goal.', 'warning');
+					return;
+				}
+				const active = state?.enabled ? state : undefined;
+				const todoPath = active?.todoPath ?? autoTodoPath(ctx);
+				try {
+					await withBacklogLock(todoPath, async () => {
+						const backlog = await loadTargetBacklog(todoPath, '/ralph reject');
+						if (backlog.goal()?.status !== 'claimed') throw new Error('there is no claimed goal to reject');
+						backlog.withdrawGoal(reason);
+						backlog.save(todoPath);
+						if (state?.enabled && state.mode === 'goal' && state.todoPath === todoPath) {
+							refreshCounts(backlog, countCategory(state));
+							persistState({ ...state, blocked: false, blockedItem: undefined, paused: false });
+							updateStatus(ctx);
+							pi.sendUserMessage(`${automatedPrefix()}The user rejected the goal claim. Continue working on what is missing:\n\n${reason}`);
+						}
+					});
+					if (!active) await startLoop(ctx, { goal: true, category: state?.mode === 'goal' ? state.category : undefined });
+				} catch (error) {
+					ctx.ui.notify(`Could not reject the Ralph goal: ${error instanceof Error ? error.message : String(error)}`, 'warning');
+				}
+				return;
+			}
 			if (command === 'approve') {
 				if (commandArgs.length !== 1 || !ctx.isIdle()) {
 					ctx.ui.notify('Use /ralph approve with no arguments after the current turn has finished.', 'warning');
@@ -5259,7 +5370,7 @@ export default function (pi: ExtensionAPI) {
 				// turn settles, so Pi can report idle despite Ralph having a continuation
 				// pending. Treat that queued cycle as part of the current iteration and
 				// stop at the next agent_settled event.
-				if (ctx.isIdle() && !state.cycleQueued) {
+				if (ctx.isIdle() && (!state.cycleQueued || state.paused || state.blocked)) {
 					stopLoop(ctx, 'Ralph loop stopped');
 				} else {
 					persistState({ ...state, stopRequested: true });
@@ -5287,7 +5398,7 @@ export default function (pi: ExtensionAPI) {
 					: state.blocked
 						? `${loopName} is awaiting your decision: ${state.blockedItem ?? 'no question was recorded'}`
 						: state.paused
-							? `${loopName} is paused — type a message to resume it with extra info`
+							? `${loopName} is paused — /ralph resume or type a message to continue`
 						: state.cycleCheckpointing
 							? state.cycleReason === 'completed-task'
 								? `${loopName} is recording the completed task’s progress`
@@ -5311,12 +5422,11 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const knownCommands = ['start', 'new', 'rollover', 'import', 'set-goal', 'stop', 'status', 'config', 'reload'];
-			if (command !== '' && !knownCommands.includes(command)) {
+			if (command !== '' && !RALPH_COMMANDS.some(({ value }) => value === command)) {
 				// The first non-subcommand argument is a backlog file for the home view.
 				if (ctx.mode !== 'tui') {
 					ctx.ui.notify(
-						`Unknown subcommand "${commandArgs[0]}" — usage: /ralph [start|new|import|set-goal|stop|status|config|reload]`,
+						`Unknown subcommand "${commandArgs[0]}" — usage: ${RALPH_COMMAND_SUMMARY}`,
 						'error'
 					);
 					return;
@@ -5326,7 +5436,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === '') {
 				if (ctx.mode !== 'tui') {
-					ctx.ui.notify('Usage: /ralph [start|new|import|set-goal|stop|status|config|reload] (in TUI: bare /ralph opens the home view)', 'warning');
+					ctx.ui.notify(`Usage: ${RALPH_COMMAND_SUMMARY} (in TUI: bare /ralph opens Ralph Home)`, 'warning');
 					return;
 				}
 				await openHome(ctx);
