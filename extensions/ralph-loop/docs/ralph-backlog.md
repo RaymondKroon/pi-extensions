@@ -152,7 +152,10 @@ Enable **Away mode** in `/ralph config` to have Ralph infer intent from the
 existing instructions and project evidence, and keep going on reversible
 assumptions. Genuine blockers still pause normally. Ralph gives an incomplete
 request one chance to reconsider before pausing: use `Checked:`, `Recommendation:`,
-and `Risk:` lines in the request's context. This does not change goal approval.
+`Blocked:`, and `Risk:` lines in the request's context. Name the exact next step
+that needs the user and why the recommendation or current behavior is not a
+reasonable way forward. A tradeoff by itself is not a blocker; report it without
+creating a separate decision record for routine choices. Goal approval is unchanged.
 Legacy `autoApproveDecisions` settings migrate to `awayMode` without retaining
 any auto-approval behavior.
 

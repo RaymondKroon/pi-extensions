@@ -2350,7 +2350,7 @@ export default function (pi: ExtensionAPI) {
 			if (state.mode === 'goal' && goalState === 'claimed') {
 				throw new Error('The claimed goal is already awaiting user review. Only the user can run /ralph approve.');
 			}
-			const hasRationale = ['Checked', 'Recommendation', 'Risk'].every((label) =>
+			const hasRationale = ['Checked', 'Recommendation', 'Blocked', 'Risk'].every((label) =>
 				new RegExp(`^${label}:[ \\t]*\\S[^\\r\\n]*`, 'im').test(detail ?? '')
 			);
 			if (state.awayMode && !state.blocked && !awayDecisionNudged && !hasRationale) {
@@ -2358,7 +2358,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{
 						type: 'text',
-						text: 'Away mode: Ralph has not paused or asked the user. Reread the user’s instructions and check the relevant project evidence. Use a reasonable reversible assumption if possible. If you still cannot proceed, call this tool again with one precise question and three context lines: Checked: what you checked; Recommendation: what you would choose; Risk: what could go wrong without an answer.'
+						text: 'Away mode: Ralph has not paused or asked the user. If your recommendation is reasonably safe, reversible, and within the user’s instructions and permissions, take it. You can also keep existing behavior and report the tradeoff. If you still cannot proceed, call this tool again with one precise question and four context lines: Checked: what you checked; Recommendation: your best candidate; Blocked: the specific next step you cannot take; Risk: why your recommendation or the status quo is unsafe, hard to reverse, or outside your authority.'
 					}],
 					details: { reconsider: true }
 				};

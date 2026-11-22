@@ -3331,7 +3331,7 @@ describe('ralph-loop extension (Away mode)', () => {
 		expect(normal.fake.userMessages.at(-1)?.text).not.toContain('Away mode is on');
 		expect((await normal.ask()).terminate).toBe(true);
 		const away = await start(true);
-		expect(away.fake.userMessages.at(-1)?.text).toContain('For a low-cost, reversible choice');
+		expect(away.fake.userMessages.at(-1)?.text).toContain('A measured downside or an invitation to ask for input is not itself a blocker');
 		expect(away.tool.description).toBe(normal.tool.description);
 		expect(away.fake.activeTools).toEqual(normal.fake.activeTools);
 	});
@@ -3352,9 +3352,27 @@ describe('ralph-loop extension (Away mode)', () => {
 		expect((await ask()).terminate).toBeUndefined();
 	});
 
+	test('a benchmark tradeoff without a blocked next step does not pause on the first request', async () => {
+		const { ask, fakeCtx } = await start(true);
+		const result = await ask([
+			'Checked: benchmarks found both a correct handle and a wrong-label regression.',
+			'Recommendation: retain existing opt-in pointer casing and report the tradeoff.',
+			'Risk: a misleading label can alter a correctly capitalized name.'
+		].join('\n'));
+		expect(result.terminate).toBeUndefined();
+		expect(result.content[0]!.text).toContain('keep existing behavior and report the tradeoff');
+		expect(result.content[0]!.text).toContain('Blocked: the specific next step');
+		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
+	});
+
 	test('a genuine blocker with context pauses immediately and can be resolved', async () => {
 		const { ask, fake, fakeCtx } = await start(true);
-		const result = await ask('Checked: tests and public docs.\nRecommendation: keep the old API.\nRisk: breaking callers requires authorization.');
+		const result = await ask([
+			'Checked: tests and public docs; the existing endpoint cannot meet the requirement.',
+			'Recommendation: add a narrowly scoped API instead of changing the endpoint in place.',
+			'Blocked: cannot expose the new data to external callers without owner authorization.',
+			'Risk: the existing endpoint cannot provide the required data, and the new exposure is not yet authorized.'
+		].join('\n'));
 		expect(result.terminate).toBe(true);
 		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
 		const reply = await fake.fire('input', fakeCtx.ctx, { source: 'interactive', text: 'Keep the old API.' });
