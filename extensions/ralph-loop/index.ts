@@ -2354,7 +2354,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'ralph_request_decision',
 		label: 'Request Ralph decision',
-		description: 'Pause the active Ralph loop with one precise decision question and evidence/options. Do Not Disturb rejects all requests without pausing; defer work that needs the user’s decision instead of guessing.',
+		description: 'Pause the active Ralph loop with one precise decision question and evidence/options. Do Not Disturb rejects new requests without pausing; investigate, choose an authorized path, and keep working on the current task.',
 		parameters: Type.Object({
 			question: Type.String({ description: 'The decision the user must make.' }),
 			context: Type.Optional(Type.String({ description: 'Evidence, constraints, and options.' }))
@@ -2365,7 +2365,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{
 						type: 'text',
-						text: 'Do Not Disturb: decision request rejected. No question was sent and Ralph’s pause state is unchanged. Do not retry or ask in chat. Leave work that needs the user’s decision open, record the blocker, and continue any independent authorized work.'
+						text: 'Do Not Disturb: decision request rejected. No question was sent and Ralph’s pause state is unchanged. Do not retry or ask in chat. Figure it out yourself: use the available evidence, choose a reasonable authorized approach, and verify it. Try another way to meet the same goal before treating the task as blocked.'
 					}],
 					details: { rejected: true }
 				};
@@ -4846,7 +4846,7 @@ export default function (pi: ExtensionAPI) {
 			{
 				id: 'dndMode',
 				label: 'Do Not Disturb',
-				description: 'Reject all new work decision requests without pausing. Leave blocked work open and continue what is authorized. Goal approval is unchanged.',
+				description: 'Make work decisions independently and keep working on the current task. New decision requests are rejected without pausing. Goal approval is unchanged.',
 				currentValue: config.dndMode ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
 			},

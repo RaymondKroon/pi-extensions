@@ -3488,7 +3488,7 @@ describe('ralph-loop extension (Do Not Disturb)', () => {
 		expect(normal.fake.userMessages.at(-1)?.text).not.toContain('Do Not Disturb is on');
 		expect((await normal.ask()).terminate).toBe(true);
 		const dnd = await start(true);
-		expect(dnd.fake.userMessages.at(-1)?.text).toContain('Ralph rejects every work decision request without pausing');
+		expect(dnd.fake.userMessages.at(-1)?.text).toContain('Figure it out yourself and keep working on the current task');
 		const prompt = await dnd.fake.fire('before_agent_start', dnd.fakeCtx.ctx, { systemPrompt: 'Base' });
 		expect(prompt).toMatchObject({ systemPrompt: expect.stringContaining('Do not call ralph_request_decision') });
 		expect(dnd.tool.description).toBe(normal.tool.description);
@@ -3509,6 +3509,7 @@ describe('ralph-loop extension (Do Not Disturb)', () => {
 			const result = await ask(context);
 			expect(result.terminate).toBeUndefined();
 			expect(result.content[0]!.text).toContain('Do Not Disturb: decision request rejected');
+			expect(result.content[0]!.text).toContain('choose a reasonable authorized approach, and verify it');
 			expect(result).toMatchObject({ details: { rejected: true } });
 		}
 		expect(fake.entries).toHaveLength(stateCount);

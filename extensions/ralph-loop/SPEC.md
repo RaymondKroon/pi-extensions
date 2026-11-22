@@ -152,9 +152,10 @@ Ralph decision workflow.
   The user can accept the claim with `/ralph approve` or reply with what is
   missing so the model can call `ralph_goal withdraw`. No model tool can approve.
 - Do Not Disturb rejects every new work decision request without pausing the
-  loop or replacing an existing pending decision. Leave work that needs the
-  user’s decision open, record the blocker, and continue independent
-  authorized work. Goal approval is unchanged.
+  loop or replacing an existing pending decision. Ralph uses the available
+  evidence to choose and verify an authorized approach to the current task
+  instead of deferring it. It looks for alternatives before reporting a
+  blocker. Goal approval is unchanged.
 - No secrets or credentials may appear in goal evidence, checkpoints, or
   completion log entries.
 

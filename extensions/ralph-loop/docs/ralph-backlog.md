@@ -165,12 +165,13 @@ command list. Press `Esc` to return to Home.
 
 ## Do Not Disturb
 
-Enable **Do Not Disturb** in `/ralph config` to reject every new work decision
-request without asking you or pausing the loop. Ralph leaves work that needs
-your decision open, records the blocker, and continues any independent work
-it is authorized to do. Rejection does not authorize the proposed change.
-Existing pending decisions and goal approval are unchanged. To allow new
-decision requests again for this session, run `/ralph dnd off`.
+Enable **Do Not Disturb** in `/ralph config` to have Ralph make work decisions
+without asking you or pausing the loop. Ralph checks project evidence,
+chooses and verifies a reasonable approach, and keeps working on the current
+task. If the first approach is unavailable, it looks for alternatives before
+reporting a blocker. This does not grant new permissions. Existing pending
+decisions and goal approval are unchanged. To allow new decision requests
+again for this session, run `/ralph dnd off`.
 Legacy `autoApproveDecisions` settings migrate to `dndMode` without retaining
 any auto-approval behavior.
 

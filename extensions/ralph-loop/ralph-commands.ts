@@ -9,7 +9,7 @@ export const RALPH_COMMANDS = [
 	{ value: 'reject', usage: 'reject <reason>', description: 'Reopen the claimed goal with your feedback and continue working.' },
 	{ value: 'review', usage: 'review', description: 'Show the pending decision or the claimed goal and its evidence.' },
 	{ value: 'next', usage: 'next', description: 'Preview the next open task and its checkpoint.' },
-	{ value: 'dnd', usage: 'dnd [on | off]', description: 'Toggle or set Do Not Disturb for this session only. Work decision requests are rejected; goal review still pauses.' },
+	{ value: 'dnd', usage: 'dnd [on | off]', description: 'Toggle or set Do Not Disturb for this session only. Ralph makes work decisions independently; goal review still pauses.' },
 	{ value: 'pause', usage: 'pause', description: 'Pause the loop after the current turn without stopping it.' },
 	{ value: 'resume', usage: 'resume [note]', description: 'Resume the paused loop and optionally give it direction.' },
 	{ value: 'stop', usage: 'stop [--force]', description: 'Stop after the current iteration, or abort immediately with --force.' },
