@@ -478,7 +478,7 @@ beforeEach(async () => {
 	await mkdir(join(dir, '.pi'), { recursive: true });
 	await writeFile(
 		join(dir, '.pi', 'ralph-loop.json'),
-		`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10 }, null, '\t')}\n`
+		`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10 }, null, '\t')}\n`
 	);
 });
 
@@ -531,7 +531,7 @@ describe('ralph-loop extension', () => {
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, cycleOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, cycleOn: { tasks: 'budget', goal: 'task', auto: 'budget' } }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -544,7 +544,7 @@ describe('ralph-loop extension', () => {
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on', cycleOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, autoMode: 'on', cycleOn: { tasks: 'task', goal: 'task', auto: 'task' } }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -558,7 +558,7 @@ describe('ralph-loop extension', () => {
 		{
 			await writeFile(
 				join(dir, '.pi', 'ralph-loop.json'),
-				`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10 }, null, '\t')}\n`
+				`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10 }, null, '\t')}\n`
 			);
 			const fake = createFakePi();
 			extension(fake.pi as never);
@@ -648,7 +648,7 @@ describe('ralph-loop extension', () => {
 	test('loop-police reasoning-loop detection arms the auto loop and queues the escape cycle when no loop is active', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -680,7 +680,7 @@ describe('ralph-loop extension', () => {
 	test('loop-police detection does not re-arm the auto loop after an explicit stop', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1565,7 +1565,7 @@ D 3 2026-01-01T00:00:00Z
 	test('stops the loop when a context-limit cycle would exceed the maximum iterations', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 2 }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 2 }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -1593,7 +1593,7 @@ D 3 2026-01-01T00:00:00Z
 	test('stops the loop when a task completes at the maximum iterations', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 1 }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 1 }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -2207,7 +2207,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 				join(dir, '.pi', 'ralph-loop.json'),
 				`${JSON.stringify({
 					contextThresholds: {},
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10,
 					rollover: { enabled: true, maxMB: 50, maxMessages: 10 }
 				})}\n`
@@ -2338,7 +2338,7 @@ describe('ralph-loop extension (SQLite-backed ralph format)', () => {
 					taskIteration: 1,
 					maxIterations: 20,
 					contextThreshold: 0.8,
-					awayMode: false,
+					dndMode: false,
 					cycleQueued: false,
 					cycleCheckpointing: false,
 					stopRequested: false,
@@ -3293,7 +3293,7 @@ GB
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify({
 				contextThresholds: {},
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10,
 				rollover: { enabled: true, maxMB: 50, maxMessages: 3000 }
 			})}\n`
@@ -3309,6 +3309,13 @@ GB
 	});
 });
 
+type DecisionTool = {
+	description: string;
+	execute: (
+		id: string, params: Record<string, unknown>, signal: unknown, onUpdate: unknown, ctx: unknown
+	) => Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }>;
+};
+
 describe('ralph-loop extension (operator commands)', () => {
 	const CLAIMED = '# ralph v2\n\nG "Example goal" claimed\nGB\n  Ship the patch.\nGE "All checks passed."\n';
 
@@ -3320,12 +3327,12 @@ describe('ralph-loop extension (operator commands)', () => {
 		return { fake, fakeCtx, run: (args: string) => fake.commands.get('ralph')!.handler(args, fakeCtx.ctx) };
 	}
 
-	test('away changes only the session, persists through reload, and updates model guidance', async () => {
+	test('dnd changes only the session, persists through reload, and updates model guidance', async () => {
 		const { fake, fakeCtx, run } = await setup();
 		const dirConfig = join(dir, '.pi', 'ralph-loop.json');
 		const oldConfig = await readFile(dirConfig, 'utf8');
-		await run('away');
-		expect(statusLine(fakeCtx.widgets)).toContain('away');
+		await run('dnd');
+		expect(statusLine(fakeCtx.widgets)).toContain('dnd');
 		expect(fake.userMessages).toHaveLength(0);
 		expect(await readFile(dirConfig, 'utf8')).toBe(oldConfig);
 		expect(existsSync(join(agentDir, 'ralph', 'config.json'))).toBe(false);
@@ -3334,14 +3341,14 @@ describe('ralph-loop extension (operator commands)', () => {
 		fakeCtx.branchEntries.push(...fake.entries);
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'reload' });
 		await run('start');
-		expect(fake.userMessages.at(-1)?.text).toContain('Away mode is on');
-		await run('away invalid');
-		expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph away');
-		expect(statusLine(fakeCtx.widgets)).toContain('away');
-		await run('away off');
+		expect(fake.userMessages.at(-1)?.text).toContain('Do Not Disturb is on');
+		await run('dnd invalid');
+		expect(fakeCtx.notifications.at(-1)?.message).toContain('Usage: /ralph dnd');
+		expect(statusLine(fakeCtx.widgets)).toContain('dnd');
+		await run('dnd off');
 		const prompt = await fake.fire('before_agent_start', fakeCtx.ctx, { systemPrompt: 'Base' });
-		expect(prompt).toMatchObject({ systemPrompt: expect.stringContaining('The user set Away mode off for this session') });
-		expect(statusLine(fakeCtx.widgets)).not.toContain('away');
+		expect(prompt).toMatchObject({ systemPrompt: expect.stringContaining('The user set Do Not Disturb off for this session') });
+		expect(statusLine(fakeCtx.widgets)).not.toContain('dnd');
 		expect(fake.userMessages).toHaveLength(1);
 	});
 
@@ -3385,21 +3392,31 @@ describe('ralph-loop extension (operator commands)', () => {
 		expect(fake.userMessages.at(-1)?.text).toContain('Keep the existing implementation.');
 	});
 
-	test('review shows a normal pending decision; away and resume do not clear it', async () => {
+	test('Do Not Disturb preserves a pending decision and lets the user resolve it', async () => {
 		const { fake, fakeCtx, run } = await setup();
 		await writeFile(autoFile(), RALPH_V1);
 		await run('start');
-		const ask = fake.tools.get('ralph_request_decision') as GoalTool;
+		const ask = fake.tools.get('ralph_request_decision') as DecisionTool;
 		await ask.execute('t', { question: 'May the API change?', context: 'Clients still rely on it.' }, undefined, undefined, fakeCtx.ctx);
-		await run('away on');
+		await run('dnd on');
+		const followUp = await ask.execute('t', { question: 'What about a new API?' }, undefined, undefined, fakeCtx.ctx);
+		expect(followUp).toMatchObject({ details: { rejected: true } });
+		expect(followUp.terminate).toBeUndefined();
 		await run('resume ignore this');
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('does not clear it');
 		await run('review');
 		const review = fakeCtx.notifications.at(-1)?.message;
 		expect(review).toContain('May the API change?');
 		expect(review).toContain('Clients still rely on it.');
-		expect(statusLine(fakeCtx.widgets)).toContain('waiting (away');
+		expect(review).not.toContain('What about a new API?');
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting (dnd');
 		expect(fake.userMessages).toHaveLength(1);
+
+		const reply = await fake.fire('input', fakeCtx.ctx, { source: 'interactive', text: 'Keep the API.' });
+		expect(reply).toMatchObject({ action: 'transform', text: expect.stringContaining('leave the original decision pending') });
+		const resolve = fake.tools.get('ralph_resolve_decision') as DecisionTool;
+		await resolve.execute('t', { resolution: 'Keep the API.' }, undefined, undefined, fakeCtx.ctx);
+		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
 	});
 
 	test('review and reject a claimed goal without model interpretation', async () => {
@@ -3449,9 +3466,9 @@ describe('ralph-loop extension (operator commands)', () => {
 	});
 });
 
-describe('ralph-loop extension (Away mode)', () => {
-	async function start(awayMode: boolean) {
-		await writeFile(join(dir, '.pi', 'ralph-loop.json'), JSON.stringify({ contextThresholds: {}, awayMode }));
+describe('ralph-loop extension (Do Not Disturb)', () => {
+	async function start(dndMode: boolean) {
+		await writeFile(join(dir, '.pi', 'ralph-loop.json'), JSON.stringify({ contextThresholds: {}, dndMode }));
 		await writeFile(autoFile(), RALPH_V1);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -3459,67 +3476,53 @@ describe('ralph-loop extension (Away mode)', () => {
 		await fake.fire('session_start', fakeCtx.ctx, { reason: 'startup' });
 		await fake.commands.get('ralph')!.handler('start', fakeCtx.ctx);
 		await fake.fire('agent_start', fakeCtx.ctx);
-		const tool = fake.tools.get('ralph_request_decision') as GoalTool & { description: string };
+		const tool = fake.tools.get('ralph_request_decision') as DecisionTool;
 		return {
 			fake, fakeCtx, tool,
 			ask: (context?: string) => tool.execute('t', { question: 'May the API change?', context }, undefined, undefined, fakeCtx.ctx)
 		};
 	}
 
-	test('raises the bar before asking without changing the tool definition', async () => {
+	test('updates decision guidance without changing the tool definition or activation', async () => {
 		const normal = await start(false);
-		expect(normal.fake.userMessages.at(-1)?.text).not.toContain('Away mode is on');
+		expect(normal.fake.userMessages.at(-1)?.text).not.toContain('Do Not Disturb is on');
 		expect((await normal.ask()).terminate).toBe(true);
-		const away = await start(true);
-		expect(away.fake.userMessages.at(-1)?.text).toContain('A measured downside or an invitation to ask for input is not itself a blocker');
-		expect(away.tool.description).toBe(normal.tool.description);
-		expect(away.fake.activeTools).toEqual(normal.fake.activeTools);
+		const dnd = await start(true);
+		expect(dnd.fake.userMessages.at(-1)?.text).toContain('Ralph rejects every work decision request without pausing');
+		const prompt = await dnd.fake.fire('before_agent_start', dnd.fakeCtx.ctx, { systemPrompt: 'Base' });
+		expect(prompt).toMatchObject({ systemPrompt: expect.stringContaining('Do not call ralph_request_decision') });
+		expect(dnd.tool.description).toBe(normal.tool.description);
+		expect(dnd.fake.activeTools).toEqual(normal.fake.activeTools);
 	});
 
-	test('an incomplete request gets one nudge, then the model can still ask', async () => {
+	test('rejects repeated requests, including a fully documented blocker, without changing loop state', async () => {
 		const { ask, fake, fakeCtx } = await start(true);
-		const first = await ask('Checked: the API tests.');
-		expect(first.terminate).toBeUndefined();
-		expect(first.content[0]!.text).toContain('Ralph has not paused or asked the user');
-		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
-		expect(fake.userMessages).toHaveLength(1);
-
-		expect((await ask()).terminate).toBe(true);
-		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { resolution: 'Keep it compatible.' }, undefined, undefined, fakeCtx.ctx);
-		await fake.fire('agent_start', fakeCtx.ctx);
-		expect((await ask()).terminate).toBeUndefined();
-	});
-
-	test('a benchmark tradeoff without a blocked next step does not pause on the first request', async () => {
-		const { ask, fakeCtx } = await start(true);
-		const result = await ask([
-			'Checked: benchmarks found both a correct handle and a wrong-label regression.',
-			'Recommendation: retain existing opt-in pointer casing and report the tradeoff.',
-			'Risk: a misleading label can alter a correctly capitalized name.'
-		].join('\n'));
-		expect(result.terminate).toBeUndefined();
-		expect(result.content[0]!.text).toContain('keep existing behavior and report the tradeoff');
-		expect(result.content[0]!.text).toContain('Blocked: the specific next step');
-		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
-	});
-
-	test('a genuine blocker with context pauses immediately and can be resolved', async () => {
-		const { ask, fake, fakeCtx } = await start(true);
-		const result = await ask([
+		const stateCount = fake.entries.length;
+		const notificationCount = fakeCtx.notifications.length;
+		const rationale = [
 			'Checked: tests and public docs; the existing endpoint cannot meet the requirement.',
 			'Recommendation: add a narrowly scoped API instead of changing the endpoint in place.',
 			'Blocked: cannot expose the new data to external callers without owner authorization.',
 			'Risk: the existing endpoint cannot provide the required data, and the new exposure is not yet authorized.'
-		].join('\n'));
-		expect(result.terminate).toBe(true);
-		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
-		const reply = await fake.fire('input', fakeCtx.ctx, { source: 'interactive', text: 'Keep the old API.' });
-		expect(reply).toMatchObject({ action: 'transform', text: expect.stringContaining('Keep the old API.') });
-		const resolve = fake.tools.get('ralph_resolve_decision') as GoalTool;
-		await resolve.execute('t', { resolution: 'Keep the old API.' }, undefined, undefined, fakeCtx.ctx);
+		].join('\n');
+		for (const context of [rationale, undefined, rationale]) {
+			const result = await ask(context);
+			expect(result.terminate).toBeUndefined();
+			expect(result.content[0]!.text).toContain('Do Not Disturb: decision request rejected');
+			expect(result).toMatchObject({ details: { rejected: true } });
+		}
+		expect(fake.entries).toHaveLength(stateCount);
+		expect(fakeCtx.notifications).toHaveLength(notificationCount);
 		expect(fakeCtx.widgets.get('ralph-decision')).toBeUndefined();
+		expect(fake.userMessages).toHaveLength(1);
+	});
+
+	test('turning Do Not Disturb off restores normal decision requests', async () => {
+		const { ask, fake, fakeCtx } = await start(true);
+		expect(await ask()).toMatchObject({ details: { rejected: true } });
+		await fake.commands.get('ralph')!.handler('dnd off', fakeCtx.ctx);
+		expect((await ask()).terminate).toBe(true);
+		expect(fakeCtx.widgets.has('ralph-decision')).toBe(true);
 	});
 });
 
@@ -3926,7 +3929,7 @@ GE "All routes render."
 		expect(fakeCtx.notifications.at(-1)?.message).toContain('paused');
 	});
 
-	test('a legacy auto-approval config uses Away mode but cannot approve a goal', async () => {
+	test('a legacy auto-approval config uses Do Not Disturb and leaves goal approval to the user', async () => {
 		const fake = createFakePi();
 		extension(fake.pi as never);
 		const fakeCtx = createFakeCtx(dir);
@@ -3939,7 +3942,7 @@ GE "All routes render."
 		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
 		const run = (params: Record<string, unknown>) => goalTool(fake).execute('t', params, undefined, undefined, fakeCtx.ctx);
 
-		expect(fake.userMessages.at(-1)?.text).toContain('Away mode is on');
+		expect(fake.userMessages.at(-1)?.text).toContain('Do Not Disturb is on');
 		const result = await run({ action: 'complete', note: 'All criteria verified: bun test green.' });
 		expect(result.terminate).toBe(true);
 		expect(result.content[0]!.text).toContain('/ralph approve');
@@ -3949,7 +3952,10 @@ GE "All routes render."
 		const goal = readBacklog().goal()!;
 		expect(goal.status).toBe('claimed');
 		expect(goal.evidence).toBe('All criteria verified: bun test green.');
-		expect(statusLine(fakeCtx.widgets)).toContain('waiting (away');
+		expect(statusLine(fakeCtx.widgets)).toContain('waiting (dnd');
+
+		await fake.commands.get('ralph')!.handler('approve', fakeCtx.ctx);
+		expect(readBacklog().goal()?.status).toBe('done');
 	});
 
 	test('/ralph approve refuses an open goal', async () => {
@@ -4723,7 +4729,7 @@ describe('ralph-loop extension (/ralph home view)', () => {
 			'reject',
 			'review',
 			'next',
-			'away',
+			'dnd',
 			'pause',
 			'resume',
 			'stop',
@@ -5024,7 +5030,7 @@ describe('ralph-loop extension (cycle compaction and completion summaries)', () 
 		// Compaction mode defaults to on; state it explicitly for clarity.
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: true }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, compactionMode: true }, null, '\t')}\n`
 		);
 	});
 
@@ -5266,7 +5272,7 @@ describe('ralph-loop extension (cycle compaction and completion summaries)', () 
 	test('cycle: compaction mode disabled skips the compaction and sends the fresh iteration directly', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: false }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, compactionMode: false }, null, '\t')}\n`
 		);
 		const fake = createFakePi();
 		extension(fake.pi as never);
@@ -5537,7 +5543,7 @@ describe('ralph-loop extension (auto mode)', () => {
 		writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
 			`${JSON.stringify(
-				{ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: true, autoMode: 'on', ...extra },
+				{ contextThresholds: {}, dndMode: false, maxIterations: 10, compactionMode: true, autoMode: 'on', ...extra },
 				null,
 				'\t'
 			)}\n`
@@ -5965,7 +5971,7 @@ GB
 				taskIteration: 1,
 				maxIterations: 10,
 				contextThreshold: 0.5,
-				awayMode: false,
+				dndMode: false,
 				cycleQueued: false,
 				cycleCheckpointing: false,
 				stopRequested: false,
@@ -6652,7 +6658,7 @@ M list "Plan"
 	const writeConfig = (extra: Record<string, unknown> = {}) =>
 		writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, ...extra }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, ...extra }, null, '\t')}\n`
 		);
 
 	/** The per-mode cycle policy with one value for all modes. */
@@ -7368,7 +7374,7 @@ T 1 - "Roll out the flat configuration to every language"
 describe('ralph-loop extension (global config store)', () => {
 	const storePath = () => join(agentDir, 'ralph', 'config.json');
 	const fullConfig = (extra: Record<string, unknown> = {}) =>
-		({ contextThresholds: {}, awayMode: false, maxIterations: 10, compactionMode: true, autoMode: 'off', cycleOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
+		({ contextThresholds: {}, dndMode: false, maxIterations: 10, compactionMode: true, autoMode: 'off', cycleOn: { tasks: 'task', goal: 'task', auto: 'budget' }, ...extra });
 
 	const writeStore = (store: { defaults?: Record<string, unknown>; dirs?: Record<string, unknown> }) =>
 		writeFile(storePath(), `${JSON.stringify(store, null, '\t')}\n`);
@@ -7678,7 +7684,7 @@ describe('ralph-loop extension (global config store)', () => {
 		const view = await openConfigUi(fake, fakeCtx);
 		// Rows: Save to, Start fresh context at, Maximum iterations, Checkpoint
 		// note guideline, Compaction
-		// mode, Finish-up: work call limit, Away mode, Auto mode,
+		// mode, Finish-up: work call limit, Do Not Disturb, Auto mode,
 		// Cycle: task loop, Cycle: goal loop, Cycle: auto loop.
 		for (let i = 0; i < 8; i++) view.handleInput('\x1b[B');
 		view.handleInput('\r'); // active task policy task → budget
@@ -7933,7 +7939,7 @@ describe('ralph-loop extension (ralph_cycle tool)', () => {
 	test('arms the auto loop and cycles when auto mode is on and the session backlog has open tasks', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		await writeFile(autoFile(), '# ralph v2\n\nM list "General"\n\nT 1 General "Task one"\n');
 		const fake = createFakePi();
@@ -7961,7 +7967,7 @@ describe('ralph-loop extension (ralph_cycle tool)', () => {
 	test('arms the auto loop even when the session backlog has no open tasks: the note carries the reason', async () => {
 		await writeFile(
 			join(dir, '.pi', 'ralph-loop.json'),
-			`${JSON.stringify({ contextThresholds: {}, awayMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
+			`${JSON.stringify({ contextThresholds: {}, dndMode: false, maxIterations: 10, autoMode: 'on' }, null, '\t')}\n`
 		);
 		// No session backlog at all: the cycle note is what the fresh
 		// iteration moves on.

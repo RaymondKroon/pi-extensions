@@ -151,7 +151,7 @@ becomes the goal checkpoint.
 Open Ralph Home with bare `/ralph` and press `?` for the full, read-only
 command list. Press `Esc` to return to Home.
 
-- `/ralph away [on | off]` toggles Away mode with no argument, or sets it
+- `/ralph dnd [on | off]` toggles Do Not Disturb with no argument, or sets it
   explicitly for this session. It survives reload but doesn't change the
   defaults in `/ralph config` or clear a pending decision.
 - `/ralph pause` lets the current turn finish without starting another.
@@ -163,17 +163,15 @@ command list. Press `Esc` to return to Home.
 - `/ralph next` previews the next open task and checkpoint without starting
   the loop.
 
-## Away mode
+## Do Not Disturb
 
-Enable **Away mode** in `/ralph config` to have Ralph infer intent from the
-existing instructions and project evidence, and keep going on reversible
-assumptions. Genuine blockers still pause normally. Ralph gives an incomplete
-request one chance to reconsider before pausing: use `Checked:`, `Recommendation:`,
-`Blocked:`, and `Risk:` lines in the request's context. Name the exact next step
-that needs the user and why the recommendation or current behavior is not a
-reasonable way forward. A tradeoff by itself is not a blocker; report it without
-creating a separate decision record for routine choices. Goal approval is unchanged.
-Legacy `autoApproveDecisions` settings migrate to `awayMode` without retaining
+Enable **Do Not Disturb** in `/ralph config` to reject every new work decision
+request without asking you or pausing the loop. Ralph leaves work that needs
+your decision open, records the blocker, and continues any independent work
+it is authorized to do. Rejection does not authorize the proposed change.
+Existing pending decisions and goal approval are unchanged. To allow new
+decision requests again for this session, run `/ralph dnd off`.
+Legacy `autoApproveDecisions` settings migrate to `dndMode` without retaining
 any auto-approval behavior.
 
 ## Auto mode

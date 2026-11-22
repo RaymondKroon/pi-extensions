@@ -10,7 +10,7 @@ import { contextThresholdFor, contextUsageLabel, modelKeyOf, tuiStatusText } fro
 
 const CONFIG = {
 	autoMode: "on",
-	awayMode: false,
+	dndMode: false,
 	compactionMode: false,
 	cycleOn: { auto: "budget", tasks: "task", goal: "budget" },
 	contextThresholds: { __default__: 0.7 },
@@ -178,13 +178,13 @@ describe("tuiStatusText", () => {
 		).toBe("Ralph (goal): off");
 	});
 
-	test("modifiers: away and compaction", () => {
+	test("modifiers: dnd and compaction", () => {
 		expect(
 			tuiStatusText({
 				state: {
 					enabled: true,
 					mode: "auto",
-					awayMode: true,
+					dndMode: true,
 					iteration: 1,
 					maxIterations: 50,
 					cycleOn: "budget",
@@ -193,12 +193,12 @@ describe("tuiStatusText", () => {
 				config: { ...CONFIG, compactionMode: true },
 				contextPercent: 10,
 			}),
-		).toBe("Ralph (auto): on (away, compaction) · cycle: budget · iteration 1/50 · context: 10% / 70%");
+		).toBe("Ralph (auto): on (dnd, compaction) · cycle: budget · iteration 1/50 · context: 10% / 70%");
 	});
 
 	test("idle modifiers come from the config", () => {
-		expect(tuiStatusText({ state: null, config: { ...CONFIG, awayMode: true }, contextPercent: 10 })).toBe(
-			"Ralph: auto (away) · cycle: budget · context: 10% / 70%",
+		expect(tuiStatusText({ state: null, config: { ...CONFIG, dndMode: true }, contextPercent: 10 })).toBe(
+			"Ralph: auto (dnd) · cycle: budget · context: 10% / 70%",
 		);
 	});
 

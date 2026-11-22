@@ -56,11 +56,11 @@ export function contextUsageLabel(percent, threshold) {
  * @param {undefined | {enabled?: boolean, mode?: string, paused?: boolean, blocked?: boolean,
  *   cycleCheckpointing?: boolean, cycleReason?: string, stopRequested?: boolean, cycleQueued?: boolean,
  *   iteration?: number, maxIterations?: number, category?: string,
- *   awayMode?: boolean, autoApproveDecisions?: boolean, contextThreshold?: number, cycleOn?: string, baselinePhase?: string}} data.state
+ *   dndMode?: boolean, autoApproveDecisions?: boolean, contextThreshold?: number, cycleOn?: string, baselinePhase?: string}} data.state
  *   The persisted loop state (null when the session has no loop state). The
  *   server adds the derived baselinePhase (the goal phase at the iteration
  *   baseline) so this stays a pure function of the summary payload.
- * @param {undefined | {autoMode?: string, awayMode?: boolean, compactionMode?: boolean,
+ * @param {undefined | {autoMode?: string, dndMode?: boolean, compactionMode?: boolean,
  *   cycleOn?: {auto?: string, tasks?: string, goal?: string}, contextThresholds?: Record<string, number>}} data.config
  *   The resolved ralph config (null when none).
  * @param {string} [data.goalState] The backlog goal's status (open/claimed/done).
@@ -71,7 +71,7 @@ export function contextUsageLabel(percent, threshold) {
 export function tuiStatusText(data) {
 	const state = data.state;
 	const config = data.config;
-	const awayMode = state?.enabled ? (state.awayMode ?? state.autoApproveDecisions) : config?.awayMode;
+	const dndMode = state?.enabled ? (state.dndMode ?? state.autoApproveDecisions) : config?.dndMode;
 	const mode = state?.blocked
 		? "waiting"
 		: state?.paused
@@ -99,8 +99,8 @@ export function tuiStatusText(data) {
 	// Idle state word: the auto mode setting itself: "auto" is armed (the
 	// loop arms itself at the context budget), not off.
 	const idleState = label === "Ralph" ? (config?.autoMode === "on" ? "auto" : "off") : "off";
-	// Non-default modifiers, compact: (away) and/or (compaction).
-	const modifiers = [awayMode ? "away" : undefined, config?.compactionMode ? "compaction" : undefined]
+	// Non-default modifiers, compact: (dnd) and/or (compaction).
+	const modifiers = [dndMode ? "dnd" : undefined, config?.compactionMode ? "compaction" : undefined]
 		.filter((part) => part !== undefined)
 		.join(", ");
 	const modifierSuffix = modifiers ? ` (${modifiers})` : "";

@@ -44,7 +44,7 @@ import { RALPH_COMMANDS, RALPH_COMMAND_SUMMARY } from './ralph-commands.ts';
 
 const STATE_TYPE = 'ralph-loop-state';
 const CONFIG_TYPE = 'ralph-loop-config';
-const AWAY_OVERRIDE_TYPE = 'ralph-away-override';
+const DND_OVERRIDE_TYPE = 'ralph-dnd-override';
 const CONFIG_FILE_NAME = 'ralph-loop.json';
 /** The global config store file (in the ralph directory of pi's global agent directory): settings per directory and, for git repositories, per branch. */
 const GLOBAL_CONFIG_FILE_NAME = 'config.json';
@@ -89,7 +89,7 @@ const AUTO_TODO_DIR = 'ralph';
 const autoTodoPath = (ctx: ExtensionContext): string =>
 	join(getAgentDir(), AUTO_TODO_DIR, `${ctx.sessionManager.getSessionId()}.db`);
 const DEFAULT_CONTEXT_THRESHOLD = 0.5;
-const DEFAULT_AWAY_MODE = false;
+const DEFAULT_DND_MODE = false;
 const DEFAULT_MAX_ITERATIONS = 10;
 const DEFAULT_CHECKPOINT_CAP_CHARS = 600;
 /**
@@ -219,7 +219,7 @@ interface RalphConfig {
 	 * existing projects working until a model receives an explicit setting.
 	 */
 	contextThresholds: Record<string, number>;
-	awayMode: boolean;
+	dndMode: boolean;
 	maxIterations: number;
 	/**
 	 * Character guideline for checkpoint notes: over the cap, the checkpoint
@@ -260,7 +260,7 @@ interface RalphConfig {
 
 interface LegacyRalphConfig {
 	contextThreshold: number;
-	awayMode?: boolean;
+	dndMode?: boolean;
 	autoApproveDecisions?: boolean;
 	maxIterations?: number;
 }
@@ -321,7 +321,7 @@ function isCarriedSelection(value: unknown): value is CarriedSelection {
 interface RalphState {
 	/** The active model's threshold, retained for this Ralph session. */
 	contextThreshold: number;
-	awayMode: boolean;
+	dndMode: boolean;
 	enabled: boolean;
 	/** Loop policy: the finite task backlog, the single goal, or the auto loop. */
 	mode: 'tasks' | 'goal' | 'auto';
@@ -468,7 +468,7 @@ function isRalphState(value: unknown): value is RalphState {
 		(state.maxIterations === undefined || (typeof state.maxIterations === 'number' && state.maxIterations >= 1)) &&
 		(state.checkpointCapChars === undefined || isCheckpointCapChars(state.checkpointCapChars)) &&
 		typeof state.contextThreshold === 'number' &&
-		(state.awayMode === undefined || typeof state.awayMode === 'boolean') &&
+		(state.dndMode === undefined || typeof state.dndMode === 'boolean') &&
 		typeof cycleQueued === 'boolean' &&
 		(cycleReason === undefined ||
 			cycleReason === 'completed-task' ||
@@ -528,7 +528,7 @@ function normalizeState(state: RalphState): RalphState {
 		...rest,
 		mode,
 		cycleOn: state.cycleOn ?? legacyCycleOn ?? (mode === 'auto' ? 'budget' : 'task'),
-		awayMode: state.awayMode ?? (typeof legacyAutoApprove === 'boolean' ? legacyAutoApprove : DEFAULT_AWAY_MODE),
+		dndMode: state.dndMode ?? (typeof legacyAutoApprove === 'boolean' ? legacyAutoApprove : DEFAULT_DND_MODE),
 		iteration: state.iteration ?? 1,
 		taskIteration: state.taskIteration ?? 1,
 		maxIterations: state.maxIterations ?? DEFAULT_MAX_ITERATIONS,
@@ -580,7 +580,7 @@ function isRalphConfig(value: unknown): value is RalphConfig {
 		!!config.contextThresholds &&
 		typeof config.contextThresholds === 'object' &&
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
-		typeof config.awayMode === 'boolean' &&
+		typeof config.dndMode === 'boolean' &&
 		isMaxIterations(config.maxIterations) &&
 		isCheckpointCapChars(config.checkpointCapChars) &&
 		typeof config.compactionMode === 'boolean' &&
@@ -601,7 +601,7 @@ function isRalphConfigPartial(
 		!!config.contextThresholds &&
 		typeof config.contextThresholds === 'object' &&
 		Object.values(config.contextThresholds).every(isContextThreshold) &&
-		(config.awayMode === undefined || typeof config.awayMode === 'boolean') &&
+		(config.dndMode === undefined || typeof config.dndMode === 'boolean') &&
 		(config.autoApproveDecisions === undefined || typeof config.autoApproveDecisions === 'boolean') &&
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations)) &&
 		(config.checkpointCapChars === undefined || isCheckpointCapChars(config.checkpointCapChars)) &&
@@ -621,7 +621,7 @@ function isLegacyRalphConfig(value: unknown): value is LegacyRalphConfig {
 	const config = value as Partial<LegacyRalphConfig>;
 	return (
 		isContextThreshold(config.contextThreshold) &&
-		(config.awayMode === undefined || typeof config.awayMode === 'boolean') &&
+		(config.dndMode === undefined || typeof config.dndMode === 'boolean') &&
 		(config.autoApproveDecisions === undefined || typeof config.autoApproveDecisions === 'boolean') &&
 		(config.maxIterations === undefined || isMaxIterations(config.maxIterations))
 	);
@@ -633,7 +633,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 		const { rotateOn: legacyCycleOn, autoApproveDecisions: legacyAutoApprove, ...rest } = value;
 		return {
 			...rest,
-			awayMode: value.awayMode ?? legacyAutoApprove ?? DEFAULT_AWAY_MODE,
+			dndMode: value.dndMode ?? legacyAutoApprove ?? DEFAULT_DND_MODE,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			checkpointCapChars: value.checkpointCapChars ?? DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: value.compactionMode ?? DEFAULT_COMPACTION_MODE,
@@ -646,7 +646,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 	if (isLegacyRalphConfig(value)) {
 		return {
 			contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: value.contextThreshold },
-			awayMode: value.awayMode ?? value.autoApproveDecisions ?? DEFAULT_AWAY_MODE,
+			dndMode: value.dndMode ?? value.autoApproveDecisions ?? DEFAULT_DND_MODE,
 			maxIterations: value.maxIterations ?? DEFAULT_MAX_ITERATIONS,
 			checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 			compactionMode: DEFAULT_COMPACTION_MODE,
@@ -661,7 +661,7 @@ function normalizeConfig(value: unknown): RalphConfig | undefined {
 function defaultConfig(): RalphConfig {
 	return {
 		contextThresholds: {},
-		awayMode: DEFAULT_AWAY_MODE,
+		dndMode: DEFAULT_DND_MODE,
 		maxIterations: DEFAULT_MAX_ITERATIONS,
 		checkpointCapChars: DEFAULT_CHECKPOINT_CAP_CHARS,
 		compactionMode: DEFAULT_COMPACTION_MODE,
@@ -1142,7 +1142,7 @@ function iterationPromptBody(state: RalphState, reason?: CycleReason): string {
 		throw new Error('Ralph loop state has a non-ralph baseline; restart the loop on a ralph-format backlog.');
 	}
 	const isAuto = state.mode === 'auto';
-	const decisionNote = renderPrompt('decision-note', { awayMode: state.awayMode });
+	const decisionNote = renderPrompt('decision-note', { dndMode: state.dndMode });
 	const cycleNoteClause = state.cycleNote ? ` because: ${state.cycleNote}` : '';
 	const contextNote = isAuto
 		? renderPrompt('context-note-auto', {
@@ -1950,8 +1950,8 @@ async function importRalphBacklog(
 export default function (pi: ExtensionAPI) {
 	let state: RalphState | undefined;
 	let config = defaultConfig();
-	let awayOverride: boolean | undefined;
-	const effectiveAwayMode = () => awayOverride ?? config.awayMode;
+	let dndOverride: boolean | undefined;
+	const effectiveDndMode = () => dndOverride ?? config.dndMode;
 	// True while the current directory resolves its settings from the global
 	// store's defaults section (no directory entry, no legacy project file):
 	// editing the global defaults then applies to this session as well.
@@ -1996,9 +1996,6 @@ export default function (pi: ExtensionAPI) {
 	// iteration-ended cycle or a no-work stall. Keep this across agent_start:
 	// queued follow-ups can start another low-level run before the final settle.
 	let humanInputSinceSettle = false;
-	// At most one reconsideration nudge per run; a real blocker must still be
-	// reportable even if the model cannot produce the requested explanation.
-	let awayDecisionNudged = false;
 	// The ralph-provided compaction pending for the in-flight cycle:
 	// consumed by the session_before_compact handler when pi's compact() runs.
 	let pendingRalphCompaction: { summary: string; anchorId?: string } | undefined;
@@ -2190,7 +2187,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const updateStatus = (ctx: ExtensionContext) => {
-		const awayMode = state?.enabled ? state.awayMode : effectiveAwayMode();
+		const dndMode = state?.enabled ? state.dndMode : effectiveDndMode();
 		const mode = state?.blocked
 			? 'waiting'
 			: state?.paused
@@ -2225,8 +2222,8 @@ export default function (pi: ExtensionAPI) {
 		// loop arms itself at the context budget), not off — and distinct from
 		// "on", which means a loop is actually running.
 		const idleState = label === 'Ralph' ? (config.autoMode === 'on' ? 'auto' : 'off') : 'off';
-		// Non-default modifiers, compact: (away) and/or (compaction).
-		const modifiers = [awayMode ? 'away' : undefined, config.compactionMode ? 'compaction' : undefined]
+		// Non-default modifiers, compact: (dnd) and/or (compaction).
+		const modifiers = [dndMode ? 'dnd' : undefined, config.compactionMode ? 'compaction' : undefined]
 			.filter((part): part is string => part !== undefined)
 			.join(', ');
 		const modifierSuffix = modifiers ? ` (${modifiers})` : '';
@@ -2357,31 +2354,27 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'ralph_request_decision',
 		label: 'Request Ralph decision',
-		description: 'Pause the active Ralph loop with a decision question for the user. Use it instead of guessing whenever active Ralph work needs a user decision; include one precise question and the evidence/options.',
+		description: 'Pause the active Ralph loop with one precise decision question and evidence/options. Do Not Disturb rejects all requests without pausing; defer work that needs the user’s decision instead of guessing.',
 		parameters: Type.Object({
 			question: Type.String({ description: 'The decision the user must make.' }),
 			context: Type.Optional(Type.String({ description: 'Evidence, constraints, and options.' }))
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!state?.enabled) throw new Error('Ralph is not active.');
+			if (state.dndMode) {
+				return {
+					content: [{
+						type: 'text',
+						text: 'Do Not Disturb: decision request rejected. No question was sent and Ralph’s pause state is unchanged. Do not retry or ask in chat. Leave work that needs the user’s decision open, record the blocker, and continue any independent authorized work.'
+					}],
+					details: { rejected: true }
+				};
+			}
 			const question = params.question.trim();
 			if (!question) throw new Error('A decision question is required.');
 			const detail = params.context?.trim();
 			if (state.mode === 'goal' && goalState === 'claimed') {
 				throw new Error('The claimed goal is already awaiting user review. Only the user can run /ralph approve.');
-			}
-			const hasRationale = ['Checked', 'Recommendation', 'Blocked', 'Risk'].every((label) =>
-				new RegExp(`^${label}:[ \\t]*\\S[^\\r\\n]*`, 'im').test(detail ?? '')
-			);
-			if (state.awayMode && !state.blocked && !awayDecisionNudged && !hasRationale) {
-				awayDecisionNudged = true;
-				return {
-					content: [{
-						type: 'text',
-						text: 'Away mode: Ralph has not paused or asked the user. If your recommendation is reasonably safe, reversible, and within the user’s instructions and permissions, take it. You can also keep existing behavior and report the tradeoff. If you still cannot proceed, call this tool again with one precise question and four context lines: Checked: what you checked; Recommendation: your best candidate; Blocked: the specific next step you cannot take; Risk: why your recommendation or the status quo is unsafe, hard to reverse, or outside your authority.'
-					}],
-					details: { reconsider: true }
-				};
 			}
 			const pendingDecision = detail ? `${question}\nEvidence/options: ${detail}` : question;
 			blockLoop(ctx, pendingDecision);
@@ -2396,8 +2389,8 @@ export default function (pi: ExtensionAPI) {
 				return new Markdown('> Ralph is preparing the decision request…', 0, 0, getMarkdownTheme());
 			}
 
-			const details = result.details as { question?: unknown; context?: unknown; reconsider?: boolean } | undefined;
-			if (details?.reconsider) {
+			const details = result.details as { question?: unknown; context?: unknown; rejected?: boolean } | undefined;
+			if (details?.rejected) {
 				const message = result.content[0];
 				if (message?.type === 'text') return new Markdown(message.text, 0, 0, getMarkdownTheme());
 			}
@@ -3416,7 +3409,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
-				awayMode: effectiveAwayMode(),
+				dndMode: effectiveDndMode(),
 				cycleQueued: false,
 				cycleReason: undefined,
 				cycleCheckpointing: false,
@@ -3561,7 +3554,7 @@ export default function (pi: ExtensionAPI) {
 				maxIterations: config.maxIterations,
 				checkpointCapChars: config.checkpointCapChars,
 				contextThreshold: contextThresholdFor(config, ctx),
-				awayMode: effectiveAwayMode(),
+				dndMode: effectiveDndMode(),
 				cycleQueued: false,
 				cycleReason: undefined,
 				cycleCheckpointing: false,
@@ -3700,7 +3693,7 @@ export default function (pi: ExtensionAPI) {
 		goalState = undefined;
 		freshIterationPending = false;
 		deferredFreshIteration = undefined;
-		awayOverride = undefined;
+		dndOverride = undefined;
 		turnStartedOverBudget = false;
 		lastCtx = undefined;
 		loopEscapePending = false;
@@ -3730,7 +3723,7 @@ export default function (pi: ExtensionAPI) {
 					hasSessionConfig = true;
 				}
 			}
-			if (entry.customType === AWAY_OVERRIDE_TYPE && typeof entry.data === 'boolean') awayOverride = entry.data;
+			if (entry.customType === DND_OVERRIDE_TYPE && typeof entry.data === 'boolean') dndOverride = entry.data;
 			if (entry.customType === STATE_TYPE && isRalphState(entry.data)) {
 				lastStateData = entry.data;
 			}
@@ -3759,7 +3752,7 @@ export default function (pi: ExtensionAPI) {
 		if (state && !hasSessionConfig) {
 			config = {
 				contextThresholds: { [DEFAULT_MODEL_CONFIG_KEY]: state.contextThreshold },
-				awayMode: state.awayMode,
+				dndMode: state.dndMode,
 				maxIterations: state.maxIterations,
 				checkpointCapChars: state.checkpointCapChars,
 				compactionMode: DEFAULT_COMPACTION_MODE,
@@ -3825,7 +3818,7 @@ export default function (pi: ExtensionAPI) {
 			if (state?.enabled) {
 				state = {
 					...state,
-					awayMode: effectiveAwayMode(),
+					dndMode: effectiveDndMode(),
 					maxIterations: config.maxIterations,
 					checkpointCapChars: config.checkpointCapChars,
 					contextThreshold: contextThresholdFor(config, ctx)
@@ -3833,7 +3826,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (state?.enabled) {
-			if (awayOverride !== undefined) state = { ...state, awayMode: awayOverride };
+			if (dndOverride !== undefined) state = { ...state, dndMode: dndOverride };
 			try {
 				const current = Backlog.open(state.todoPath);
 				// Goal mode is done when the goal is done, not when the plan is
@@ -4011,9 +4004,14 @@ export default function (pi: ExtensionAPI) {
 	// later request and reinforces itself. A system-prompt guardrail sits at the
 	// top of every request for the whole run, which a one-off correction steer
 	// cannot be. Keep the prefix stable unless the loop starts/stops or the
-	// user explicitly changes the session's Away mode.
+	// user explicitly changes the session's Do Not Disturb.
 	pi.on('before_agent_start', (event) => {
 		if (!state?.enabled) return;
+		const decisionGuidance = dndOverride !== undefined
+			? `The user set Do Not Disturb ${dndOverride ? 'on' : 'off'} for this session. Follow this current decision guidance over earlier iteration prompts:\n${renderPrompt('decision-note', { dndMode: state.dndMode })}`
+			: state.dndMode
+				? renderPrompt('decision-note', { dndMode: true })
+				: 'Use ralph_request_decision if work needs a user decision.';
 		return {
 			systemPrompt:
 				`${event.systemPrompt}\n\n` +
@@ -4026,8 +4024,7 @@ export default function (pi: ExtensionAPI) {
 				'Continue the current task from the tool results. ' +
 				'A human question during the loop is not an iteration boundary: answer it, apply any new direction, ' +
 				'then resume the ongoing work in the same context. Do not finish up merely because you answered. ' +
-				'Honor a user request to stop or pause, and use ralph_request_decision if work needs a user decision.' +
-				(awayOverride === undefined ? '' : `\n\nThe user set Away mode ${awayOverride ? 'on' : 'off'} for this session. Follow this current decision guidance over earlier iteration prompts:\n${renderPrompt('decision-note', { awayMode: awayOverride })}`)
+				`Honor a user request to stop or pause.\n\n${decisionGuidance}`
 		};
 	});
 
@@ -4036,7 +4033,6 @@ export default function (pi: ExtensionAPI) {
 	// not caught up with the fresh (filtered) context yet.
 	pi.on('agent_start', (_event, ctx) => {
 		lastCtx = ctx;
-		awayDecisionNudged = false;
 		selfEscapeAbort = false;
 		loopPoliceAbort = false;
 		loopPoliceEvent = undefined;
@@ -4268,9 +4264,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const question = state.blockedItem ?? 'the pending Ralph decision';
+			const followUp = state.dndMode
+				? 'If the reply is insufficient, explain what is missing and leave the original decision pending. Do not submit a new decision request in Do Not Disturb.'
+				: 'If more information or a different choice is needed, explain the exact remaining question and call ralph_request_decision again.';
 			return {
 				action: 'transform',
-				text: `Ralph is paused in this session pending this decision:\n${question}\n\nThe user replied:\n${event.text}\n\nWork with the user to make the decision precise. Do not resume implementation yet. If more information or a different choice is needed, explain the exact remaining question and call ralph_request_decision again. Once the answer is sufficient, then call ralph_resolve_decision with a concise resolution. A rejection is also a sufficient answer: if the user rejects the proposal, call ralph_resolve_decision with a resolution recording the rejection and the agreed follow-up — do not start implementation before resolving, and do not leave the decision pending. That tool unblocks the session, after which continue the previously blocked work.`
+				text: `Ralph is paused in this session pending this decision:\n${question}\n\nThe user replied:\n${event.text}\n\nWork with the user to make the decision precise. Do not resume implementation yet. ${followUp} Once the answer is sufficient, then call ralph_resolve_decision with a concise resolution. A rejection is also a sufficient answer: if the user rejects the proposal, call ralph_resolve_decision with a resolution recording the rejection and the agreed follow-up — do not start implementation before resolving, and do not leave the decision pending. That tool unblocks the session, after which continue the previously blocked work.`
 			};
 		}
 
@@ -4675,8 +4674,8 @@ export default function (pi: ExtensionAPI) {
 						: 'disabled'
 					: id === 'finishUpWorkToolLimit'
 						? String(cfg.finishUpWorkToolLimit)
-						: id === 'awayMode'
-							? cfg.awayMode
+						: id === 'dndMode'
+							? cfg.dndMode
 								? 'enabled'
 								: 'disabled'
 						: id === 'autoMode'
@@ -4717,7 +4716,7 @@ export default function (pi: ExtensionAPI) {
 							? { ...cfg, rollover: { ...cfg.rollover, maxMB: Number.parseInt(value, 10) } }
 							: id === 'rolloverMaxMessages'
 								? { ...cfg, rollover: { ...cfg.rollover, maxMessages: Number.parseInt(value, 10) } }
-								: { ...cfg, awayMode: value === 'enabled' };
+								: { ...cfg, dndMode: value === 'enabled' };
 		const savedDescription = (id: string, next: RalphConfig): string =>
 			id === 'contextThreshold'
 				? contextThresholdLabel(contextThresholdFor(next, ctx))
@@ -4743,7 +4742,7 @@ export default function (pi: ExtensionAPI) {
 								? `rollover file limit ${next.rollover.maxMB}MB`
 								: id === 'rolloverMaxMessages'
 									? `rollover message limit ${next.rollover.maxMessages}`
-									: `away mode ${next.awayMode ? 'enabled' : 'disabled'}`;
+									: `Do Not Disturb ${next.dndMode ? 'enabled' : 'disabled'}`;
 
 		const items: SettingItem[] = [
 			{
@@ -4845,10 +4844,10 @@ export default function (pi: ExtensionAPI) {
 					)
 			},
 			{
-				id: 'awayMode',
-				label: 'Away mode',
-				description: 'Tell Ralph to infer intent and keep going on reversible choices. It still pauses for genuine blockers and goal approval.',
-				currentValue: config.awayMode ? 'enabled' : 'disabled',
+				id: 'dndMode',
+				label: 'Do Not Disturb',
+				description: 'Reject all new work decision requests without pausing. Leave blocked work open and continue what is authorized. Goal approval is unchanged.',
+				currentValue: config.dndMode ? 'enabled' : 'disabled',
 				values: ['enabled', 'disabled']
 			},
 			{
@@ -4970,7 +4969,7 @@ export default function (pi: ExtensionAPI) {
 							persistState({
 								...state,
 								cycleOn,
-								awayMode: effectiveAwayMode(),
+								dndMode: effectiveDndMode(),
 								maxIterations: next.maxIterations,
 								contextThreshold: contextThresholdFor(next, ctx)
 							});
@@ -5212,17 +5211,17 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const command = commandArgs[0]?.toLowerCase() ?? '';
-			if (command === 'away') {
+			if (command === 'dnd') {
 				const value = commandArgs[1]?.toLowerCase();
 				if (commandArgs.length > 2 || (value !== undefined && value !== 'on' && value !== 'off')) {
-					ctx.ui.notify('Usage: /ralph away [on | off]', 'warning');
+					ctx.ui.notify('Usage: /ralph dnd [on | off]', 'warning');
 					return;
 				}
-				awayOverride = value === undefined ? !effectiveAwayMode() : value === 'on';
-				pi.appendEntry(AWAY_OVERRIDE_TYPE, awayOverride);
-				if (state?.enabled) persistState({ ...state, awayMode: awayOverride });
+				dndOverride = value === undefined ? !effectiveDndMode() : value === 'on';
+				pi.appendEntry(DND_OVERRIDE_TYPE, dndOverride);
+				if (state?.enabled) persistState({ ...state, dndMode: dndOverride });
 				updateStatus(ctx);
-				ctx.ui.notify(`Away mode ${awayOverride ? 'on' : 'off'} for this session.`, 'info');
+				ctx.ui.notify(`Do Not Disturb ${dndOverride ? 'on' : 'off'} for this session.`, 'info');
 				return;
 			}
 			if (command === 'pause') {

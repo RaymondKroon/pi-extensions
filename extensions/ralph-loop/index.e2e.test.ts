@@ -395,7 +395,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -447,7 +447,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -490,7 +490,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -542,7 +542,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -590,7 +590,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10,
 				compactionMode: true
 			});
@@ -665,7 +665,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -689,7 +689,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			: textResponder('Finished the current turn.', { prompt_tokens: 9000, completion_tokens: 10 })(body), 500);
 		const sess = await createRalphSession(endpoint.port, {
 			contextThresholds: { __default__: 0.2 },
-			awayMode: false,
+			dndMode: false,
 			maxIterations: 10
 		});
 
@@ -728,7 +728,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -805,7 +805,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10
 			});
 
@@ -899,7 +899,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.1 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10,
 				autoMode: 'on'
 			});
@@ -957,7 +957,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 			]);
 			const sess = await createRalphSession(endpoint.port, {
 				contextThresholds: { __default__: 0.9 },
-				awayMode: false,
+				dndMode: false,
 				maxIterations: 10,
 				autoMode: 'on',
 				cycleOn: { tasks: 'task', goal: 'task', auto: 'task' }
@@ -1005,7 +1005,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				// Bind the reload action like pi's interactive mode does, so the
@@ -1086,7 +1086,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1162,7 +1162,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1226,7 +1226,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1272,7 +1272,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1307,7 +1307,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1340,7 +1340,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1367,7 +1367,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
@@ -1399,7 +1399,7 @@ describe('ralph-loop end-to-end (mocked LLM endpoint)', () => {
 				endpoint.port,
 				{
 					contextThresholds: { __default__: 0.9 },
-					awayMode: false,
+					dndMode: false,
 					maxIterations: 10
 				},
 				undefined,
