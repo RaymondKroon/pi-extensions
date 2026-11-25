@@ -6493,6 +6493,45 @@ GB
 		expect(status).toContain('iteration 1/10');
 	});
 
+	test('auto mode does not nudge after an errored run: the loop pauses instead of spinning', async () => {
+		await writeAutoConfig();
+		const fake = createFakePi();
+		extension(fake.pi as never);
+		const fakeCtx = createFakeCtx(dir);
+		await startLoop(fake, fakeCtx);
+
+		const tool = autoTool(fake);
+		await tool.execute('t', { action: 'add', title: 'First step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'add', title: 'Second step' }, undefined, undefined, fakeCtx.ctx);
+		await tool.execute('t', { action: 'complete', task: '1', note: 'done' }, undefined, undefined, fakeCtx.ctx);
+
+		// The run ends with a provider error ("503 no available server"): a
+		// settle must not re-inject the continue nudge — every nudge would
+		// start another run into the same error, so the loop spins (session
+		// 01a21370 spun like that, nudge after errored turn, until Escape).
+		// Pause instead: the user inspects and resumes with a message.
+		fakeCtx.usagePercent.value = 10;
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'error' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+
+		expect(fake.userMessages).toHaveLength(1);
+		expect(statusLine(fakeCtx.widgets)).toContain('paused');
+		const stateEntry = [...fake.entries].reverse().find((entry) => entry.customType === 'ralph-loop-state');
+		expect((stateEntry?.data as { paused?: boolean })?.paused).toBe(true);
+
+		// A settle can never arrive while paused, but a second errored run
+		// after a resume must not nudge either — it re-pauses.
+		fake.userMessages.length = 0;
+		await fake.fire('input', fakeCtx.ctx, { text: 'retry', source: 'user' } as never);
+		await fake.fire('agent_start', fakeCtx.ctx);
+		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'error' } });
+		await fake.fire('agent_settled', fakeCtx.ctx);
+		await flush();
+		expect(statusLine(fakeCtx.widgets)).toContain('paused');
+	});
+
 	test('auto mode nudge does not fire over budget: the context-limit cycle wins', async () => {
 		await writeAutoConfig();
 		const fake = createFakePi();
@@ -7252,15 +7291,17 @@ T 1 - "Continuous re-test loop (run until stopped)"
 		await fake.commands.get('ralph')!.handler('start --goal', fakeCtx.ctx);
 		const iterationCount = fake.userMessages.length;
 
-		// The run ended in an error: the loop stays put for the user to inspect
-		// instead of burning iterations on a broken provider.
+		// The run ended in an error: the loop pauses for the user to inspect
+		// instead of burning iterations on a broken provider — and no settle
+		// branch may nudge the next run into the same error (session
+		// 01a21370: a down provider re-injected the continue nudge after
+		// every errored turn).
 		await fake.fire('message_end', fakeCtx.ctx, { message: { role: 'assistant', stopReason: 'error' } });
 		fakeCtx.usagePercent.value = 10;
 		await fake.fire('agent_settled', fakeCtx.ctx);
 		await flush();
 
-		expect(statusLine(fakeCtx.widgets)).toContain('Ralph (goal): on');
-		expect(statusLine(fakeCtx.widgets)).toContain('iteration 1/10');
+		expect(statusLine(fakeCtx.widgets)).toContain('paused');
 		expect(fake.userMessages).toHaveLength(iterationCount);
 	});
 

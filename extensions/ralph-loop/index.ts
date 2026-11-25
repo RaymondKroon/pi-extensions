@@ -4448,6 +4448,31 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
+		// A turn that ended in a model/provider error (e.g. "503 no available
+		// server", "429 rate limit") must not trigger any of the settle actions
+		// below — every one of them starts a new run that will hit the same
+		// error, so the loop spins: the errored run settles, the continue nudge
+		// (or a queued cycle) starts the next run, it errors, settle, repeat
+		// (session 01a21370: a down provider re-injected "continue the loop"
+		// after every errored turn until the user Escaped). Pause like an abort:
+		// the user inspects and resumes with a typed message, which re-runs the
+		// loop from where it stopped (a queued cycle resumes via
+		// resumePausedLoop).
+		if (lastAssistantStopReason === 'error') {
+			if (state.stopRequested) {
+				stopLoop(ctx, 'Ralph loop stopped after the current iteration');
+			} else {
+				// An over-budget context must not keep growing on resume: queue
+				// the finish-up (durable state, no prompt). The resume input
+				// handler re-runs the recording turn with the user's extra info.
+				if (overBudget) {
+					queueCycle(ctx, 'context-limit', { record: false });
+					ctx.ui.notify('Ralph: context is over budget — the finish-up cycle is queued and runs when you resume.', 'info');
+				}
+				pauseLoop(ctx, 'Ralph loop paused after a model error — inspect the last turn, then type a message to resume');
+			}
+			return;
+		}
 		// Loop-escape fallback: the intercept instructed the model to call
 		// ralph_cycle, but a looping model sometimes ignores it — if the turn
 		// settles without a queued cycle, queue the escape cycle ourselves.
